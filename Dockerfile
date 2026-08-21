@@ -34,7 +34,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Runtime deps first (cache layer reuse).
-COPY pyproject.toml ./
+# README.md is required by hatchling's metadata step (readme field in
+# pyproject.toml). COPY it before the first pip install.
+COPY pyproject.toml README.md ./
+
+# SB-stack deps (kahndor, subtrix, pycurity, ladyol) are local
+# namespace packages — not on PyPI. They are NOT in this Dockerfile;
+# instead, the build script `scripts/build-sophia.sh` vendors them
+# into `sb-dist/` as wheels (using `pip wheel --no-deps`) before
+# invoking `docker build`. The wheels are then installed as part of
+# this Dockerfile step.
+#
+# If sb-dist/ is missing, the build fails loudly — operator should
+# run `scripts/build-sophia.sh` (or copy wheels from a known-good
+# CI artefact) before retrying.
+COPY sb-dist/*.whl /tmp/sb-dist/
+RUN pip install --prefix=/install --no-deps /tmp/sb-dist/*.whl \
+    && rm -rf /tmp/sb-dist
+
+# PyPI deps (fastapi, uvicorn, sse-starlette, httpx, pyyaml) resolve
+# cleanly now that the SB-stack namespace packages are installed.
 RUN pip install --prefix=/install --no-cache-dir .
 
 # Project package (editable, no deps — deps already installed above).

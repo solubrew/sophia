@@ -19,6 +19,10 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+# But DO allow our own vendored SB-stack wheels under sb-dist/
+# (mirrors nchantdoffice_com's pattern; .dockerignore rules are
+# additive, so the explicit allow below re-includes it).
+!sb-dist/
 
 # Virtual environments
 .venv/
