@@ -1,5 +1,14 @@
 # Sophia TODOs
 
+> **Session 2026-08-21:** S1 + S2 from the previous ShieldFace handoff
+> RESOLVED. Shieldface server is live at http://192.168.1.210:3141 (API)
+> + :3142 (devpi PyPI mirror); devpi can be reached from subprocess exec,
+> so `pip wheel` / `pip install` no longer get blocked. The vendored
+> `sb-dist/` directory is populated with the 4 SB wheels (kahndor +
+> subtrix + pycurity @ 0.0.1.0.1.2, ladyol 0.2.0) that the Dockerfile
+> consumes via `COPY sb-dist/*.whl`. `scripts/build-sophia.sh` builds
+> them on demand. See CHANGES.md for details.
+
 ## New Features
 - each connection should be a service url + apikey (if needed) such that one service url can be used multiple times with different api keys
 - each of these connection accounts should have a name, user account email, and usage schedule like a rotateing 75million tokens reset at 1am, 6am, 11am, 4pm, 8pm or other schedule and/or weekly, monthly limits
@@ -16,11 +25,6 @@
 
 ---
 
-## ShieldFace TODOs — for the next session (2026-08-21)
-
-Sophia's MVP + Docker service shipped today. Two pieces are still
-needed from ShieldFace before the Docker image can build end-to-end
-on a clean host (without the SB-stack editable-installed):
 
 ### 1. Pre-vendored SB-stack wheels under `sb-dist/`
 

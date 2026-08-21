@@ -9,3 +9,6 @@ build/
 .pytest_cache/
 .ruff_cache/
 _data_/local.yaml
+
+# vendored SB-stack wheels (built by build-sophia.sh before docker build)
+sb-dist/
