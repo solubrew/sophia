@@ -13,7 +13,7 @@ import json
 import time
 from typing import AsyncIterator, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from kahndor.logma import Logma
 
@@ -78,6 +78,33 @@ def create_app(config=None) -> FastAPI:
         rec = keys.lookup(raw)
         return rec.name if rec else None
 
+    def _resolve_key(authorization: Optional[str]):
+        """Return the full ApiKey record (for role checks), or None."""
+        if not authorization or not authorization.lower().startswith("bearer "):
+            return None
+        return keys.lookup(authorization[7:].strip())
+
+    async def _require_cap(authorization: Optional[str], cap: str):
+        """Coroutine that resolves the Bearer header and enforces a
+        capability. Used as a FastAPI dependency. 401 on missing key,
+        403 on missing capability."""
+        rec = _resolve_key(authorization)
+        if rec is None:
+            raise HTTPException(status_code=401, detail="missing or invalid API key")
+        if not rec.can(cap):
+            raise HTTPException(
+                status_code=403,
+                detail=f"role {rec.role!r} does not permit {cap!r}",
+            )
+        return rec
+
+    def _cap_dep(cap: str):
+        """The inner coroutine FastAPI will call. Use with
+        ``Depends(_cap_dep("chat"))``."""
+        async def _dep(authorization: Optional[str] = Header(default=None)):
+            return await _require_cap(authorization, cap)
+        return _dep
+
     @app.get("/healthz")
     async def healthz():
         models = await pool.list_models()
@@ -85,26 +112,18 @@ def create_app(config=None) -> FastAPI:
         return {"status": "ok", "providers": len(providers), "models": len(models)}
 
     @app.get("/v1/models")
-    async def list_models(authorization: Optional[str] = Header(default=None)):
-        requestor = _auth(authorization)
-        if not requestor:
-            raise HTTPException(status_code=401, detail="missing or invalid API key")
+    async def list_models(rec=Depends(_cap_dep("chat"))):
         models = await pool.list_models()
         return ModelList(data=models).model_dump()
 
     @app.post("/v1/chat/completions")
     async def chat_completions(
         req: ChatCompletionRequest,
-        authorization: Optional[str] = Header(default=None),
-        x_requestor_hint: Optional[str] = Header(default=None, alias="X-Requestor"),
+        rec=Depends(_cap_dep("chat")),
     ):
-        requestor_name = _auth(authorization)
-        if not requestor_name:
-            raise HTTPException(status_code=401, detail="missing or invalid API key")
-        # Re-resolve to get store_payload flag (cheap; in-memory DB)
-        raw = authorization.split(" ", 1)[1].strip()  # type: ignore[union-attr]
-        requestor = keys.lookup(raw)
-        assert requestor is not None  # _auth just succeeded
+        requestor_name = rec.name
+        requestor = rec
+        assert requestor is not None  # _require_cap just succeeded
 
         if not req.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
@@ -214,23 +233,13 @@ def create_app(config=None) -> FastAPI:
                 )
         return JSONResponse(content=resp.model_dump())
 
-    # ── usage reporting ────────────────────────────────────────────────────
-
-    def _require_admin(authorization: Optional[str]) -> Optional[str]:
-        """A second API key with ``admin=True`` flag isn't yet modelled;
-        until then we accept the same bearer auth as the chat endpoint
-        (any active requestor can read usage). TODO: split admin/requestor
-        roles when a second tenant signs up."""
-        return _auth(authorization)
+    # ── usage reporting (admin + collection only) ────────────────────────
 
     @app.get("/v1/usage/summary")
     async def usage_summary(
-        authorization: Optional[str] = Header(default=None),
         window: Optional[str] = Query(default=None, description="today|7d|all (default all)"),
+        rec=Depends(_cap_dep("usage_read")),
     ):
-        requestor = _require_admin(authorization)
-        if not requestor:
-            raise HTTPException(status_code=401, detail="missing or invalid API key")
         log = UsageLog(db)
         if window == "today":
             from datetime import datetime, timezone, timedelta
@@ -251,33 +260,24 @@ def create_app(config=None) -> FastAPI:
     async def usage_by_requestor(
         name: str = Query(...),
         limit: int = Query(default=100, le=500),
-        authorization: Optional[str] = Header(default=None),
+        rec=Depends(_cap_dep("usage_read")),
     ):
-        requestor = _require_admin(authorization)
-        if not requestor:
-            raise HTTPException(status_code=401, detail="missing or invalid API key")
         return {"requestor": name, "rows": UsageLog(db).for_requestor(name, limit)}
 
     @app.get("/v1/usage/errors")
     async def usage_errors(
         limit: int = Query(default=50, le=200),
-        authorization: Optional[str] = Header(default=None),
+        rec=Depends(_cap_dep("usage_read")),
     ):
-        requestor = _require_admin(authorization)
-        if not requestor:
-            raise HTTPException(status_code=401, detail="missing or invalid API key")
         return {"errors": UsageLog(db).recent_errors(limit)}
 
     @app.get("/v1/captures")
     async def captures_list(
         requestor: Optional[str] = Query(default=None),
-        authorization: Optional[str] = Header(default=None),
+        rec=Depends(_cap_dep("usage_read")),
     ):
         """List captures metadata (paths + sizes), not the bodies. Body
         fetch is left to direct file access (path returned in the row)."""
-        authed = _auth(authorization)
-        if not authed:
-            raise HTTPException(status_code=401, detail="missing or invalid API key")
         return {"stats": captures.stats(), "items": captures.list(requestor=requestor)}
 
     # ── helpers ───────────────────────────────────────────────────────────

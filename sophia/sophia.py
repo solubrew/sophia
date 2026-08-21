@@ -53,8 +53,19 @@ CREATE TABLE IF NOT EXISTS sophia_requestors (
 );
 
 -- API keys (one Sophia-callable identity = one row). The raw key is
--- never stored; only its SHA-256 hash and a non-secret prefix for UI
--- display.
+-- never stored; only its SHA-256 hash and a non-secret prefix for
+-- UI display.
+--
+-- role: "requestor" (default) — can only call /v1/chat/completions
+--                    + /v1/structured_chat/completions (the actual
+--                    business endpoints). No read access to usage,
+--                    captures, or other requestors' data.
+--       "admin"      — full access: can read usage + captures, list
+--                    requestors, disable/enable other keys.
+--       "collection" — read-only access to usage + captures for
+--                    analytics dashboards; no write access to
+--                    anything (no chat, no key management). Use
+--                    this for dashboards and reporter-style agents.
 CREATE TABLE IF NOT EXISTS sophia_keys (
     id            INTEGER PRIMARY KEY,
     name          TEXT    NOT NULL,
@@ -64,9 +75,13 @@ CREATE TABLE IF NOT EXISTS sophia_keys (
     expires_at    TEXT,
     enabled       INTEGER NOT NULL DEFAULT 1,
     store_payload INTEGER NOT NULL DEFAULT 0,
+    role          TEXT    NOT NULL DEFAULT 'requestor'
+                   CHECK (role IN ('requestor', 'admin', 'collection')),
     FOREIGN KEY (name) REFERENCES sophia_requestors(name) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_sophia_keys_hash ON sophia_keys(key_hash);
+-- idx_sophia_keys_role is created by the v2 migration (see
+-- _apply_migrations) so it runs only after the ``role`` column exists.
 
 -- Per-request accounting row. One row per /v1/chat/completions call,
 -- regardless of stream/non-stream. Captured by Sophia AFTER the
@@ -97,6 +112,26 @@ CREATE INDEX IF NOT EXISTS idx_usage_provider_time  ON sophia_usage(provider_nam
 CREATE INDEX IF NOT EXISTS idx_usage_model_time     ON sophia_usage(model, created_at);
 """
 
+# Idempotent migrations applied AFTER SCHEMA_DDL, in order. Each
+# migration bumps ``schema_versions`` and must be safe to re-run
+# (column-existence guards). Adding a new one: append + increment
+# ``INITIAL_VERSION``.
+def _has_column(conn, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == column for r in rows)
+
+
+def _apply_migrations(c) -> None:
+    if not _has_column(c, "sophia_keys", "role"):
+        # v2: add role column to existing v1 sophia_keys tables
+        c.execute("ALTER TABLE sophia_keys ADD COLUMN role TEXT NOT NULL DEFAULT 'requestor'")
+    # Role index lives here (not in SCHEMA_DDL) so it's safe to apply
+    # against both fresh-install tables (which have role from v2 DDL
+    # onwards) and legacy v1 tables (where the column was just added).
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sophia_keys_role ON sophia_keys(role)")
+    # Future migrations go here. Each should be guarded like the
+    # ALTER above and bump schema_versions when applied.
+
 INITIAL_VERSION = 1
 INITIAL_NAME = "sophia_db_v1"
 
@@ -125,6 +160,7 @@ class SophiaDB:
     def _initialise(self) -> None:
         with self._connect() as c:
             c.executescript(SCHEMA_DDL)
+            _apply_migrations(c)
             cur = c.execute(
                 "SELECT 1 FROM schema_versions WHERE version = ?",
                 (INITIAL_VERSION,),

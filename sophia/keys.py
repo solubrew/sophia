@@ -33,6 +33,9 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+VALID_ROLES = ("requestor", "admin", "collection")
+
+
 @dataclass
 class ApiKey:
     id: int
@@ -43,6 +46,7 @@ class ApiKey:
     expires_at: Optional[str]
     enabled: bool
     store_payload: bool
+    role: str = "requestor"
 
     def to_public(self) -> dict:
         return {
@@ -53,7 +57,26 @@ class ApiKey:
             "expires_at": self.expires_at,
             "enabled": self.enabled,
             "store_payload": self.store_payload,
+            "role": self.role,
         }
+
+    def can(self, capability: str) -> bool:
+        """Capability check against the role. Returns True iff this key's
+        role is allowed to perform ``capability``.
+
+        Capabilities:
+          - ``"chat"``        — call /v1/chat/completions (and friends)
+          - ``"usage_read"``  — read /v1/usage/* and /v1/captures
+          - ``"key_admin"``   — issue/disable/delete other keys
+        """
+        if not self.enabled:
+            return False
+        per_role = {
+            "requestor":  {"chat"},
+            "collection": {"usage_read"},
+            "admin":      {"chat", "usage_read", "key_admin"},
+        }
+        return capability in per_role.get(self.role, set())
 
 
 class KeyStore:
@@ -74,11 +97,20 @@ class KeyStore:
         name: str,
         store_payload: bool = False,
         expires_at: Optional[str] = None,
+        role: str = "requestor",
     ) -> tuple[ApiKey, str]:
         """Insert a new key for ``name``. Auto-creates the requestor row
-        if missing (caller didn't go through ``ensure_requestor``).
-        Returns ``(record, raw_key)`` — the raw key is shown to the
-        caller ONCE; we never persist the plaintext."""
+        if missing. Returns ``(record, raw_key)`` — the raw key is
+        shown to the caller ONCE; we never persist the plaintext.
+
+        ``role`` is one of ``"requestor"`` (default — chat only),
+        ``"admin"`` (everything), or ``"collection"`` (read-only
+        analytics). Invalid roles raise ``ValueError`` so a typo in
+        the CLI never silently downgrades to requestor."""
+        if role not in VALID_ROLES:
+            raise ValueError(
+                f"role {role!r} invalid; must be one of {VALID_ROLES}"
+            )
         raw = self.new_raw_key()
         created = _utc_now_iso()
         with self.db.transaction() as conn:
@@ -86,15 +118,18 @@ class KeyStore:
             cur = conn.execute(
                 """
                 INSERT INTO sophia_keys
-                    (name, key_hash, key_prefix, created_at, expires_at, enabled, store_payload)
-                VALUES (?, ?, ?, ?, ?, 1, ?)
+                    (name, key_hash, key_prefix, created_at, expires_at,
+                     enabled, store_payload, role)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
                 """,
-                (name, _hash_key(raw), _prefix_of(raw), created, expires_at, 1 if store_payload else 0),
+                (name, _hash_key(raw), _prefix_of(raw), created, expires_at,
+                 1 if store_payload else 0, role),
             )
             row_id = int(cur.lastrowid or 0)
         rec = ApiKey(
             id=row_id, name=name, key_hash=_hash_key(raw), key_prefix=_prefix_of(raw),
-            created_at=created, expires_at=expires_at, enabled=True, store_payload=store_payload,
+            created_at=created, expires_at=expires_at, enabled=True,
+            store_payload=store_payload, role=role,
         )
         return rec, raw
 
@@ -121,6 +156,7 @@ class KeyStore:
             key_prefix=row["key_prefix"], created_at=row["created_at"],
             expires_at=row["expires_at"], enabled=bool(row["enabled"]),
             store_payload=bool(row["store_payload"]),
+            role=row["role"] or "requestor",
         )
 
     def disable(self, name: str) -> bool:
@@ -131,6 +167,18 @@ class KeyStore:
     def enable(self, name: str) -> bool:
         with self.db.transaction() as conn:
             cur = conn.execute("UPDATE sophia_keys SET enabled = 1 WHERE name = ?", (name,))
+            return cur.rowcount > 0
+
+    def set_role(self, name: str, role: str) -> bool:
+        if role not in VALID_ROLES:
+            raise ValueError(
+                f"role {role!r} invalid; must be one of {VALID_ROLES}"
+            )
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE sophia_keys SET role = ? WHERE name = ?",
+                (role, name),
+            )
             return cur.rowcount > 0
 
     def set_store_payload(self, name: str, enabled: bool) -> bool:

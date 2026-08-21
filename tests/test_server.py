@@ -6,6 +6,7 @@ needs a TTY). The SophiaDB is isolated per test via a temp SOPHIA_DB env so
 key lookups don't leak between tests.
 """
 import os
+from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -178,16 +179,101 @@ async def test_usage_summary_requires_auth(client):
 
 
 @pytest.mark.asyncio
-async def test_usage_summary_authenticated(client, bearer):
-    r = await client.get("/v1/usage/summary", headers=bearer)
+async def test_usage_summary_authenticated(client, admin_key):
+    r = await client.get("/v1/usage/summary",
+                         headers={"Authorization": f"Bearer {admin_key}"})
     assert r.status_code == 200
     body = r.json()
     assert "by_requestor" in body and "by_provider" in body and "by_model" in body
 
 
 @pytest.mark.asyncio
-async def test_captures_list_authenticated(client, bearer):
-    r = await client.get("/v1/captures", headers=bearer)
+async def test_captures_list_authenticated(client, admin_key):
+    r = await client.get("/v1/captures",
+                         headers={"Authorization": f"Bearer {admin_key}"})
     assert r.status_code == 200
     body = r.json()
     assert "stats" in body and "items" in body
+
+
+# ── role enforcement ────────────────────────────────────────────────────
+
+@pytest.fixture
+async def admin_key(_isolated_db):
+    _, keys, _ = (None, None, None)
+    # Reuse the existing app.state.keys via create_app() and add an admin.
+    import importlib
+    import sophia.server as srv
+    importlib.reload(srv)
+    app = srv.create_app()
+    rec, raw = app.state.keys.create(name="admin-test", role="admin")
+    return raw
+
+
+@pytest.fixture
+async def collection_key(_isolated_db):
+    import importlib
+    import sophia.server as srv
+    importlib.reload(srv)
+    app = srv.create_app()
+    rec, raw = app.state.keys.create(name="collection-test", role="collection")
+    return raw
+
+
+@pytest.mark.asyncio
+async def test_requestor_cannot_read_usage_summary(client, bearer, auth_keys):
+    """Default requestor role: chat only. Usage read should be 403."""
+    # auth_keys == bearer; replace bearer to force requestor identity
+    r = await client.get("/v1/usage/summary", headers=bearer)
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_requestor_cannot_read_captures(client, bearer):
+    r = await client.get("/v1/captures", headers=bearer)
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_collection_role_can_read_usage(client, collection_key):
+    headers = {"Authorization": f"Bearer {collection_key}"}
+    r = await client.get("/v1/usage/summary", headers=headers)
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_collection_role_cannot_chat(client, collection_key):
+    headers = {"Authorization": f"Bearer {collection_key}"}
+    r = await client.post(
+        "/v1/chat/completions", headers=headers,
+        json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_can_read_usage_and_chat(client, admin_key):
+    headers = {"Authorization": f"Bearer {admin_key}"}
+    r = await client.get("/v1/usage/summary", headers=headers)
+    assert r.status_code == 200
+    r = await client.post(
+        "/v1/chat/completions", headers=headers,
+        json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_invalid_role_at_creation():
+    """Role validation in KeyStore.create — protects against typos in
+    the CLI that would silently downgrade privileges."""
+    from sophia.keys import KeyStore
+    from sophia.sophia import SophiaDB
+    import tempfile, os
+    db_file = Path(tempfile.mkstemp(suffix=".db")[1])
+    os.environ["SOPHIA_DB"] = str(db_file)
+    db = SophiaDB()
+    keys = KeyStore(db)
+    with pytest.raises(ValueError):
+        keys.create(name="oops", role="superuser")
+    os.unlink(db_file)

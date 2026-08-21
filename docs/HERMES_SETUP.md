@@ -53,7 +53,7 @@ TODOs is **not implemented yet** (see §6).
 
 ---
 
-## 3. Wire requestor API keys
+## 3. Wire requestor API keys + roles
 
 Sophia now authenticates every `/v1/chat/completions` call with a
 Bearer token issued from its internal SQLite `sophia.db` (table
@@ -62,13 +62,37 @@ Bearer token issued from its internal SQLite `sophia.db` (table
 Sophia-internal *requestor* identities — the wire copy is already
 plaintext, so encrypting the at-rest copy is theatre).
 
+Every key has a **role** that determines which capabilities it grants:
+
+| Role         | Capabilities                              | Use case                       |
+|--------------|-------------------------------------------|--------------------------------|
+| `requestor`  | chat only (`/v1/chat/completions`, `/v1/models`) | default — Hermes, gateways, agents |
+| `collection` | usage read only (`/v1/usage/*`, `/v1/captures`)    | dashboards, analytics, reporters |
+| `admin`      | chat + usage read + key management         | operator only                    |
+
+A requestor hitting `/v1/usage/summary` gets **403**, not a leaked
+report. A collection key trying to chat gets **403**, not a free
+completion. Add `?role=admin` filtering or split-role tokens when a
+second tenant signs up — today's default is single-tenant trust.
+
 ```bash
 # In the sophia container:
+# Default — chat-only requestor key for Hermes
 docker compose exec sophia python -m sophia.cmds.manage_keys create hermes-cli
-# created hermes-cli  prefix=sk-sophia  id=1
-# store_payload=False
-# ---
-# API key (SAVE THIS NOW — shown once): sk-sophia-AbCdEf...
+# created hermes-cli  prefix=sk-sophi  id=1  role=requestor
+
+# Admin key for the operator
+docker compose exec sophia python -m sophia.cmds.manage_keys create solubrew-admin \
+    --role admin
+# created solubrew-admin  prefix=sk-sophi  id=2  role=admin
+
+# Collection key for a dashboard (read-only)
+docker compose exec sophia python -m sophia.cmds.manage_keys create grafana-bot \
+    --role collection
+# created grafana-bot  prefix=sk-sophi  id=3  role=collection
+
+# Promote an existing requestor to admin without rotating the key:
+docker compose exec sophia python -m sophia.cmds.manage_keys set-role grafana-bot admin
 
 # Opt-in to prompt+completion capture for this requestor (sizes the
 # SOPHIA_CAPTURES_DIR by default to 1 GiB, oldest-first pruning):
@@ -97,23 +121,25 @@ full request/response JSON is written under `SOPHIA_CAPTURES_DIR`
 The capture directory is size-capped (default 1 GiB,
 `SOPHIA_CAPTURE_MAX_BYTES`) and prunes oldest-first.
 
-Query:
+Query (requires a `collection` or `admin` key — requestors get 403):
 
 ```bash
-curl -fsS -H "Authorization: Bearer $KEY" \
+curl -fsS -H "Authorization: Bearer $ADMIN_KEY" \
   "http://<sophia-host>:8765/v1/usage/summary?window=7d"
 # { "window": "7d", "by_requestor": [...], "by_provider": [...], "by_model": [...] }
 
-curl -fsS -H "Authorization: Bearer $KEY" \
+curl -fsS -H "Authorization: Bearer $ADMIN_KEY" \
   "http://<sophia-host>:8765/v1/usage/by_requestor?name=hermes-cli&limit=50"
 
-curl -fsS -H "Authorization: Bearer $KEY" \
+curl -fsS -H "Authorization: Bearer $ADMIN_KEY" \
   "http://<sophia-host>:8765/v1/captures?requestor=hermes-cli"
 ```
 
-(Note: until a real admin role lands, any active requestor key can
-read usage + captures. Add `?role=admin` filtering when a second
-tenant signs up; today's default is single-tenant trust.)
+A `collection` key can read these but **cannot** chat — wire your
+Grafana scraper with `--role collection` at creation time. The
+requestor-side response (chat completions + their `/v1/usage` rollups
+embedded in the response) is unaffected; per-requestor reports stay
+accessible to the requestor itself when we wire that in.
 
 ## 5. Migration to Postgres
 
