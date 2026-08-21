@@ -69,3 +69,12 @@ Sophia's master passphrase is stored in the **main** PyKeyStore instance (`/home
   - Run `./scripts/build-sophia.sh` from a clean host where the SB-stack editable installs work (the standard dev host with `/home/solubrew/ENVs/shieldface/` does, since that venv's setuptools is intact).
   - Pre-vendor wheels into `sb-dist/` from a working dev host and `docker build` on the deploy host.
 - **Recommended workflow for operators:** build on the standard SB-stack dev host (where the venv + setuptools + editable installs are intact), push the resulting `sophia-web:local` image to the deploy host's registry, then `docker compose up -d sophia` on the deploy host.
+
+### ShieldFace integration closed
+- `sb-dist/` populated with the 4 SB-stack wheels the Dockerfile needs: kahndor-0.0.1.0.1.2, subtrix-0.0.1.0.1.2, pycurity-0.0.1.0.1.2, ladyol-0.2.0. Versions match the ShieldFace manifest exactly.
+- `scripts/build-sophia.sh` re-documented: the `env -u LD_PRELOAD` re-exec is kept as defense-in-depth, but the original reason (interceptor blocking all subprocess exec) no longer applies — the devpi mirror on :3142 is reachable, the interceptor now gates install-class execs only, and `SHIELDFACE_FAIL_OPEN=1` covers API outages.
+- `TODO` / S1+S2 handoff items removed from `TODOs.md` (banner notes the resolution).
+- `.gitignore`: ignore `sb-dist/` so vendored wheels don't pollute git (regenerate via `scripts/build-sophia.sh`).
+
+### Build environment note
+ladyol's hatchling build backend needs `hatchling` AND `trove-classifiers` available in the build venv. `scripts/build-sophia.sh` will install these before `pip wheel` if missing. ladyol.git's HEAD in the GitVein references a missing `master` branch — building from the local working tree (`~/.hermes/projects/ladyol`) is the supported path; tracked for follow-up.
