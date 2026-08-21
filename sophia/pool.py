@@ -69,6 +69,44 @@ class SophiaPool:
             model=model,
         )
 
+    async def chat_with_meta(
+        self,
+        prompt: str,
+        sprompt: str = "",
+        temperature: float = 0.7,
+        strategy: str = "random",
+        model: Optional[str] = None,
+    ) -> tuple[str, dict]:
+        """Like ``chat`` but also returns a meta dict so callers can
+        extract provider_name / usage / cost keys for accounting.
+
+        Today ladyol's pool doesn't expose per-response metadata
+        uniformly across providers, so we return a best-effort dict
+        populated from what the pool DOES expose after a chat call:
+        ``provider_name`` from the last-picked provider object, plus
+        ``usage`` when the upstream surfaced it.
+
+        When meta is empty the server falls back to word-count token
+        estimates (see server._token_counts).
+        """
+        pool = await self._ensure_pool()
+        text = await pool.chat(
+            prompt=prompt, sprompt=sprompt, temperature=temperature,
+            strategy=strategy, model=model,
+        )
+        meta: dict = {}
+        # Try to read whatever the pool stashed about the last call.
+        # Different ladyol versions expose different attrs — guard each.
+        for attr, key in (
+            ("last_provider", "provider_name"),
+            ("last_usage", "usage"),
+            ("last_model", "model"),
+        ):
+            v = getattr(pool, attr, None)
+            if v is not None:
+                meta[key] = v
+        return text, meta
+
     async def stream(
         self,
         prompt: str,

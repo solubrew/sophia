@@ -1,8 +1,10 @@
 """End-to-end test: boot a real uvicorn server on a free port and hit it over real HTTP."""
 import importlib
+import os
 import socket
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import uvicorn
@@ -85,6 +87,20 @@ def live_server(monkeypatch):
     thread.join(timeout=3)
 
 
+@pytest.fixture
+def live_key(live_server, tmp_path):
+    """Issue a key on the same SophiaDB the live server is using."""
+    from sophia.keys import KeyStore
+    from sophia.sophia import SophiaDB
+    db_path = os.environ.get("SOPHIA_DB")
+    if not db_path:
+        pytest.skip("SOPHIA_DB not set on the live server")
+    db = SophiaDB(db_path=Path(db_path))
+    ks = KeyStore(db)
+    _, raw = ks.create(name="e2e-test")
+    return raw
+
+
 def test_live_healthz(live_server):
     with Client(base_url=live_server) as c:
         r = c.get("/healthz")
@@ -92,10 +108,11 @@ def test_live_healthz(live_server):
         assert r.json()["status"] == "ok"
 
 
-def test_live_chat_completions(live_server):
+def test_live_chat_completions(live_server, live_key):
     with Client(base_url=live_server) as c:
         r = c.post(
             "/v1/chat/completions",
+            headers={"Authorization": f"Bearer {live_key}"},
             json={
                 "model": "auto",
                 "messages": [{"role": "user", "content": "ping"}],
@@ -109,9 +126,9 @@ def test_live_chat_completions(live_server):
         assert body["object"] == "chat.completion"
 
 
-def test_live_models_endpoint(live_server):
+def test_live_models_endpoint(live_server, live_key):
     with Client(base_url=live_server) as c:
-        r = c.get("/v1/models")
+        r = c.get("/v1/models", headers={"Authorization": f"Bearer {live_key}"})
         assert r.status_code == 200
         body = r.json()
         assert body["object"] == "list"

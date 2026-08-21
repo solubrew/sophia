@@ -4,11 +4,14 @@ How to wire Hermes Agent to Sophia as its OpenAI-compatible provider,
 get automatic rotation across the accounts in Sophia's provider pool,
 and avoid the mistakes the gateway is built to prevent.
 
-> **TL;DR:** set `provider: custom` + `base_url: http://<sophia-host>:8765/v1`,
-> use `strategy: auto` and `model: auto` on the wire, point Sophia at
-> ladyol's `providers.yaml`, and Hermes rotates for free. Sophia's
-> vault pattern lets you swap/rotate API keys without restarting
-> Hermes.
+> **TL;DR:** issue a requestor API key with
+> `python -m sophia.cmds.manage_keys create hermes-cli`, set
+> `provider: custom` + `base_url: http://<sophia-host>:8765/v1` +
+> `api_key: <sk-sophia-…>` in Hermes' `config.yaml`, use
+> `strategy: auto` and `model: auto` on the wire, point Sophia at
+> ladyol's `providers.yaml`, and Hermes rotates for free. Every call
+> is logged into `sophia.db` (`sophia_usage`); opt-in capture stores
+> prompt+response JSON files capped at `SOPHIA_CAPTURE_MAX_BYTES`.
 
 ---
 
@@ -50,7 +53,79 @@ TODOs is **not implemented yet** (see §6).
 
 ---
 
-## 2. Sophia side — bring the server up and load accounts
+## 3. Wire requestor API keys
+
+Sophia now authenticates every `/v1/chat/completions` call with a
+Bearer token issued from its internal SQLite `sophia.db` (table
+`sophia_keys`). The store is deliberately separate from PyKeyStore
+(PyKeyStore holds external *provider* secrets; `sophia.db` holds
+Sophia-internal *requestor* identities — the wire copy is already
+plaintext, so encrypting the at-rest copy is theatre).
+
+```bash
+# In the sophia container:
+docker compose exec sophia python -m sophia.cmds.manage_keys create hermes-cli
+# created hermes-cli  prefix=sk-sophia  id=1
+# store_payload=False
+# ---
+# API key (SAVE THIS NOW — shown once): sk-sophia-AbCdEf...
+
+# Opt-in to prompt+completion capture for this requestor (sizes the
+# SOPHIA_CAPTURES_DIR by default to 1 GiB, oldest-first pruning):
+docker compose exec sophia python -m sophia.cmds.manage_keys set-payload hermes-cli on
+
+# Other subcommands:
+docker compose exec sophia python -m sophia.cmds.manage_keys list
+docker compose exec sophia python -m sophia.cmds.manage_keys show hermes-cli
+docker compose exec sophia python -m sophia.cmds.manage_keys disable hermes-cli
+docker compose exec sophia python -m sophia.cmds.manage_keys delete old-tenant
+```
+
+The raw key is shown **once** at creation. We store only the SHA-256
+hash + a non-secret prefix; rotate by issuing a new key (and
+disabling the old one if you want a hard cut-over).
+
+## 4. Token accounting + captures
+
+Every `/v1/chat/completions` call — stream or non-stream — produces
+one row in `sophia_usage` (in `sophia.db`) with per-requestor,
+per-provider-account, per-model token counts and USD cost estimates
+(derived from `costs_per_1k_input`/`costs_per_1k_output` in the
+model YAML). When `store_payload=True` on the requestor's key, the
+full request/response JSON is written under `SOPHIA_CAPTURES_DIR`
+(default `sophia/_data_/captures`, layout `YYYY-MM-DD/<requestor>/<completion_id>.json`).
+The capture directory is size-capped (default 1 GiB,
+`SOPHIA_CAPTURE_MAX_BYTES`) and prunes oldest-first.
+
+Query:
+
+```bash
+curl -fsS -H "Authorization: Bearer $KEY" \
+  "http://<sophia-host>:8765/v1/usage/summary?window=7d"
+# { "window": "7d", "by_requestor": [...], "by_provider": [...], "by_model": [...] }
+
+curl -fsS -H "Authorization: Bearer $KEY" \
+  "http://<sophia-host>:8765/v1/usage/by_requestor?name=hermes-cli&limit=50"
+
+curl -fsS -H "Authorization: Bearer $KEY" \
+  "http://<sophia-host>:8765/v1/captures?requestor=hermes-cli"
+```
+
+(Note: until a real admin role lands, any active requestor key can
+read usage + captures. Add `?role=admin` filtering when a second
+tenant signs up; today's default is single-tenant trust.)
+
+## 5. Migration to Postgres
+
+Every Sophia-internal table lives in **one** SQLite file (`sophia.db`)
+today, with the DDL centralised in `sophia/sophia.py: SCHEMA_DDL`.
+Tables are Postgres-shaped (no SQLite-only types, no auto-increment
+PKs hidden behind `INTEGER PRIMARY KEY` — those will become BIGSERIAL
+on migration). The next step is a thin `backend` module that swaps
+the connection layer from `sqlite3` to SQLAlchemy Core /
+`psycopg`+`pg8000` while reading the same DDL string. The
+`schema_versions` table tracks applied migrations so the upgrade is
+online + auditable.
 
 Sophia runs as a Docker Compose service on the LAN host. Full
 deployment is in `sophia/docs/DEPLOY.md`. For the wiring to work, you
@@ -108,7 +183,7 @@ needs an entry per alias.
 
 ---
 
-## 3. Hermes side — point at Sophia
+## 6. Hermes side — point at Sophia
 
 Hermes supports any OpenAI-compatible endpoint via `provider: custom`
 + `base_url`. Sophia listens on `<host>:8765` and exposes
@@ -174,7 +249,7 @@ model:
 
 ---
 
-## 4. The rotation model in practice
+## 7. The rotation model in practice
 
 Hermes always sends one of three things per request:
 
@@ -225,7 +300,7 @@ per-request, not time-windowed.
 
 ---
 
-## 5. Verifying the wire
+## 8. Verifying the wire
 
 ```bash
 # 1. Sophia is healthy
@@ -263,7 +338,7 @@ logs the picked (provider, account, model). If Hermes logs an HTTP
 
 ---
 
-## 6. What's not implemented yet (and how to file it)
+## 9. What's not implemented yet (and how to file it)
 
 Three of Sophia's TODOs from the `## New Features` section are NOT
 implemented yet — they're listed in `sophia/TODOs.md` and quoted here
@@ -292,7 +367,7 @@ scheduling is missing.
 
 ---
 
-## 7. Quick troubleshooting
+## 10. Quick troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
