@@ -1,0 +1,11 @@
+# sophia/_data_/sophia.yaml
+sophia:
+  server:
+    host: "0.0.0.0"
+    port: 8765
+  logging:
+    level: "INFO"
+  provider_pool:
+    # Default points at ladyol's YAML so Sophia stays a thin wrapper.
+    # Override via SOPHIA_PROVIDER_POOL env var when needed.
+    config_path: null  # resolved at load time to ladyol's bundled path
