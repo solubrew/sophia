@@ -1,0 +1,6 @@
+# Sophia Caddyfile — rendered from ${DOMAIN} / ${CADDY_CHALLENGE} / etc.
+# at container startup by entrypoint.sh. Do not edit by hand.
+{$DOMAIN} {
+    encode zstd gzip
+    reverse_proxy sophia:8765
+}
