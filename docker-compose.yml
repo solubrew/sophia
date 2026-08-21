@@ -1,0 +1,104 @@
+# Sophia Docker Compose deployment.
+#
+# First-time setup (LAN, no TLS):
+#   1. Generate a random master passphrase and add it to the MAIN
+#      PyKeyStore instance under service name `sophia_master_passphrase`:
+#         PYCURITY_MASTER_PASSPHRASE=$(openssl rand -base64 32)
+#         python -c "from pycurity.pykey import PyKeyStore; \
+#             PyKeyStore().set('sophia_master_passphrase', {'api_key': '$PYCURITY_MASTER_PASSPHRASE'})"
+#   2. cp .env.docker.example .env  (and set SOPHIA_MASTER_PASSPHRASE)
+#   3. docker compose build
+#   4. docker compose up -d sophia
+#   5. docker compose exec -it sophia python -m sophia.cmds.manage_secrets init
+#   6. docker compose exec sophia python -m sophia.cmds.manage_secrets set anthropic_api_key
+#      (paste the key, then Ctrl-D)
+#   ... repeat for openai_api_key, kalshi_api_key, etc.
+#   7. docker compose restart sophia
+#
+# For TLS fronting (Cloudflare DNS-01 recommended):
+#   1. set DOMAIN, CADDY_CHALLENGE=cloudflare, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE in .env
+#   2. docker build -f Caddy.dockerfile -t sophia-caddy:local .
+#   3. docker compose --profile tls up -d caddy
+#
+# Secrets: the sophia container reads its own master passphrase from
+# $SOPHIA_MASTER_PASSPHRASE (sourced from the host's main PyKeyStore at
+# deploy time, per the single-unlock pattern). Provider keys live in
+# the named `sophia_pycurity` volume, encrypted under that passphrase.
+
+name: sophia
+
+services:
+  sophia:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sophia-web:local
+    restart: unless-stopped
+    environment:
+      SOPHIA_HOST: 0.0.0.0
+      SOPHIA_PORT: "8765"
+      # PyKeyStore locations — internal vault.
+      SOPHIA_PYCURITY_DB_PATH: /var/lib/sophia/pycurity/vault.db
+      SOPHIA_PYCURITY_SALT_PATH: /var/lib/sophia/pycurity/salt.bin
+      # Master passphrase — sourced from the MAIN PyKeyStore at deploy time.
+      SOPHIA_MASTER_PASSPHRASE: ${SOPHIA_MASTER_PASSPHRASE:?SOPHIA_MASTER_PASSPHRASE must be set in .env (pull from main vault's sophia_master_passphrase service)}
+      # Provider pool YAML — defaults to ladyol's bundled file.
+      SOPHIA_PROVIDER_POOL: ${SOPHIA_PROVIDER_POOL:-}
+      # Logging.
+      SOPHIA_LOG_LEVEL: ${SOPHIA_LOG_LEVEL:-INFO}
+      # Secrets resolution: production = PyKeyStore-only.
+      # Dev workflows can set SOPHIA_ALLOW_ENV_FALLBACK=1 in .env.
+      SOPHIA_ALLOW_ENV_FALLBACK: ${SOPHIA_ALLOW_ENV_FALLBACK:-0}
+    volumes:
+      - sophia_pycurity:/var/lib/sophia/pycurity
+    ports:
+      - "${SOPHIA_PORT:-8765}:8765"
+    # Logging: cap at 20 MB (FastAPI access logs are larger).
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8765/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Optional reverse proxy — disabled by default. Build the Caddy image
+  # locally with `docker build -f Caddy.dockerfile -t sophia-caddy:local .`
+  # before `docker compose --profile tls up -d caddy`.
+  caddy:
+    image: sophia-caddy:local
+    build:
+      context: .
+      dockerfile: Caddy.dockerfile
+    profiles: ["tls"]
+    restart: unless-stopped
+    depends_on:
+      sophia:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN must be set in .env}
+      CADDY_CHALLENGE: ${CADDY_CHALLENGE:-http}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      CLOUDFLARE_ZONE: ${CLOUDFLARE_ZONE:-}
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_tmp:/tmp/caddy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  sophia_pycurity:
+  caddy_data:
+  caddy_config:
+  caddy_tmp:

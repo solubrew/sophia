@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+# But DO allow our own vendored SB-stack wheels under sb-dist/
+# (mirrors nchantdoffice_com's pattern; .dockerignore rules are
+# additive, so the explicit allow below re-includes it).
+!sb-dist/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE / OS / test artefacts
+.idea/
+.vscode/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+.tox/
+tests/
+test_reports/
+.git/
+.github/
+
+# Secrets — NEVER bake these into the image
+.env
+.env.*
+!.env.docker.example
