@@ -85,7 +85,6 @@ RUN python3 /tmp/gen_constraints.py
 # declares that we don't actually need). The list covers everything
 # we hit at runtime when booting sophia/ladyol.
 RUN pip install --prefix=/install --no-cache-dir --no-build-isolation \
-        --constraint /install/sb-constraints.txt \
         --no-deps \
         fastapi 'uvicorn[standard]' 'pydantic>=2.0,<3.0' 'pyyaml>=6.0,<7.0' \
         'sse-starlette>=2.0' httpx click anyio \
@@ -94,9 +93,25 @@ RUN pip install --prefix=/install --no-cache-dir --no-build-isolation \
         sniffio typing-extensions httpcore \
         markdown-it-py pygments typing_inspection 'pandas<3.0' 'numpy<3.0' \
         starlette 'pydantic-core==2.46.4' \
-        'annotated-types>=0.6' annotated_doc \
+        'annotated-types>=0.6' annotated-doc \
         pytz python-dateutil tzdata six jsonschema \
-        networkx opencv-python-headless
+        networkx opencv-python-headless Pillow webp \
+        cryptography cffi \
+        scikit-learn scipy joblib threadpoolctl \
+        narwhals black mypy_extensions pytokens packaging attrs jsonschema \
+        tomli platformdirs
+
+# pathspec + tomlkit are pre-installed into /usr/local at the hatchling
+# step (hatchling requires pathspec>=0.10.1). The bulk pip install
+# below sees "Requirement already satisfied" and skips them — leaving
+# /install without them. Force-install these two into /install
+# explicitly with --ignore-installed so they live alongside the rest
+# of the runtime deps in /install → /usr/local in the runtime stage.
+RUN pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
+        --ignore-installed pathspec==1.1.1 tomlkit==0.15.1 packaging pytokens \
+        diskcache Send2Trash ruamel.yaml pyodbc \
+        referencing rpds-py jsonschema-specifications typer \
+        shellingham colorama
 # Install sophia itself with --no-deps.
 RUN pip install --prefix=/install --no-cache-dir --no-build-isolation \
         --no-deps .[standard]
@@ -125,11 +140,18 @@ RUN groupadd --system --gid 1001 sophia \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
+        unixodbc \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /app /var/lib/sophia/pycurity /tmp /home/sophia \
     && chown -R sophia:sophia /app /home/sophia /tmp /var/lib/sophia
 
 WORKDIR /app
+
+# Drop in the entrypoint BEFORE the chown (so the file is root-owned
+# and we can chmod it). The runtime stage then chowns the rest of /app
+# to the sophia user.
+COPY cluster/entrypoint.py /app/entrypoint.py
+RUN chmod 755 /app/entrypoint.py
 
 COPY --from=builder /install /usr/local
 COPY --from=builder /build/sophia ./sophia
@@ -139,11 +161,14 @@ RUN chown -R sophia:sophia /app
 USER sophia:sophia
 ENV HOME=/home/sophia
 
-# Sophia state dir (sqlite DB + captures + cache). The cluster
-# compose-mounts a named volume here; the standalone single-container
-# setup just writes to /var/lib/sophia inside the image (created
-# below).
-RUN mkdir -p /var/lib/sophia && chown sophia:sophia /var/lib/sophia
+# Pre-create /var/lib/sophia (volume mount target) + /etc/sophia
+# (bundled providers.yaml target) while still root, so the chown
+# below can give the sophia user write access without the chown
+# itself failing on a non-existent dir.
+RUN mkdir -p /var/lib/sophia /etc/sophia \
+    && chown sophia:sophia /var/lib/sophia /etc/sophia
+COPY cluster/providers.yaml /etc/sophia/providers.yaml
+RUN chmod 644 /etc/sophia/providers.yaml
 
 EXPOSE 8765
 
@@ -153,7 +178,11 @@ EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://localhost:8765/healthz || exit 1
 
-# Production entrypoint: uvicorn. PORT env var is honoured so the
-# cluster compose file can override the default 8765.
-SHELL ["/bin/sh", "-c"]
-CMD uvicorn sophia.server:app --host ${HOST:-0.0.0.0} --port ${PORT:-8765} --log-level ${LOG_LEVEL:-info}
+# Sophia's vault init (cluster/entrypoint.py) creates the
+# PyKeyStore vault with a random passphrase + caches the temp
+# key, so the runtime never hits a getpass prompt (which EOFErrors
+# in non-TTY containers). When a real provider key is added via
+# `manage_secrets set`, the operator types the master passphrase
+# from /var/lib/sophia/pycurity/.master_passphrase into the temp
+# prompt — see cluster/README.md §"Adding provider keys".
+CMD ["python", "/app/entrypoint.py"]

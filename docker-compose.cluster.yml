@@ -52,6 +52,11 @@ services:
       SOPHIA_DB: /var/lib/sophia/sophia.db
       SOPHIA_CAPTURES_DIR: /var/lib/sophia/captures
       SOPHIA_CAPTURE_MAX_BYTES: "1073741824"   # 1 GiB
+      # Provider pool: ship a small providers.yaml that points at the
+      # host's local ollama (no API key needed). Override with
+      # SOPHIA_PROVIDER_POOL=/path/to/your.yaml in cluster/.env when you
+      # want to switch providers.
+      SOPHIA_PROVIDER_POOL: /etc/sophia/providers.yaml
     volumes:
       - sophia_data:/var/lib/sophia
       # Bind-mount the local sb-dist wheels so the Dockerfile can

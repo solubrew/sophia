@@ -1,0 +1,185 @@
+# providers.yaml.template
+#
+# Sophia's provider-pool configuration. Sophia reads this file on
+# startup (via the SOPHIA_PROVIDER_POOL env var) and uses it to
+# configure ladyol's ProviderPool — the rotating account pool that
+# fronts /v1/chat/completions.
+#
+# The schema is ladyol's `providers.yaml` (a superset of OpenAI's
+# provider-list format). The bundled reference is in ladyol's
+# installation at:
+#   /usr/local/lib/python3.12/site-packages/ladyol/_data_/providers.yaml
+# (in the sophia image) — every key we use below comes from there.
+#
+# This template is what's pushed to sophia.git. After you fill in your
+# real provider/accounts, the cluster harness copies it into the
+# image at /etc/sophia/providers.yaml and sets SOPHIA_PROVIDER_POOL
+# to point at it. Sophia + Open WebUI then route every chat
+# completion through the configured pool.
+#
+# ────────────────────────────────────────────────────────────────────
+# Template
+# ────────────────────────────────────────────────────────────────────
+
+ProviderPool:
+  strategies:
+    model-provider-selection:
+      - round_robin
+      - round_robin_weighted
+      - random
+      - weighted
+      - cheapest
+      - cheapest_weighted
+      - least_used
+      - least_used_weighted
+      - least_used_cheapest
+      - least_used_cheapest_weighted
+      - best_available
+    task_router:
+      tasks:
+        "default":  "<default-model-id>"
+        "implement": "<default-model-id>"
+        "analyze":  "<default-model-id>"
+
+  providers:
+    # ──── Local providers (no API key needed) ────────────────────────
+    ollama:
+      name: "ollama"
+      display_name: "Local Ollama"
+      env_key: ""
+      is_gateway: False
+      is_local: True
+      base_url: "http://host.docker.internal:11434/v1"
+      skip_prefixes: []
+      supports_prompt_caching: False
+      models:
+        llama3:
+          enabled: True
+          capability_score: 8
+          capabilities: [chat, analysis, code]
+          max_tokens: 8192
+        mistral:
+          enabled: True
+          capability_score: 7
+          capabilities: [chat, code]
+          max_tokens: 8192
+
+    # ──── Cloud providers ───────────────────────────────────────────
+    # Copy this template block for each provider you want to enable.
+    # Fill in `enabled: True` on the model you actually have a key for.
+    #
+    # anthropic:
+    #   name: "anthropic"
+    #   display_name: "Anthropic Claude"
+    #   env_key: "ANTHROPIC_API_KEY"          # name of the env Sophia reads from PyKeyStore
+    #   is_gateway: True
+    #   is_local: False
+    #   supports_prompt_caching: True
+    #   base_url: "https://api.anthropic.com/v1"
+    #   headers:
+    #     Content-Type: "application/json"
+    #     x-api-key: "<[API_KEY]>"            # template placeholder — gets
+    #                                           #   substituted with the
+    #                                           #   PyKeyStore secret at runtime
+    #     anthropic-version: "2023-06-01"
+    #   models:
+    #     claude-3-5-sonnet-20241022:
+    #       enabled: True                      # <-- turn this on for the keys you have
+    #       capability_score: 10
+    #       capabilities: [chat, code, analysis]
+    #       max_tokens: 8192
+    #       context_window: 200000
+    #       costs_per_1k_input: 0.003
+    #       costs_per_1k_output: 0.015
+    #     claude-3-5-haiku-20241022:
+    #       enabled: True
+    #       capability_score: 7
+    #       capabilities: [chat]
+    #       max_tokens: 8192
+    #       context_window: 200000
+    #       costs_per_1k_input: 0.0008
+    #       costs_per_1k_output: 0.004
+    #
+    # openai:
+    #   name: "openai"
+    #   display_name: "OpenAI"
+    #   env_key: "OPENAI_API_KEY"
+    #   is_gateway: True
+    #   is_local: False
+    #   base_url: "https://api.openai.com/v1"
+    #   headers:
+    #     Content-Type: "application/json"
+    #     Authorization: "Bearer <[API_KEY]>"
+    #   models:
+    #     gpt-4o:
+    #       enabled: True
+    #       capability_score: 11
+    #       capabilities: [chat, code, vision]
+    #       max_tokens: 16384
+    #       context_window: 128000
+    #       costs_per_1k_input: 0.0025
+    #       costs_per_1k_output: 0.01
+    #
+    # deepseek:
+    #   name: "deepseek"
+    #   display_name: "DeepSeek"
+    #   env_key: "DEEPSEEK_API_KEY"
+    #   is_gateway: True
+    #   is_local: False
+    #   base_url: "https://api.deepseek.com/v1"
+    #   headers:
+    #     Content-Type: "application/json"
+    #     Authorization: "Bearer <[API_KEY]>"
+    #   models:
+    #     deepseek-chat:
+    #       enabled: True
+    #       capability_score: 9
+    #       capabilities: [chat, code]
+    #       max_tokens: 8192
+    #       costs_per_1k_input: 0.00014
+    #       costs_per_1k_output: 0.00028
+
+# ────────────────────────────────────────────────────────────────────
+# Provider accounts (PyKeyStore-backed)
+# ────────────────────────────────────────────────────────────────────
+# Each provider can have multiple accounts — Sophia rotates across
+# them using the strategy in `strategies.model-provider-selection` (the
+# provider-pool picks the next from the rotation queue per request).
+# Accounts are stored in Sophia's PyKeyStore vault, not in this file.
+# To add an account:
+#
+#   docker compose -f docker-compose.cluster.yml exec -T sophia \
+#     python -m sophia.cmds.manage_secrets set anthropic_api_key
+#     # (paste sk-ant-... when prompted — Sophia reads from stdin,
+#     #  the entrypoint already initialized the vault)
+#
+# The env_key field on each provider (e.g. "ANTHROPIC_API_KEY") is
+# the lookup key Sophia uses when populating the Authorization header.
+# If you add multiple accounts for the same provider, use suffixes:
+#   anthropic_api_key        (account 1, default)
+#   anthropic_api_key_2      (account 2)
+#   anthropic_api_key_3      (account 3)
+# Sophia reads them in suffix order and rotates via the strategy.
+#
+# ────────────────────────────────────────────────────────────────────
+# How to test with this config
+# ────────────────────────────────────────────────────────────────────
+# 1. Fill in the providers + enabled models above.
+# 2. Add one or more accounts per enabled provider via manage_secrets.
+# 3. Open http://127.0.0.1:3000 in a browser → Open WebUI loads with
+#    Sophia as the backend (OPENAI_API_BASE_URL=http://sophia:8765/v1).
+# 4. The Models dropdown shows every enabled model from every
+#    provider; the Strategy dropdown lets you pick the rotation
+#    strategy from the `strategies.model-provider-selection` list.
+# 5. Hit Send on a chat and watch sophia_1's docker logs — you'll see
+#    `[SophiaPool] chat via <provider> <model> via <account>` lines
+#    showing the rotation in action. Per-request usage rows are
+#    written to /var/lib/sophia/sophia.db (visible via the
+#    /v1/usage/summary endpoint with a `collection` or `admin` role).
+#
+# 6. Confirm the rotation is happening by sending the same prompt N
+#    times and checking /v1/usage/by_provider?requestor=openwebui —
+#    each call should land on a different account until the rotation
+#    cycles. With one account per provider you'll see the strategy
+#    picking the cheapest / least-used / round-robin across PROVIDERS
+#    rather than across accounts.

@@ -57,10 +57,13 @@ def live_server(monkeypatch):
                 yield "x"
             return gen()
 
-    # Patch the symbol that sophia.pool imports, so when it instantiates ProviderPool
-    # inside _ensure_pool, it gets the fake.
+    # Patch the symbol that sophia.pool imports lazily from ladyol.
+    # We have to patch the source-of-truth (`ladyol.providers`) rather
+    # than `sophia.pool.ProviderPool` because sophia defers that
+    # import to inside _ensure_pool (so there's no module-level
+    # ProviderPool attribute to monkeypatch).
     fake_instance = FakeProviderPool(memory=None)
-    monkeypatch.setattr(sophia.pool, "ProviderPool", lambda *a, **kw: fake_instance)
+    monkeypatch.setattr("ladyol.providers.ProviderPool", lambda *a, **kw: fake_instance)
 
     # Now import server fresh and grab the app.
     import sophia.server

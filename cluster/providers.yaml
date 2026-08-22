@@ -1,0 +1,53 @@
+# providers.yaml — Sophia's provider-pool config. The operator fills
+# this in from cluster/providers.yaml.template (the documented schema
+# reference) and commits it back to the repo. The cluster harness
+# COPYs whatever is here into /etc/sophia/providers.yaml at build
+# time. Until you fill it in, the pool has zero enabled accounts and
+# every chat will return 502 — expected, harmless, by design.
+#
+# Start from cluster/providers.yaml.template for the schema + provider
+# block examples. Keep the strategy block at the top; the providers
+# list is yours to populate.
+#
+# When this file is non-empty, sophia's /v1/models and /v1/chat/completions
+# endpoints will serve the configured models. Open WebUI on :3000 will
+# pick them up too (it auto-discovers via the OpenAI-compatible
+# /v1/models endpoint).
+#
+# Tip: while developing, keep ollama (the local-model section in the
+# template) as the only enabled provider. It needs no account and the
+# local ollama container is already running on this host. Once the
+# wire is working end-to-end, add your real providers + accounts.
+
+ProviderPool:
+  strategies:
+    model-provider-selection:
+      - round_robin
+      - round_robin_weighted
+      - random
+      - weighted
+      - cheapest
+      - least_used
+      - best_available
+    task_router:
+      tasks:
+        "default":  "llama3"
+        "implement": "llama3"
+        "analyze":  "llama3"
+
+  providers:
+    ollama:
+      name: "ollama"
+      display_name: "Local Ollama"
+      env_key: ""
+      is_gateway: False
+      is_local: True
+      base_url: "http://host.docker.internal:11434/v1"
+      skip_prefixes: []
+      supports_prompt_caching: False
+      models:
+        llama3:
+          enabled: True
+          capability_score: 8
+          capabilities: [chat, analysis, code]
+          max_tokens: 8192

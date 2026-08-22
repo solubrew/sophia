@@ -130,10 +130,22 @@ class SophiaPool:
                                        strategy=strategy, temperature=temperature):
             yield chunk
 
-    async def list_models(self) -> List[ModelCard]:
-        pool = await self._ensure_pool()
-        available = pool.available()  # {provider: [models]}
-        out: List[ModelCard] = []
+    async def list_models(self) -> list:
+        try:
+            pool = await self._ensure_pool()
+            available = pool.available()  # {provider: [models]}
+        except (ValueError, RuntimeError) as exc:
+            # Empty pool / no provider accounts is a perfectly valid
+            # state for a freshly-bootstrapped cluster — the operator
+            # adds provider keys via `manage_secrets set` later. We
+            # surface it as an empty list (HTTP 200) rather than 500
+            # so /v1/models and /healthz always return something
+            # useful for the Open WebUI's startup probe.
+            if "no provider" in str(exc).lower() or "not found" in str(exc).lower():
+                logma.warning(f"SophiaPool: {exc}; returning empty model list")
+                return []
+            raise
+        out: list = []
         for provider, models in available.items():
             for m in models:
                 out.append(ModelCard(id=m, owned_by=provider))

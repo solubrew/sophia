@@ -47,9 +47,15 @@ class FakePool:
 
 @pytest.fixture
 def fake_pool_instance(monkeypatch):
-    """Replace ``ladyol.providers.ProviderPool`` with FakePool and return the instance."""
+    """Replace ``ladyol.providers.ProviderPool`` with FakePool and return the instance.
+
+    NB: sophia.pool imports ProviderPool lazily inside _ensure_pool, so
+    there is no module-level `sophia.pool.ProviderPool` attribute to
+    patch. We patch the source-of-truth (`ladyol.providers.ProviderPool`)
+    instead, which is the import that _ensure_pool resolves at call time.
+    """
     instance = FakePool(memory=None)
-    monkeypatch.setattr("sophia.pool.ProviderPool", lambda *a, **kw: instance)
+    monkeypatch.setattr("ladyol.providers.ProviderPool", lambda *a, **kw: instance)
     return instance
 
 
