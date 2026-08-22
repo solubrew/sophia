@@ -61,46 +61,95 @@ print(f'sPR: source vault opens OK, {len(keys)} keys present')
 echo "=== wiping sophia volume + recreating with merge vars ==="
 cd "$ROOT"
 
-# v1 docker-compose does NOT auto-load `.env` (that's a v2 feature),
-# and it does NOT inherit the parent shell's env. The only
-# reliable way to inject env vars is to add them to the YAML's
-# `environment:` block before `up`. We:
-#   1) make a temp copy of the YAML with the merge env vars injected
-#   2) run `up` against the temp YAML
-#   3) leave the temp YAML in place (compose writes container
-#      metadata to a project dir; renaming the YAML mid-flight
-#      would confuse subsequent operations)
-#   4) delete the temp YAML at script exit
-TMP_YAML="$(mktemp -u /tmp/sophia-compose-XXXXXX.yml)"
+# v1 docker-compose does NOT auto-load `.env` (v2 feature), does
+# NOT inherit the parent shell's env, and does NOT understand the
+# v2 ${VAR:?error} syntax that the open-webui block uses. The
+# cleanest way to inject the merge env vars is to make a temp copy
+# of the YAML in the project dir with the merge vars injected + the
+# v2 syntax downgraded to v1-compatible, then run 'up' against it.
+# The temp YAML must be in the project dir so docker-compose can
+# find the Dockerfile (relative path) and the .env (auto-loaded
+# from the YAML's directory).
+#
+# We also bind-mount the source vault's parent directory into the
+# sophia container at /host-pycurity, so the entrypoint can read the
+# source vault file from inside the container. The operator's real
+# vault lives at ~/.local/share/pycurity/secure_store.db on the host;
+# we mount ~/.local/share/pycurity/ into the container and reference
+# it as /host-pycurity/secure_store.db.
+SRC_MOUNT_DIR="$(dirname "$SRC_DB")"
+TMP_YAML="$(mktemp -u $ROOT/sophia-compose-XXXXXX.yml)"
 cp -p docker-compose.cluster.yml "$TMP_YAML"
-# Inject the merge vars into the sophia service's environment:
-# We add them at the END of the existing environment: list (so they
-# take precedence in case the user has them hardcoded as a literal
-# empty string elsewhere).
-python3 -c "
-import sys
-import re
-with open('$TMP_YAML') as f:
-    text = f.read()
-merge_vars = (
-    '      SOPHIA_MERGE_FROM_PYCURITY_PATH: \"$SRC_DB\"\n'
-    '      SOPHIA_MERGE_PASSPHRASE: \"$SRC_PASS\"\n'
-)
-# Insert right after the first 'environment:' under the sophia
-# service (the first occurrence in the file is for sophia since
-# sophia is defined first).
-new_text = text.replace('      PORT: \"8765\"', '      PORT: \"8765\"\n' + merge_vars, 1)
-with open('$TMP_YAML', 'w') as f:
-    f.write(new_text)
-print('injected merge vars into', '$TMP_YAML')
-"
+./cluster/inject-merge-vars.py docker-compose.cluster.yml "$TMP_YAML" "/host-pycurity/secure_store.db" "$SRC_PASS"
 
+# Validate the source vault exists AND is readable by the user
+# the container will run as (sophia, uid 1001). PyKeyStore files
+# are mode 600 by default (only owner can read), and the
+# parent directory is mode 700 (only owner can traverse). Both
+# block the bind-mount. We chmod both for the duration of the
+# seed-keys flow, then restore the original perms.
+if [ ! -f "$SRC_DB" ]; then
+  echo "ERROR: source vault file not found at $SRC_DB" >&2
+  exit 2
+fi
+SRC_DIR="$(dirname "$SRC_DB")"
+ORIG_PERMS=$(stat -c '%a' "$SRC_DB")
+ORIG_DIR_PERMS=$(stat -c '%a' "$SRC_DIR")
+ORIG_OWNER=$(stat -c '%U:%G' "$SRC_DB")
+NEED_RESTORE=0
+if [ "$ORIG_PERMS" != "444" ] && [ "$ORIG_PERMS" != "644" ] && [ "$ORIG_PERMS" != "464" ] && [ "$ORIG_PERMS" != "664" ]; then
+  echo "Making $SRC_DB world-readable (chmod 444) for the duration of the seed"
+  echo "  (was mode $ORIG_PERMS owned by $ORIG_OWNER; will be restored)"
+  chmod 444 "$SRC_DB"
+  NEED_RESTORE=1
+fi
+if [ "$ORIG_DIR_PERMS" != "755" ] && [ "$ORIG_DIR_PERMS" != "775" ] && [ "$ORIG_DIR_PERMS" != "777" ] && [ "$ORIG_DIR_PERMS" != "744" ] && [ "$ORIG_DIR_PERMS" != "711" ]; then
+  echo "Making $SRC_DIR world-traversable (chmod 755) for the duration of the seed"
+  echo "  (was mode $ORIG_DIR_PERMS; will be restored)"
+  chmod 755 "$SRC_DIR"
+  NEED_RESTORE_DIR=1
+fi
 cleanup() {
   rm -f "$TMP_YAML"
+  if [ -n "$NEED_RESTORE" ]; then
+    echo "restoring $SRC_DB to mode $ORIG_PERMS"
+    chmod "$ORIG_PERMS" "$SRC_DB"
+  fi
+  if [ -n "$NEED_RESTORE_DIR" ]; then
+    echo "restoring $SRC_DIR to mode $ORIG_DIR_PERMS"
+    chmod "$ORIG_DIR_PERMS" "$SRC_DIR"
+  fi
 }
 trap cleanup EXIT
 
 ./cluster/docker-compose -f "$TMP_YAML" down -v >/dev/null 2>&1 || true
+# Inject the bind-mount into the sophia service: point /host-pycurity
+# at the source vault directory on the host. The yaml uses 4-space
+# indent for top-level volume lines (the volumes: list is at
+# service-level, items are at 2 + 2 indent). We pass SRC_MOUNT_DIR
+# into the python3 subshell via export so the actual value (not the
+# literal `$SRC_MOUNT_DIR` string) gets substituted.
+export SRC_MOUNT_DIR
+python3 -c "
+import os
+with open('$TMP_YAML') as f:
+    text = f.read()
+SRC_MOUNT_DIR = os.environ['SRC_MOUNT_DIR']
+bind = f'      - \"{SRC_MOUNT_DIR}:/host-pycurity:ro\"\n'
+if '/host-pycurity' not in text or SRC_MOUNT_DIR not in text:
+    new_text = text.replace(
+        '      - ./sb-dist:/opt/sophia/sb-dist:ro',
+        '      - ./sb-dist:/opt/sophia/sb-dist:ro\n' + bind,
+        1,
+    )
+    if new_text == text:
+        print('WARN: sb-dist bind line not found; mount injection skipped', file=__import__('sys').stderr)
+    else:
+        with open('$TMP_YAML', 'w') as f:
+            f.write(new_text)
+        print('injected bind mount for', SRC_MOUNT_DIR)
+"
+unset SRC_MOUNT_DIR
 ./cluster/docker-compose -f "$TMP_YAML" up -d --force-recreate sophia
 
 # Wait for the entrypoint to complete (success OR failure).

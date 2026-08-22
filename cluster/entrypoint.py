@@ -15,6 +15,16 @@ import secrets
 import sys
 from pathlib import Path
 
+# Force unbuffered stderr so the operator can see our diagnostic
+# messages in `docker logs` (Python defaults to block-buffering stderr
+# when the output is a pipe, which makes debugging this entrypoint
+# miserable). Python 3.7+ supports reconfigure; for safety we
+# wrap in try/except for the (very unlikely) older-Python case.
+try:
+    sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+except Exception:
+    pass
+
 VAULT_DIR = Path("/var/lib/sophia/pycurity")
 VAULT_DB = VAULT_DIR / "vault.db"
 SALT_BIN = VAULT_DIR / "salt.bin"
@@ -61,8 +71,13 @@ def _ensure_vault() -> None:
 
 
 def _merge_from_system_wide() -> None:
+    # DEBUG: log the entire relevant env so we can see what's reaching
+    # the entrypoint from compose.
+    sys.stderr.write(f"[entrypoint] _merge_from_system_wide: env_has_merge_path={'SOPHIA_MERGE_FROM_PYCURITY_PATH' in os.environ}\n")
+    sys.stderr.write(f"[entrypoint] _merge_from_system_wide: env_has_merge_pass={'SOPHIA_MERGE_PASSPHRASE' in os.environ}\n")
     src_path = os.environ.pop(MERGE_FROM_ENV, "").strip()
     src_pass = os.environ.pop(MERGE_PASS_ENV, "").strip()
+    sys.stderr.write(f"[entrypoint] _merge_from_system_wide: src_path={src_path!r} src_pass_set={bool(src_pass)}\n")
     if not src_path:
         return
     if not src_pass:
