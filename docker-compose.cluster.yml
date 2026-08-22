@@ -1,0 +1,112 @@
+# docker-compose.yml — Sophia cluster for end-to-end testing.
+#
+# Topology (this host):
+#
+#   open-webui (localhost:3000) ──┐
+#                                 ├──▶ sophia (LAN:8765) ──▶ ollama / future providers
+#   hermes (later) ──────────────┘
+#
+# Sophia uses SQLite inside the named `sophia_data` volume — one
+# single SQLite file holds the requestor keys + usage log + role
+# metadata. The cluster has NO postgres dependency: the bootstrap
+# service that originally tried to seed a `sophia` DB on the shared
+# ncho-postgres was removed after we discovered the existing
+# ncho-postgres launch env carries a stale POSTGRES_PASSWORD (so any
+# outside connection fails authentication). When Sophia's Postgres
+# adapter lands (per HERMES_SETUP.md §5), we'll add the bootstrap
+# service back + flip SOPHIA_DB to a postgres:// URL — but that's a
+# separate piece of work.
+#
+# Patterns lifted from nchantdoffice_com/docker-compose.yml:
+#   - named services + named volumes
+#   - json-file log rotation (10 MB × 3)
+#   - depends_on with healthchecks (when compose v2 is available)
+#   - secrets via PyKeyStore, NOT env vars (the web container reads
+#     vault.db at startup; never put provider API keys in .env)
+#
+# Run:    ./cluster/docker-compose -f docker-compose.cluster.yml up -d --build
+# Stop:   ./cluster/docker-compose -f docker-compose.cluster.yml down
+# Wipe:   ./cluster/docker-compose -f docker-compose.cluster.yml down -v
+#
+# NB: the host's `docker-compose` CLI is v1.29 (legacy). Use
+# `./cluster/docker-compose` (our local wrapper) — it shims the
+# dropped `ssl_version` kwarg so v1 still works against modern dockerd.
+# When the docker-compose-plugin v2 lands, the shim can go away and
+# this file gains `version: "3.8"` + top-level `name:` + restored
+# `depends_on: condition:` clauses.
+
+services:
+  sophia:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # LAN bind — exposed on the host's loopback for the test (open
+      # webui + hermes both run on this host too).
+      HOST: "0.0.0.0"
+      PORT: "8765"
+      # Sophia's SQLite DB lives on the named volume mounted at
+      # /var/lib/sophia. The path matches what the Dockerfile
+      # RUN mkdir'd so the sophia user (uid 1001) can write.
+      SOPHIA_DB: /var/lib/sophia/sophia.db
+      SOPHIA_CAPTURES_DIR: /var/lib/sophia/captures
+      SOPHIA_CAPTURE_MAX_BYTES: "1073741824"   # 1 GiB
+    volumes:
+      - sophia_data:/var/lib/sophia
+      # Bind-mount the local sb-dist wheels so the Dockerfile can
+      # COPY them in. Read-only is fine — the container never writes
+      # back to the host checkout.
+      - ./sb-dist:/opt/sophia/sb-dist:ro
+    ports:
+      - "127.0.0.1:8765:8765"   # LAN-test only; remove for prod
+    healthcheck:
+      # /healthz is the FastAPI health endpoint (no auth required).
+      # Single-shot `wget` (no curl in the image).
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8765/healthz >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  open-webui:
+    # Official image — Open WebUI speaks OpenAI-compatible /v1 since
+    # 0.4.x, so pointing it at sophia needs only the URL + a Bearer key.
+    image: ghcr.io/open-webui/open-webui:main
+    restart: unless-stopped
+    depends_on:
+      - sophia
+    environment:
+      OPENAI_API_BASE_URL: http://sophia:8765/v1
+      OPENAI_API_KEY: ${SOPHIA_REQUESTOR_KEY:?set SOPHIA_REQUESTOR_KEY in .env to the requestor key you create}
+      # Point at the host's existing ollama so the UI's "models"
+      # list shows local models too (useful fallback while we wire
+      # Sophia providers).
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      # Disable auth for the test. Production: WEBUI_AUTH=true +
+      # configure an admin user.
+      WEBUI_AUTH: "false"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:3000:8080"
+    volumes:
+      - openwebui_data:/app/backend/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  default:
+    driver: bridge
+
+volumes:
+  sophia_data:
+  openwebui_data:

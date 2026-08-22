@@ -107,9 +107,18 @@ def create_app(config=None) -> FastAPI:
 
     @app.get("/healthz")
     async def healthz():
-        models = await pool.list_models()
-        providers = sorted({m.owned_by for m in models})
-        return {"status": "ok", "providers": len(providers), "models": len(models)}
+        """Process-alive probe. Does NOT touch ladyol or the DB —
+        a transient import hiccup in either must not trigger container
+        restarts. Returns a richer payload if providers/models are
+        reachable, but always returns 200 if the FastAPI loop is
+        responsive."""
+        try:
+            models = await pool.list_models()
+            providers = sorted({m.owned_by for m in models})
+            return {"status": "ok", "providers": len(providers), "models": len(models)}
+        except Exception as exc:  # noqa: BLE001 — healthz must always 200
+            logma.warning(f"/healthz: pool unreachable ({exc.__class__.__name__}); returning minimal ok")
+            return {"status": "ok", "providers": 0, "models": 0, "note": "pool not initialized"}
 
     @app.get("/v1/models")
     async def list_models(rec=Depends(_cap_dep("chat"))):

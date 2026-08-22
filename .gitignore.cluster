@@ -1,0 +1,5 @@
+.env
+.coverage
+FALCON_TEST.yaml
+PROJECT_TRACKER.*
+test_reports/

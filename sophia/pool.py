@@ -13,7 +13,6 @@ import uuid
 from typing import AsyncIterator, List, Optional
 
 from kahndor.logma import Logma
-from ladyol.providers import ProviderPool
 
 from sophia.config import SophiaConfig
 from sophia.schemas import ModelCard
@@ -22,14 +21,25 @@ logma = Logma(__name__)
 
 
 class SophiaPool:
-    """One per process. Construct lazily so import is cheap."""
+    """One per process. Construct lazily so import is cheap.
+
+    `from ladyol.providers import ProviderPool` is deferred — ladyol
+    has a deep transitive import tree (pandas → numpy, etc.) that
+    we don't want at Sophia boot. We import inside ``_pool()`` so
+    the rest of the FastAPI app can serve /healthz and admin
+    endpoints even when no provider config exists.
+    """
 
     def __init__(self, config: SophiaConfig):
         self._config = config
         self._lock = asyncio.Lock()
-        self._pool: Optional[ProviderPool] = None
+        self._pool = None
 
-    async def _ensure_pool(self) -> ProviderPool:
+    async def _ensure_pool(self):
+        # Defer the heavy import until the first chat call. Sophia
+        # can serve /healthz + admin endpoints without ever loading
+        # ladyol.
+        from ladyol.providers import ProviderPool  # noqa: PLC0415
         if self._pool is None:
             async with self._lock:
                 if self._pool is None:

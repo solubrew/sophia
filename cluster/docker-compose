@@ -1,0 +1,29 @@
+#!/usr/bin/python3
+"""Wrapper for the legacy docker-compose v1.29 binary on this host.
+
+The host's /usr/bin/docker-compose (1.29) is broken against modern
+dockerd because it passes ``ssl_version=`` to docker-py's
+``kwargs_from_env``, which the newer docker SDK dropped. This wrapper
+imports our local shim FIRST (so it monkey-patches docker.utils) and
+then runs the same entry point as the system binary.
+
+Use this INSTEAD of /usr/bin/docker-compose for the sophia cluster:
+    ./cluster/docker-compose -f docker-compose.cluster.yml up -d
+
+Once the docker-compose-plugin (v2) is installed system-wide and
+``docker compose`` works, this file can be deleted.
+"""
+import os
+import sys
+
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)
+
+try:
+    import docker_compose_shim  # noqa: F401  — side-effecting import
+except Exception as exc:
+    print(f"warning: shim import failed: {exc}", file=sys.stderr)
+
+from compose.cli.main import main
+
+main()
