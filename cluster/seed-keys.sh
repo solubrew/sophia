@@ -66,20 +66,23 @@ SOPHIA_MERGE_PASSPHRASE="$SRC_PASS" \
 ./cluster/docker-compose -f docker-compose.cluster.yml up -d --force-recreate sophia
 
 # Wait for the entrypoint to complete (success OR failure).
-echo "=== waiting for sophia container to settle ==="
+# v1 docker-compose doesn't support --format json, so we use
+# docker inspect to read the container's state directly. We
+# consider the entrypoint "settled" when the container is
+# either (a) running AND has been Up for at least 5 seconds
+# (so the merge completed), or (b) restarting/Restarted (the
+# entrypoint crashed on the merge).
+echo "=== waiting for sophia container to settle (max 60s) ==="
 for i in $(seq 1 30); do
-  state=$(./cluster/docker-compose -f docker-compose.cluster.yml ps --format json 2>/dev/null \
-    | /home/solubrew/ENVs/shieldface/bin/python3 -c "
-import sys, json
-for line in sys.stdin:
-    try:
-        d = json.loads(line)
-        if d['Service'] == 'sophia':
-            print(d.get('State', 'unknown'))
-    except: pass
-" 2>/dev/null)
-  if [ "$state" = "running" ] || echo "$state" | grep -q "Restarting"; then
-    if [ "$i" -gt 3 ]; then sleep 2; fi
+  cstate=$(docker inspect -f '{{.State.Status}}' sophia_sophia_1 2>/dev/null)
+  cuptime=$(docker inspect -f '{{.State.StartedAt}}' sophia_sophia_1 2>/dev/null)
+  if [ "$cstate" = "running" ]; then
+    if [ -n "$cuptime" ] && [ "$(date -d "$cuptime" +%s 2>/dev/null)" -lt "$(($(date +%s) - 5))" ]; then
+      echo "sophia has been running for 5s+ (entrypoint settled)"
+      break
+    fi
+  elif [ "$cstate" = "restarting" ] || [ "$cstate" = "exited" ]; then
+    echo "sophia state=$cstate (entrypoint failed)"
     break
   fi
   sleep 2
@@ -87,9 +90,9 @@ done
 
 sleep 5
 
-state=$(./cluster/docker-compose -f docker-compose.cluster.yml ps 2>&1 | grep sophia_sophia | awk '{print $2}')
-if echo "$state" | grep -qi restart; then
-  echo "ERROR: sophia is restarting. Last 30 log lines:"
+state=$(docker inspect -f '{{.State.Status}}' sophia_sophia_1 2>/dev/null)
+if [ "$state" = "restarting" ] || [ "$state" = "exited" ]; then
+  echo "ERROR: sophia is in state=$state. Last 30 log lines:"
   ./cluster/docker-compose -f docker-compose.cluster.yml logs --tail=30 sophia
   exit 3
 fi
