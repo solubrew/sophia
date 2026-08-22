@@ -254,14 +254,16 @@ for k in keys:
 echo "$LOCAL_KEYS"
 
 echo
-echo "=== backfill: cluster master passphrase → source vault ==="
+echo "=== create: sophia cluster master passphrase → source vault ==="
 # The cluster's auto-generated master passphrase is at
 # /var/lib/sophia/pycurity/.master_passphrase. Other tools on the
 # host (nchantdoffice_com, future services joining the cluster) may
-# want to unlock the same Sophia vault — they need the same passphrase.
-# Backfill the passphrase into the SOURCE vault as a key named
-# 'sophia_cluster_master_passphrase' so it's discoverable from a
-# single source.
+# want to unlock the same Sophia vault — they need the same
+# passphrase. Write the passphrase as a NEW key in the source vault
+# under the name 'sophia_cluster_master_passphrase'. This is NOT a
+# backfill of an existing key — it's a fresh key written by the
+# cluster seed operation. (nchantdoffice_cluster_master_passphrase
+# is for a *different* cluster; we don't touch that one.)
 CLUSTER_PASS=$(docker exec sophia_sophia_1 cat /var/lib/sophia/pycurity/.master_passphrase)
 echo "Cluster passphrase is ${#CLUSTER_PASS} chars (writing to source vault as 'sophia_cluster_master_passphrase')"
 # We use the local python interpreter (not the container's) so we
@@ -274,9 +276,9 @@ src_ks = PyKeyStore(db_path='$SRC_DB', salt_path='$SRC_DIR/secure_store.salt', p
 src_ks.set(
     'sophia_cluster_master_passphrase',
     {'api_key': '$CLUSTER_PASS', 'name': 'sophia_cluster_master_passphrase'},
-    comment='Sophia cluster local vault master passphrase (auto-rotated by entrypoint; backfilled by seed-keys.sh)',
+    comment='Sophia cluster local vault master passphrase (auto-rotated by entrypoint on each fresh container; updated by seed-keys.sh on every cluster restart)',
 )
-print('backfilled')
+print('created')
 " 2>&1 | tail -3
 
 echo
