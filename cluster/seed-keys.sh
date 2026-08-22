@@ -88,36 +88,57 @@ cp -p docker-compose.cluster.yml "$TMP_YAML"
 # parent directory is mode 700 (only owner can traverse). Both
 # block the bind-mount. We chmod both for the duration of the
 # seed-keys flow, then restore the original perms.
+#
+# NB: chmod needs to cover ALL files in the vault dir — not just
+# the .db file. The entrypoint opens the .salt file
+# separately via salt_path=... and trips PermissionError if the
+# .salt is still mode 600. SQLite also has .db-shm / .db-wal
+# sidecars that the container reads.
 if [ ! -f "$SRC_DB" ]; then
   echo "ERROR: source vault file not found at $SRC_DB" >&2
   exit 2
 fi
 SRC_DIR="$(dirname "$SRC_DB")"
-ORIG_PERMS=$(stat -c '%a' "$SRC_DB")
 ORIG_DIR_PERMS=$(stat -c '%a' "$SRC_DIR")
 ORIG_OWNER=$(stat -c '%U:%G' "$SRC_DB")
-NEED_RESTORE=0
-if [ "$ORIG_PERMS" != "444" ] && [ "$ORIG_PERMS" != "644" ] && [ "$ORIG_PERMS" != "464" ] && [ "$ORIG_PERMS" != "664" ]; then
-  echo "Making $SRC_DB world-readable (chmod 444) for the duration of the seed"
-  echo "  (was mode $ORIG_PERMS owned by $ORIG_OWNER; will be restored)"
-  chmod 444 "$SRC_DB"
-  NEED_RESTORE=1
-fi
+NEED_RESTORE_DIR=0
+
 if [ "$ORIG_DIR_PERMS" != "755" ] && [ "$ORIG_DIR_PERMS" != "775" ] && [ "$ORIG_DIR_PERMS" != "777" ] && [ "$ORIG_DIR_PERMS" != "744" ] && [ "$ORIG_DIR_PERMS" != "711" ]; then
   echo "Making $SRC_DIR world-traversable (chmod 755) for the duration of the seed"
   echo "  (was mode $ORIG_DIR_PERMS; will be restored)"
   chmod 755 "$SRC_DIR"
   NEED_RESTORE_DIR=1
 fi
+
+# Chmod every file in the vault dir to 444 (or skip files that are
+# already world-readable). Track original perms for restore.
+declare -A ORIG_FILE_PERMS
+NEED_RESTORE_FILES=0
+for f in "$SRC_DIR"/*; do
+  [ -f "$f" ] || continue
+  cur=$(stat -c '%a' "$f")
+  case "$cur" in
+    444|644|464|664|4444) continue ;;  # already world-readable
+  esac
+  ORIG_FILE_PERMS["$f"]="$cur"
+  chmod 444 "$f"
+  NEED_RESTORE_FILES=1
+done
+if [ "$NEED_RESTORE_FILES" = "1" ]; then
+  echo "Made $((${#ORIG_FILE_PERMS[@]})) file(s) in $SRC_DIR world-readable (was mode 600 each; will be restored)"
+fi
+
 cleanup() {
   rm -f "$TMP_YAML"
-  if [ -n "$NEED_RESTORE" ]; then
-    echo "restoring $SRC_DB to mode $ORIG_PERMS"
-    chmod "$ORIG_PERMS" "$SRC_DB"
-  fi
   if [ -n "$NEED_RESTORE_DIR" ]; then
     echo "restoring $SRC_DIR to mode $ORIG_DIR_PERMS"
     chmod "$ORIG_DIR_PERMS" "$SRC_DIR"
+  fi
+  if [ "$NEED_RESTORE_FILES" = "1" ]; then
+    for f in "${!ORIG_FILE_PERMS[@]}"; do
+      chmod "${ORIG_FILE_PERMS[$f]}" "$f"
+    done
+    echo "restored $((${#ORIG_FILE_PERMS[@]})) file(s) in $SRC_DIR to their original perms"
   fi
 }
 trap cleanup EXIT
