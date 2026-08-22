@@ -264,8 +264,15 @@ echo "=== create: sophia cluster master passphrase → source vault ==="
 # backfill of an existing key — it's a fresh key written by the
 # cluster seed operation. (nchantdoffice_cluster_master_passphrase
 # is for a *different* cluster; we don't touch that one.)
+#
+# SQLite needs WRITE perms on the db file (and the .db-wal sidecar
+# that WAL-mode sqlite uses). The chmod 444 we did earlier makes
+# the db read-only. We bump it to 644 just for the backfill, then
+# put it back to 444. (The trap will restore to original 600 at
+# script exit.)
 CLUSTER_PASS=$(docker exec sophia_sophia_1 cat /var/lib/sophia/pycurity/.master_passphrase)
 echo "Cluster passphrase is ${#CLUSTER_PASS} chars (writing to source vault as 'sophia_cluster_master_passphrase')"
+chmod 644 "$SRC_DB"
 # We use the local python interpreter (not the container's) so we
 # can hit the SOURCE vault at $SRC_DB on the host filesystem.
 python3 -c "
@@ -280,6 +287,10 @@ src_ks.set(
 )
 print('created')
 " 2>&1 | tail -3
+# Restore the read-only state so the script's overall restore
+# logic (chmod 600 at script exit) sees the expected starting
+# perms in ORIG_FILE_PERMS.
+chmod 444 "$SRC_DB"
 
 echo
 echo "=== /v1/models with the merge applied ==="
