@@ -272,7 +272,13 @@ echo "=== create: sophia cluster master passphrase → source vault ==="
 # script exit.)
 CLUSTER_PASS=$(docker exec sophia_sophia_1 cat /var/lib/sophia/pycurity/.master_passphrase)
 echo "Cluster passphrase is ${#CLUSTER_PASS} chars (writing to source vault as 'sophia_cluster_master_passphrase')"
-chmod 644 "$SRC_DB"
+# SQLite WAL mode needs WRITE perms on the .db AND the .db-wal
+# sidecar (and .db-shm shared memory file). Bump all four to 644
+# for the backfill, then put them back to 444. The script's EXIT
+# trap will restore to original 600 at script exit.
+for f in "$SRC_DB" "$SRC_DIR/secure_store.salt" "$SRC_DIR/secure_store.db-wal" "$SRC_DIR/secure_store.db-shm"; do
+  [ -f "$f" ] && chmod 644 "$f"
+done
 # We use the local python interpreter (not the container's) so we
 # can hit the SOURCE vault at $SRC_DB on the host filesystem.
 python3 -c "
@@ -290,7 +296,9 @@ print('created')
 # Restore the read-only state so the script's overall restore
 # logic (chmod 600 at script exit) sees the expected starting
 # perms in ORIG_FILE_PERMS.
-chmod 444 "$SRC_DB"
+for f in "$SRC_DB" "$SRC_DIR/secure_store.salt" "$SRC_DIR/secure_store.db-wal" "$SRC_DIR/secure_store.db-shm"; do
+  [ -f "$f" ] && chmod 444 "$f"
+done
 
 echo
 echo "=== /v1/models with the merge applied ==="
