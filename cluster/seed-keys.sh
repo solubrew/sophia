@@ -61,44 +61,47 @@ print(f'sPR: source vault opens OK, {len(keys)} keys present')
 echo "=== wiping sophia volume + recreating with merge vars ==="
 cd "$ROOT"
 
-# v1 docker-compose does NOT inherit the parent shell's env into
-# containers. The two reliable ways to pass vars are:
-#   1) the YAML's environment: block (static)
-#   2) the .env file in the same directory as the compose YAML
-#      (auto-loaded by `compose up`; later vars override earlier)
-# We use #2: append the merge vars to a fragment file alongside the
-# real .env. After the up, we remove the fragment so the passphrase
-# doesn't persist in the project dir.
-ENV_FRAGMENT="$ROOT/.env.merge-fragment"
-cat > "$ENV_FRAGMENT" <<EOF
-SOPHIA_MERGE_FROM_PYCURITY_PATH=$SRC_DB
-SOPHIA_MERGE_PASSPHRASE=$SRC_PASS
-EOF
-chmod 600 "$ENV_FRAGMENT"
+# v1 docker-compose does NOT auto-load `.env` (that's a v2 feature),
+# and it does NOT inherit the parent shell's env. The only
+# reliable way to inject env vars is to add them to the YAML's
+# `environment:` block before `up`. We:
+#   1) make a temp copy of the YAML with the merge env vars injected
+#   2) run `up` against the temp YAML
+#   3) leave the temp YAML in place (compose writes container
+#      metadata to a project dir; renaming the YAML mid-flight
+#      would confuse subsequent operations)
+#   4) delete the temp YAML at script exit
+TMP_YAML="$(mktemp -u /tmp/sophia-compose-XXXXXX.yml)"
+cp -p docker-compose.cluster.yml "$TMP_YAML"
+# Inject the merge vars into the sophia service's environment:
+# We add them at the END of the existing environment: list (so they
+# take precedence in case the user has them hardcoded as a literal
+# empty string elsewhere).
+python3 -c "
+import sys
+import re
+with open('$TMP_YAML') as f:
+    text = f.read()
+merge_vars = (
+    '      SOPHIA_MERGE_FROM_PYCURITY_PATH: \"$SRC_DB\"\n'
+    '      SOPHIA_MERGE_PASSPHRASE: \"$SRC_PASS\"\n'
+)
+# Insert right after the first 'environment:' under the sophia
+# service (the first occurrence in the file is for sophia since
+# sophia is defined first).
+new_text = text.replace('      PORT: \"8765\"', '      PORT: \"8765\"\n' + merge_vars, 1)
+with open('$TMP_YAML', 'w') as f:
+    f.write(new_text)
+print('injected merge vars into', '$TMP_YAML')
+"
 
-# Take a backup of the real .env if it exists, then cat them
-# together so compose sees the merged vars. We restore on exit.
-BACKUP=""
-if [ -f "$ROOT/.env" ]; then
-  BACKUP="$ROOT/.env.backup.$(date +%s)"
-  cp -p "$ROOT/.env" "$BACKUP"
-  cat "$BACKUP" "$ENV_FRAGMENT" > "$ROOT/.env.tmp"
-  mv "$ROOT/.env.tmp" "$ROOT/.env"
-fi
-
-# Make sure the .env is consumed + the fragment is removed no
-# matter what happens.
 cleanup() {
-  if [ -n "$BACKUP" ] && [ -f "$BACKUP" ]; then
-    cp -p "$BACKUP" "$ROOT/.env"
-    rm -f "$BACKUP"
-  fi
-  rm -f "$ENV_FRAGMENT"
+  rm -f "$TMP_YAML"
 }
 trap cleanup EXIT
 
-./cluster/docker-compose -f docker-compose.cluster.yml down -v >/dev/null 2>&1 || true
-./cluster/docker-compose -f docker-compose.cluster.yml up -d --force-recreate sophia
+./cluster/docker-compose -f "$TMP_YAML" down -v >/dev/null 2>&1 || true
+./cluster/docker-compose -f "$TMP_YAML" up -d --force-recreate sophia
 
 # Wait for the entrypoint to complete (success OR failure).
 # v1 docker-compose doesn't support --format json, so we use
@@ -133,10 +136,15 @@ if [ "$state" = "restarting" ] || [ "$state" = "exited" ]; then
 fi
 
 echo "=== verifying merge: listing local sophia vault keys ==="
-SOPHIA_MERGE_FROM_PYCURITY_PATH="$SRC_DB" \
-SOPHIA_MERGE_PASSPHRASE="$SRC_PASS" \
-docker exec -e SOPHIA_ALLOW_ENV_FALLBACK=1 sophia_sophia_1 \
+# The container auto-generates a random passphrase on first boot and
+# stashes it at /var/lib/sophia/pycurity/.master_passphrase. We read
+# it (instead of calling PyKeyStore() without args, which would
+# prompt via getpass — and fail in this non-TTY docker exec).
+DST_PASS=$(docker exec sophia_sophia_1 cat /var/lib/sophia/pycurity/.master_passphrase)
+docker exec -e SOPHIA_ALLOW_ENV_FALLBACK=1 -e "PYCURITY_DB_PATH=/var/lib/sophia/pycurity/vault.db" -e "PYCURITY_SALT_PATH=/var/lib/sophia/pycurity/salt.bin" -e "PYCURITY_PASSPHRASE=$DST_PASS" \
+  sophia_sophia_1 \
   python -c "
+import os
 from pycurity.pykey import PyKeyStore
 ks = PyKeyStore()
 keys = sorted(k for k, _ in ks.list())
