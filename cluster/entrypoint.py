@@ -163,6 +163,19 @@ if __name__ == "__main__":
     _ensure_vault()
     _merge_from_system_wide()
     _ensure_accts_file()
+    # Ensure the PYCURITY_* env vars are explicitly set in the
+    # process environment BEFORE we exec uvicorn. PyKeyStore's
+    # constructor reads these to decide which vault to open;
+    # if they're missing, it defaults to ~/.local/share/pycurity/
+    # which is a different (empty) vault that confuses the rest
+    # of the pipeline. The _ensure_vault() call above already
+    # set them, but we re-set explicitly here for safety + as
+    # documentation of the dependency.
+    os.environ["PYCURITY_DB_PATH"] = str(VAULT_DB)
+    os.environ["PYCURITY_SALT_PATH"] = str(SALT_BIN)
+    sys.stderr.write(
+        f"[entrypoint] exec uvicorn with PYCURITY_DB_PATH={os.environ['PYCURITY_DB_PATH']}\n"
+    )
     args = sys.argv[1:] or [
         "uvicorn", "sophia.server:app",
         "--host", os.environ.get("HOST", "0.0.0.0"),
