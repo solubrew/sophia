@@ -163,11 +163,22 @@ RUN chown -R sophia:sophia /app
 # without a volume mount. These RUN steps execute as root BEFORE
 # the USER switch below (otherwise mkdir /etc/sophia fails with
 # "Permission denied" because sophia:sophia can't create /etc/*).
-RUN mkdir -p /var/lib/sophia /etc/sophia \
-    && chown sophia:sophia /var/lib/sophia /etc/sophia
-COPY cluster/providers.yaml /etc/sophia/providers.yaml
-COPY cluster/providers_accts.yaml /etc/sophia/providers_accts.yaml
-RUN chmod 644 /etc/sophia/providers.yaml /etc/sophia/providers_accts.yaml
+# Bundle agent/ directory + agent_accts.yaml under /etc/sophia.
+# The directory layout is:
+#   /etc/sophia/agent/                       ← agent_path (dir)
+#     agent.yaml                             (documentation; not read by ladyol)
+#     agent_accts.yaml                       ← what ladyol reads
+#
+# ladyol's _initialize_pool() looks for the accts file as:
+#   kahndor.Instruct(join(agent_path, f"{name}_accts.yaml"))
+# where name = Path(agent_path).name.replace('.', '').
+# With agent_path='/etc/sophia/agent':
+#   name = 'agent' (no dots to strip)
+#   accts path = /etc/sophia/agent/agent_accts.yaml ← correct
+RUN mkdir -p /etc/sophia/agent
+COPY cluster/agent/agent.yaml /etc/sophia/agent/agent.yaml
+COPY cluster/agent/agent_accts.yaml /etc/sophia/agent/agent_accts.yaml
+RUN chmod 644 /etc/sophia/agent/agent.yaml /etc/sophia/agent/agent_accts.yaml
 
 USER sophia:sophia
 ENV HOME=/home/sophia

@@ -1,0 +1,127 @@
+# agent.yaml — Sophia's provider-pool config, OVERRIDES the bundled
+# ladyol defaults at /usr/local/lib/python3.12/site-packages/ladyol/
+# _data_/providers.yaml. Sophia's pool.py loads this file, extracts
+# the ProviderPool.providers sub-tree, and calls
+# `pool.config.override({"providers": ...})` to merge it on top
+# of the bundled defaults.
+#
+# Schema: nested dict under `ProviderPool.providers.<provider_name>`
+# with these fields per ladyol's bundled providers.yaml reference:
+#   enabled: True|False
+#   display_name: <human-friendly name>
+#   env_key: <account name in PyKeyStore>
+#   base_url: <provider API endpoint>
+#   is_gateway: <True|False>
+#   is_local: <True|False>
+#   supports_prompt_caching: <True|False>
+#   models: {<model_id>: {enabled: True, capability_score: N, capabilities: [...], max_tokens: N}}
+
+ProviderPool:
+  providers:
+    minimax:
+      enabled: True
+      display_name: "minimax"
+      env_key: "minimax"
+      is_gateway: True
+      is_local: False
+      supports_prompt_caching: False
+      base_url: "https://api.minimax.chat/v1"
+      headers:
+        Content-Type: application/json
+        Authorization: "Bearer <[API_KEY]>"
+      roles: [user, assistant, system]
+      models:
+        "minimax-m2.7":
+          enabled: True
+          capability_score: 10
+          capabilities: [chat, code, analysis]
+          max_tokens: 32768
+          temperature: 0.7
+          context_window: 200000
+          costs_per_1k_input: 0.0002
+          costs_per_1k_output: 0.0006
+        "minimax-m3":
+          enabled: True
+          capability_score: 11
+          capabilities: [chat, code, analysis, reasoning]
+          max_tokens: 32768
+          temperature: 0.7
+          context_window: 200000
+          costs_per_1k_input: 0.0004
+          costs_per_1k_output: 0.0012
+
+    zai:
+      enabled: True
+      display_name: "zai"
+      env_key: "zai"
+      is_gateway: True
+      is_local: False
+      supports_prompt_caching: False
+      base_url: "https://api.zai.com/v1"
+      headers:
+        Content-Type: application/json
+        Authorization: "Bearer <[API_KEY]>"
+      roles: [user, assistant, system]
+      models:
+        "glm-4.7":
+          enabled: True
+          capability_score: 9
+          capabilities: [chat, code]
+          max_tokens: 32768
+          temperature: 0.7
+          context_window: 128000
+        "glm-5.2":
+          enabled: True
+          capability_score: 10
+          capabilities: [chat, code, reasoning]
+          max_tokens: 32768
+          temperature: 0.7
+          context_window: 128000
+
+    xai:
+      enabled: True
+      display_name: "xai"
+      env_key: "xai"
+      is_gateway: True
+      is_local: False
+      supports_prompt_caching: False
+      base_url: "https://api.x.ai/v1"
+      headers:
+        Content-Type: application/json
+        Authorization: "Bearer <[API_KEY]>"
+      roles: [user, assistant, system]
+      models:
+        "grok-2":
+          enabled: True
+          capability_score: 9
+          capabilities: [chat, code, analysis]
+          max_tokens: 32768
+          temperature: 0.7
+          context_window: 128000
+
+    ollama:
+      enabled: True
+      display_name: "Local Ollama"
+      env_key: ""
+      is_gateway: False
+      is_local: True
+      base_url: "http://host.docker.internal:11434/v1"
+      supports_prompt_caching: False
+      headers:
+        Content-Type: application/json
+      roles: [user, assistant, system]
+      models:
+        "qwen3.5:4b":
+          enabled: True
+          capability_score: 7
+          capabilities: [chat, code]
+          max_tokens: 8192
+          temperature: 0.7
+          context_window: 32768
+        "llama3":
+          enabled: True
+          capability_score: 8
+          capabilities: [chat, code, analysis]
+          max_tokens: 8192
+          temperature: 0.7
+          context_window: 8192

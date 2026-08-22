@@ -44,19 +44,57 @@ class SophiaPool:
             async with self._lock:
                 if self._pool is None:
                     logma.info(f"[SophiaPool] constructing ProviderPool from {self._config.provider_pool_path}")
-                    # ``memory`` is required by ProviderPool's signature but unused for chat calls.
-                    # Pass a tiny shim; ladyol doesn't dereference it on the chat path.
+                    # ``memory`` is required by ProviderPool's signature. ladyol's
+                    # _initialize_pool() and _record_usage() call several methods on
+                    # self.memory that the bundled providers.yaml + accts.yaml
+                    # configuration doesn't normally trigger (save_prompt /
+                    # save_response for audit). We provide a no-op shim so the
+                    # pool can initialize without needing the real mindot backend.
                     class _ShimMemory:
-                        pass
+                        """No-op stub for ladyol's memory backend.
+
+                        ladyol's ProviderPool calls several memory methods
+                        during pool init (save_model, save_provider,
+                        save_prompt, save_response, get_rubric, etc.) — all
+                        of which exist on the real mindot-backed memory but
+                        not on the simple stub Sophia needs. We provide
+                        permissive no-ops so the pool can initialize. Sophia
+                        keeps its own usage table in /var/lib/sophia/sophia.db,
+                        so we don't need the mindot audit features here.
+                        """
+
+                        def get_rubric(self, name: str) -> dict:
+                            return {
+                                "cost": 0.0,
+                                "trustworthiness": 0.5,
+                                "reliability": 0.5,
+                                "availability": 0.5,
+                                "support": 0.5,
+                                "features": [],
+                            }
+
+                        def __getattr__(self, name: str):
+                            # Catch-all: any other memory method called by
+                            # ladyol (save_*, get_*, list_*, ...) returns a
+                            # benign default. Args are ignored — ladyol just
+                            # needs the call to not raise.
+                            return lambda *args, **kwargs: None
+                    # ladyol's _initialize_pool() does:
+                    #   accts = kahndor.Instruct(join(agent_path, f"{name}_accts.yaml"))
+                    # where name = Path(agent_path).name.replace('.', '').
+                    # So agent_path is treated as a DIRECTORY and looked up as
+                    # <dir>/<basename-with-dots-stripped>_accts.yaml. We pass the
+                    # DIR (which is where agent_accts.yaml lives) as agent_path.
+                    agent_dir = self._config.provider_pool_path
                     self._pool = ProviderPool(
                         memory=_ShimMemory(),
                         decision_engine=None,
-                        agent_path=str(self._config.provider_pool_path),  # any string works
+                        agent_path=str(agent_dir),  # must be a directory
                         cfg={"providers": {}},  # override so the bundled kahndor is bypassed
                     )
                     # Re-load with the real path via the override hook:
                     self._pool.config = self._pool.config.override(
-                        {"providers": _load_providers_dict(self._config.provider_pool_path)}
+                        {"providers": _load_providers_dict(agent_dir)}
                     )
                     self._pool.providers = self._pool.config.get("providers")
                     self._pool._initialize_pool()
@@ -153,12 +191,30 @@ class SophiaPool:
 
 
 def _load_providers_dict(yaml_path: str) -> dict:
-    """Load ladyol's providers.yaml and return just the ``providers`` sub-tree."""
+    """Load the ProviderPool.providers sub-tree from Sophia's agent config.
+
+    ``yaml_path`` may be either a YAML file or a directory containing
+    a file named ``agent.yaml``. We try the file first, then fall back
+    to the directory's ``agent.yaml``. This lets the operator configure
+    agent_path as either form (ladyol wants a directory for its accts
+    lookup; the operator may prefer a single file for inspection).
+    """
+    import os
     import yaml
-    with open(yaml_path) as f:
-        data = yaml.safe_load(f) or {}
-    pool = data.get("ProviderPool") or {}
-    return pool.get("providers") or {}
+    candidates = [yaml_path]
+    if os.path.isdir(yaml_path):
+        candidates.append(os.path.join(yaml_path, "agent.yaml"))
+    for path in candidates:
+        try:
+            with open(path) as f:
+                data = yaml.safe_load(f) or {}
+            pool = data.get("ProviderPool") or {}
+            providers = pool.get("providers") or {}
+            if providers:
+                return providers
+        except (FileNotFoundError, IsADirectoryError):
+            continue
+    return {}
 
 
 def _to_messages(prompt: str, sprompt: str) -> list[dict]:

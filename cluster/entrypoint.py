@@ -30,7 +30,7 @@ VAULT_DB = VAULT_DIR / "vault.db"
 SALT_BIN = VAULT_DIR / "salt.bin"
 TEMP_KEY = VAULT_DIR / "temp.key"
 PASSPHRASE_FILE = VAULT_DIR / ".master_passphrase"
-ACCTS_YAML = Path("/etc/sophia/providers_accts.yaml")
+ACCTS_YAML = Path("/etc/sophia/agent/agent_accts.yaml")
 
 MERGE_FROM_ENV = "SOPHIA_MERGE_FROM_PYCURITY_PATH"
 MERGE_PASS_ENV = "SOPHIA_MERGE_PASSPHRASE"
@@ -39,7 +39,7 @@ MERGE_PASS_ENV = "SOPHIA_MERGE_PASSPHRASE"
 # greenfield clusters but potentially noisy if the source vault holds
 # non-LLM credentials like telegram bots, coingecko keys, etc).
 # The seed-keys.sh script populates this from the LLM account list in
-# cluster/providers_accts.yaml so only LLM provider keys land here.
+# cluster/agent_accts so only LLM provider keys land here.
 MERGE_ALLOWLIST_ENV = "SOPHIA_MERGE_ALLOWLIST"
 
 
@@ -153,8 +153,7 @@ def _ensure_accts_file() -> None:
     if not ACCTS_YAML.exists():
         sys.stderr.write(
             f"WARN: {ACCTS_YAML} not present - no provider accounts "
-            "configured. Add providers_accts.yaml to the image "
-            "(see cluster/providers_accts.template.yaml) or "
+            "configured. Add agent_accts.yaml under cluster/agent/ to the image "
             "bind-mount your own.\n"
         )
 

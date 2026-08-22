@@ -117,7 +117,7 @@ def create_app(config=None) -> FastAPI:
             providers = sorted({m.owned_by for m in models})
             return {"status": "ok", "providers": len(providers), "models": len(models)}
         except Exception as exc:  # noqa: BLE001 — healthz must always 200
-            logma.warning(f"/healthz: pool unreachable ({exc.__class__.__name__}); returning minimal ok")
+            logma.warning(f"/healthz: pool unreachable ({exc.__class__.__name__}: {exc}); returning minimal ok")
             return {"status": "ok", "providers": 0, "models": 0, "note": "pool not initialized"}
 
     @app.get("/v1/models")

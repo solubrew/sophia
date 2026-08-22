@@ -56,7 +56,28 @@ services:
       # host's local ollama (no API key needed). Override with
       # SOPHIA_PROVIDER_POOL=/path/to/your.yaml in cluster/.env when you
       # want to switch providers.
-      SOPHIA_PROVIDER_POOL: /etc/sophia/providers.yaml
+      SOPHIA_PROVIDER_POOL: /etc/sophia/agent
+    # ladyol's _initialize_pool() does:
+    #   accts = kahndor.Instruct(join(self.agent_path, f"{self.name}_accts.yaml"))
+    # where self.name = Path(agent_path).name.replace('.', '')
+    #
+    # Two quirks:
+    #  1) It calls .replace('.', '') on the basename, so any dot in
+    #     the basename (like a .yaml extension) becomes part of the
+    #     agent name. So 'providers.yaml' would have name 'providersyaml'.
+    #  2) It treats agent_path as a DIRECTORY and looks for the accts
+    #     file inside it: <dir>/<name>_accts.yaml.
+    #
+    # Resolution: ship agent_path as a DIRECTORY named 'agent'
+    # (no dot in basename, so name = 'agent'), and put the accts
+    # file inside it at agent_accts.yaml. So the in-image layout is:
+    #   /etc/sophia/agent/                    ← agent_path (dir)
+    #     agent.yaml   (not read by ladyol but useful for humans)
+    #     agent_accts.yaml                    ← what ladyol reads
+    # NB: the bundle ALSO includes agent.yaml as documentation; it's
+    # not consulted by ladyol but the operator can cp it out for
+    # inspection. We use the SOPHIA_PROVIDER_POOL dir to also host
+    # any future per-deployment overlays (env keys, model overrides).
     volumes:
       - sophia_data:/var/lib/sophia
       # Bind-mount the local sb-dist wheels so the Dockerfile can

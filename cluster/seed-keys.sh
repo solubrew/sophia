@@ -80,14 +80,14 @@ cd "$ROOT"
 SRC_MOUNT_DIR="$(dirname "$SRC_DB")"
 TMP_YAML="$(mktemp -u $ROOT/sophia-compose-XXXXXX.yml)"
 cp -p docker-compose.cluster.yml "$TMP_YAML"
-# Read the LLM account names from cluster/providers_accts.yaml so the
+# Read the LLM account names from cluster/agent/agent_accts.yaml so the
 # entrypoint only imports LLM provider keys (not telegram bots,
 # coingecko, gmail, etc.). Use Python's yaml for parse safety.
 ALLOWLIST_CSV=$(python3 -c "
 import sys
 import yaml
 try:
-    with open('cluster/providers_accts.yaml') as f:
+    with open('cluster/agent/agent_accts.yaml') as f:
         data = yaml.safe_load(f)
     if not data:
         print('')
@@ -103,11 +103,11 @@ try:
     names = [v['name'] for v in accts.values() if v and v.get('enabled')]
     print(','.join(names))
 except Exception as e:
-    print(f'WARN: could not parse cluster/providers_accts.yaml: {e}', file=sys.stderr)
+    print(f'WARN: could not parse cluster/agent/agent_accts.yaml: {e}', file=sys.stderr)
     print('')
 " 2>/dev/null)
 if [ -z "$ALLOWLIST_CSV" ]; then
-  echo "(no allowlist parsed from providers_accts.yaml — will merge all keys)"
+  echo "(no allowlist parsed from agent_accts.yaml — will merge all keys)"
 fi
 ./cluster/inject-merge-vars.py docker-compose.cluster.yml "$TMP_YAML" "/host-pycurity/secure_store.db" "$SRC_PASS" "$ALLOWLIST_CSV"
 
