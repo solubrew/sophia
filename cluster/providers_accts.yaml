@@ -1,0 +1,33 @@
+# Provider accounts for Sophia — the schema ladyol expects at
+# `<SOPHIA_PROVIDER_POOL>_accts.yaml`. Identical to
+# senbai_accts.yaml's `provider_accts` block; Sophia's
+# ProviderPool._initialize_pool reads this on first chat.
+#
+# Source of truth: cluster/../sb-dist/senbai_accts.yaml on the host (or
+# ~/.senbai/senbai_accts.yaml). This file is committed so the image
+# ships with the account list baked in; the API keys themselves
+# land in the container's PyKeyStore vault via the entrypoint's
+# SOPHIA_MERGE_FROM_PYCURITY_PATH path (see cluster/README.md §
+# "First-boot key injection").
+
+provider_accts:
+  "minimax-000.000.000":
+    enabled: True
+    provider: minimax
+    name: "minimax-000.000.000"
+  "minimax-000.000.001":
+    enabled: True
+    provider: minimax
+    name: "minimax-000.000.001"
+  "minimax-000.000.002":
+    enabled: True
+    provider: minimax
+    name: "minimax-000.000.002"
+  "zai-000.000.000":
+    enabled: True
+    provider: zai
+    name: "zai-000.000.000"
+  "xai-000.000.000":
+    enabled: True
+    provider: xai
+    name: "xai-000.000.000"

@@ -1,23 +1,15 @@
-# providers.yaml — Sophia's provider-pool config. The operator fills
-# this in from cluster/providers.yaml.template (the documented schema
-# reference) and commits it back to the repo. The cluster harness
-# COPYs whatever is here into /etc/sophia/providers.yaml at build
-# time. Until you fill it in, the pool has zero enabled accounts and
-# every chat will return 502 — expected, harmless, by design.
+# providers.yaml — Sophia's provider-pool config. Schema matches
+# ladyol's bundled providers.yaml (the reference schema lives at
+# /usr/local/lib/python3.12/site-packages/ladyol/_data_/providers.yaml
+# inside the sophia image). Each provider's `enabled: True|False`
+# here just toggles it visible in the rotation pool; the actual
+# API keys live in Sophia's PyKeyStore vault (see cluster/providers_accts.yaml
+# for the account names ladyol will look up by `env_key`).
 #
-# Start from cluster/providers.yaml.template for the schema + provider
-# block examples. Keep the strategy block at the top; the providers
-# list is yours to populate.
-#
-# When this file is non-empty, sophia's /v1/models and /v1/chat/completions
-# endpoints will serve the configured models. Open WebUI on :3000 will
-# pick them up too (it auto-discovers via the OpenAI-compatible
-# /v1/models endpoint).
-#
-# Tip: while developing, keep ollama (the local-model section in the
-# template) as the only enabled provider. It needs no account and the
-# local ollama container is already running on this host. Once the
-# wire is working end-to-end, add your real providers + accounts.
+# All providers below were lifted from the bundled providers.yaml
+# and trimmed to the enabled ones + the actual model ids we use.
+# Keep this file synced with cluster/providers_accts.yaml (account
+# name → provider name must match).
 
 ProviderPool:
   strategies:
@@ -27,13 +19,17 @@ ProviderPool:
       - random
       - weighted
       - cheapest
+      - cheapest_weighted
       - least_used
+      - least_used_weighted
+      - least_used_cheapest
+      - least_used_cheapest_weighted
       - best_available
     task_router:
       tasks:
-        "default":  "llama3"
-        "implement": "llama3"
-        "analyze":  "llama3"
+        "default":  "minimax-m2.7"
+        "implement": "minimax-m2.7"
+        "analyze":  "minimax-m3"
 
   providers:
     ollama:
@@ -51,3 +47,90 @@ ProviderPool:
           capability_score: 8
           capabilities: [chat, analysis, code]
           max_tokens: 8192
+        qwen3.5:4b:
+          enabled: True
+          capability_score: 9
+          capabilities: [chat, code]
+          max_tokens: 8192
+
+    minimax:
+      name: "minimax"
+      display_name: "Minimax"
+      env_key: "minimax"
+      is_gateway: True
+      is_local: False
+      supports_prompt_caching: True
+      base_url: "https://api.minimax.io/v1/"
+      headers:
+        "Content-Type": "application/json"
+        "Authorization": "Bearer <[API_KEY]>"
+      roles: ["user", "assistant", "system"]
+      models:
+        "minimax-m2.7":
+          enabled: True
+          capability_score: 10
+          capabilities: [chat, code]
+          max_tokens: 4096
+          context_window: 204800
+          costs_per_1k_input: 0.0003
+          costs_per_1k_output: 0.0012
+        "minimax-m3":
+          enabled: True
+          capability_score: 12
+          capabilities: [chat, code, analysis]
+          max_tokens: 4096
+          context_window: 1000000
+          costs_per_1k_input: 0.0003
+          costs_per_1k_output: 0.0012
+
+    zai:
+      name: "zai"
+      display_name: "Z.ai"
+      env_key: "zai"
+      is_gateway: True
+      is_local: False
+      supports_prompt_caching: True
+      base_url: "https://api.z.ai/api/coding/paas/v4"
+      headers:
+        "Content-Type": "application/json"
+        "Authorization": "Bearer <[API_KEY]>"
+      roles: ["user", "assistant", "system"]
+      models:
+        "glm-4.7":
+          enabled: True
+          capability_score: 10
+          capabilities: [chat, code]
+          max_tokens: 4096
+          context_window: 200000
+          costs_per_1k_input: 0.0006
+          costs_per_1k_output: 0.0022
+        "glm-5.2":
+          enabled: True
+          capability_score: 13
+          capabilities: [chat, code, analysis]
+          max_tokens: 4096
+          context_window: 1000000
+          costs_per_1k_input: 0.0014
+          costs_per_1k_output: 0.0044
+
+    xai:
+      name: "xai"
+      display_name: "xAI (Grok)"
+      env_key: "xai"
+      is_gateway: True
+      is_local: False
+      supports_prompt_caching: True
+      base_url: "https://api.groq.com/openai/v1"
+      headers:
+        "Content-Type": "application/json"
+        "Authorization": "Bearer <[API_KEY]>"
+      roles: ["user", "assistant", "system"]
+      models:
+        "grok-2":
+          enabled: True
+          capability_score: 10
+          capabilities: [chat, code]
+          max_tokens: 4096
+          context_window: 4096
+          costs_per_1k_input: 0.003
+          costs_per_1k_output: 0.015

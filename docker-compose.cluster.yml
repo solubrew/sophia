@@ -2,9 +2,9 @@
 #
 # Topology (this host):
 #
-#   open-webui (localhost:3000) ──┐
-#                                 ├──▶ sophia (LAN:8765) ──▶ ollama / future providers
-#   hermes (later) ──────────────┘
+#   open-webui (LAN:3000) ──┐
+#                              ├──▶ sophia (LAN:8765) ──▶ ollama / future providers
+#   hermes (later) ──────────┘
 #
 # Sophia uses SQLite inside the named `sophia_data` volume — one
 # single SQLite file holds the requestor keys + usage log + role
@@ -64,11 +64,14 @@ services:
       # back to the host checkout.
       - ./sb-dist:/opt/sophia/sb-dist:ro
     ports:
-      - "127.0.0.1:8765:8765"   # LAN-test only; remove for prod
+      - "8765:8765"   # bound to 0.0.0.0 — accessible from the LAN.
+                      # The container still listens on its loopback
+                      # too, so the healthcheck (http://127.0.0.1:8765/healthz)
+                      # works from within the same container.
     healthcheck:
       # /healthz is the FastAPI health endpoint (no auth required).
-      # Single-shot `wget` (no curl in the image).
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8765/healthz >/dev/null || exit 1"]
+      # Single-shot urllib probe — no extra packages needed.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8765/healthz',timeout=2); sys.exit(0 if r.status==200 else 1)\""]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -99,7 +102,9 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "127.0.0.1:3000:8080"
+      - "3000:8080"   # bound to 0.0.0.0 — accessible from the LAN.
+                      # The container listens on 8080 internally; the
+                      # host-side port is 3000.
     volumes:
       - openwebui_data:/app/backend/data
     logging:

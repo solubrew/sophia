@@ -158,25 +158,26 @@ COPY --from=builder /build/sophia ./sophia
 COPY --from=builder /build/pyproject.toml ./
 RUN chown -R sophia:sophia /app
 
-USER sophia:sophia
-ENV HOME=/home/sophia
-
-# Pre-create /var/lib/sophia (volume mount target) + /etc/sophia
-# (bundled providers.yaml target) while still root, so the chown
-# below can give the sophia user write access without the chown
-# itself failing on a non-existent dir.
+# Bundle providers.yaml + providers_accts.yaml under /etc/sophia so
+# SOPHIA_PROVIDER_POOL can point at /etc/sophia/providers.yaml
+# without a volume mount. These RUN steps execute as root BEFORE
+# the USER switch below (otherwise mkdir /etc/sophia fails with
+# "Permission denied" because sophia:sophia can't create /etc/*).
 RUN mkdir -p /var/lib/sophia /etc/sophia \
     && chown sophia:sophia /var/lib/sophia /etc/sophia
 COPY cluster/providers.yaml /etc/sophia/providers.yaml
-RUN chmod 644 /etc/sophia/providers.yaml
+COPY cluster/providers_accts.yaml /etc/sophia/providers_accts.yaml
+RUN chmod 644 /etc/sophia/providers.yaml /etc/sophia/providers_accts.yaml
 
-EXPOSE 8765
-
+USER sophia:sophia
+ENV HOME=/home/sophia
 # Health check — /healthz returns 200 as long as the FastAPI process
 # is alive; does NOT touch the keystore, so a transient vault hiccup
-# doesn't trigger a container restart loop.
+# doesn't trigger a container restart loop. We use urllib (stdlib)
+# rather than wget — the runtime image doesn't ship wget, and adding
+# it just for a healthcheck would inflate the image.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://localhost:8765/healthz || exit 1
+    CMD python -c "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8765/healthz',timeout=2); sys.exit(0 if r.status==200 else 1)"
 
 # Sophia's vault init (cluster/entrypoint.py) creates the
 # PyKeyStore vault with a random passphrase + caches the temp
