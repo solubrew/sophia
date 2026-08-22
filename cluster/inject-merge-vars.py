@@ -18,13 +18,15 @@ import sys
 
 
 def main():
-    if len(sys.argv) != 5:
+    if len(sys.argv) not in (5, 6):
         print(
-            "usage: inject-merge-vars.py <src_yaml> <dst_yaml> <vault> <pass>",
+            "usage: inject-merge-vars.py <src_yaml> <dst_yaml> <vault> "
+            "<pass> [<allowlist_csv>]",
             file=sys.stderr,
         )
         sys.exit(64)
     src_yaml, dst_yaml, vault, passphrase = sys.argv[1:5]
+    allowlist = sys.argv[5] if len(sys.argv) == 6 else ""
 
     with open(src_yaml) as f:
         text = f.read()
@@ -49,6 +51,12 @@ def main():
         f'      SOPHIA_MERGE_FROM_PYCURITY_PATH: "{vault}"\n'
         f'      SOPHIA_MERGE_PASSPHRASE: "{passphrase}"\n'
     )
+    if allowlist:
+        # Allowlist is a CSV of vault service names. We wrap in YAML
+        # double-quotes; backslash-escape any embedded backslashes
+        # and double-quotes so the YAML stays valid.
+        escaped = allowlist.replace("\\", "\\\\").replace('"', '\\"')
+        merge_vars += f'      SOPHIA_MERGE_ALLOWLIST: "{escaped}"\n'
     new_text = new_text.replace(
         '      PORT: "8765"',
         '      PORT: "8765"\n' + merge_vars,

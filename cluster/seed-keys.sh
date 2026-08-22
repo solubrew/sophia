@@ -80,7 +80,36 @@ cd "$ROOT"
 SRC_MOUNT_DIR="$(dirname "$SRC_DB")"
 TMP_YAML="$(mktemp -u $ROOT/sophia-compose-XXXXXX.yml)"
 cp -p docker-compose.cluster.yml "$TMP_YAML"
-./cluster/inject-merge-vars.py docker-compose.cluster.yml "$TMP_YAML" "/host-pycurity/secure_store.db" "$SRC_PASS"
+# Read the LLM account names from cluster/providers_accts.yaml so the
+# entrypoint only imports LLM provider keys (not telegram bots,
+# coingecko, gmail, etc.). Use Python's yaml for parse safety.
+ALLOWLIST_CSV=$(python3 -c "
+import sys
+import yaml
+try:
+    with open('cluster/providers_accts.yaml') as f:
+        data = yaml.safe_load(f)
+    if not data:
+        print('')
+        sys.exit(0)
+    accts = data.get('provider_accts', {}) or {}
+    # Each acct entry looks like:
+    #   \"<name>\":
+    #     enabled: True
+    #     provider: minimax
+    #     name: \"<name>\"
+    # We pull the value's `name` field, which is what ladyol uses as
+    # the PyKeyStore lookup key.
+    names = [v['name'] for v in accts.values() if v and v.get('enabled')]
+    print(','.join(names))
+except Exception as e:
+    print(f'WARN: could not parse cluster/providers_accts.yaml: {e}', file=sys.stderr)
+    print('')
+" 2>/dev/null)
+if [ -z "$ALLOWLIST_CSV" ]; then
+  echo "(no allowlist parsed from providers_accts.yaml — will merge all keys)"
+fi
+./cluster/inject-merge-vars.py docker-compose.cluster.yml "$TMP_YAML" "/host-pycurity/secure_store.db" "$SRC_PASS" "$ALLOWLIST_CSV"
 
 # Validate the source vault exists AND is readable by the user
 # the container will run as (sophia, uid 1001). PyKeyStore files
@@ -205,13 +234,13 @@ if [ "$state" = "restarting" ] || [ "$state" = "exited" ]; then
   exit 3
 fi
 
-echo "=== verifying merge: listing local sophia vault keys ==="
+echo "=== verifying merge: listing local vault keys ==="
 # The container auto-generates a random passphrase on first boot and
 # stashes it at /var/lib/sophia/pycurity/.master_passphrase. We read
 # it (instead of calling PyKeyStore() without args, which would
 # prompt via getpass — and fail in this non-TTY docker exec).
 DST_PASS=$(docker exec sophia_sophia_1 cat /var/lib/sophia/pycurity/.master_passphrase)
-docker exec -e SOPHIA_ALLOW_ENV_FALLBACK=1 -e "PYCURITY_DB_PATH=/var/lib/sophia/pycurity/vault.db" -e "PYCURITY_SALT_PATH=/var/lib/sophia/pycurity/salt.bin" -e "PYCURITY_PASSPHRASE=$DST_PASS" \
+LOCAL_KEYS=$(docker exec -e SOPHIA_ALLOW_ENV_FALLBACK=1 -e "PYCURITY_DB_PATH=/var/lib/sophia/pycurity/vault.db" -e "PYCURITY_SALT_PATH=/var/lib/sophia/pycurity/salt.bin" -e "PYCURITY_PASSPHRASE=$DST_PASS" \
   sophia_sophia_1 \
   python -c "
 import os
@@ -221,7 +250,34 @@ keys = sorted(k for k, _ in ks.list())
 print(f'local vault now holds {len(keys)} keys')
 for k in keys:
     print(f'  - {k}')
-" 2>&1 | tail -25
+" 2>&1)
+echo "$LOCAL_KEYS"
+
+echo
+echo "=== backfill: cluster master passphrase → source vault ==="
+# The cluster's auto-generated master passphrase is at
+# /var/lib/sophia/pycurity/.master_passphrase. Other tools on the
+# host (nchantdoffice_com, future services joining the cluster) may
+# want to unlock the same Sophia vault — they need the same passphrase.
+# Backfill the passphrase into the SOURCE vault as a key named
+# 'sophia_cluster_master_passphrase' so it's discoverable from a
+# single source.
+CLUSTER_PASS=$(docker exec sophia_sophia_1 cat /var/lib/sophia/pycurity/.master_passphrase)
+echo "Cluster passphrase is ${#CLUSTER_PASS} chars (writing to source vault as 'sophia_cluster_master_passphrase')"
+# We use the local python interpreter (not the container's) so we
+# can hit the SOURCE vault at $SRC_DB on the host filesystem.
+python3 -c "
+import os
+import sys
+from pycurity.pykey import PyKeyStore
+src_ks = PyKeyStore(db_path='$SRC_DB', salt_path='$SRC_DIR/secure_store.salt', passphrase='$SRC_PASS')
+src_ks.set(
+    'sophia_cluster_master_passphrase',
+    {'api_key': '$CLUSTER_PASS', 'name': 'sophia_cluster_master_passphrase'},
+    comment='Sophia cluster local vault master passphrase (auto-rotated by entrypoint; backfilled by seed-keys.sh)',
+)
+print('backfilled')
+" 2>&1 | tail -3
 
 echo
 echo "=== /v1/models with the merge applied ==="

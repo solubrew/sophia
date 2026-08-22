@@ -34,6 +34,13 @@ ACCTS_YAML = Path("/etc/sophia/providers_accts.yaml")
 
 MERGE_FROM_ENV = "SOPHIA_MERGE_FROM_PYCURITY_PATH"
 MERGE_PASS_ENV = "SOPHIA_MERGE_PASSPHRASE"
+# Comma-separated list of vault service names to include in the merge.
+# If unset, ALL keys from the source vault are merged (useful for
+# greenfield clusters but potentially noisy if the source vault holds
+# non-LLM credentials like telegram bots, coingecko keys, etc).
+# The seed-keys.sh script populates this from the LLM account list in
+# cluster/providers_accts.yaml so only LLM provider keys land here.
+MERGE_ALLOWLIST_ENV = "SOPHIA_MERGE_ALLOWLIST"
 
 
 def _ensure_vault() -> None:
@@ -77,7 +84,13 @@ def _merge_from_system_wide() -> None:
     sys.stderr.write(f"[entrypoint] _merge_from_system_wide: env_has_merge_pass={'SOPHIA_MERGE_PASSPHRASE' in os.environ}\n")
     src_path = os.environ.pop(MERGE_FROM_ENV, "").strip()
     src_pass = os.environ.pop(MERGE_PASS_ENV, "").strip()
-    sys.stderr.write(f"[entrypoint] _merge_from_system_wide: src_path={src_path!r} src_pass_set={bool(src_pass)}\n")
+    allowlist = os.environ.pop(MERGE_ALLOWLIST_ENV, "").strip()
+    allowlist_names = (
+        {n.strip() for n in allowlist.split(",") if n.strip()}
+        if allowlist
+        else None
+    )
+    sys.stderr.write(f"[entrypoint] _merge_from_system_wide: src_path={src_path!r} src_pass_set={bool(src_pass)} allowlist={len(allowlist_names) if allowlist_names else 'all'}\n")
     if not src_path:
         return
     if not src_pass:
@@ -97,7 +110,8 @@ def _merge_from_system_wide() -> None:
 
     src_dir = src.parent
     sys.stderr.write(
-        f"Merging system-wide PyKeyStore from {src} ...\n"
+        f"Merging system-wide PyKeyStore from {src} "
+        f"({'filtered to ' + str(len(allowlist_names)) + ' names' if allowlist_names else 'all keys'}) ...\n"
     )
     try:
         from pycurity.pykey import PyKeyStore
@@ -108,7 +122,12 @@ def _merge_from_system_wide() -> None:
                 salt_path=str(src_dir / "secure_store.salt"),
                 passphrase=src_pass,
             )
-            keys_to_merge = {name: src_ks.get(name) for name, _ in src_ks.list()}
+            all_names = [name for name, _ in src_ks.list()]
+            if allowlist_names is not None:
+                names_to_merge = [n for n in all_names if n in allowlist_names]
+            else:
+                names_to_merge = all_names
+            keys_to_merge = {name: src_ks.get(name) for name in names_to_merge}
             count = 0
             for name, key in keys_to_merge.items():
                 if key is None:
