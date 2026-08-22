@@ -29,7 +29,7 @@
 #     want to run again (the entrypoint only merges on first boot).
 set -euo pipefail
 
-if [ "$S" -lt 2 ]; then
+if [ "$#" -lt 2 ]; then
   echo "Usage: $0 <source_vault_db_path> <source_passphrase>" >&2
   echo "  source_vault_db_path: absolute path to the source secure_store.db" >&2
   echo "  source_passphrase:    the master passphrase for that vault" >&2
@@ -60,7 +60,7 @@ print(f'sPR: source vault opens OK, {len(keys)} keys present')
 
 echo "=== wiping sophia volume + recreating with merge vars ==="
 cd "$ROOT"
-./cluster/docker-compose -f docker-compose.cluster.yml down -v >/devout 2>&1 || true
+./cluster/docker-compose -f docker-compose.cluster.yml down -v >/dev/null 2>&1 || true
 SOPHIA_MERGE_FROM_PYCURITY_PATH="$SRC_DB" \
 SOPHIA_MERGE_PASSPHRASE="$SRC_PASS" \
 ./cluster/docker-compose -f docker-compose.cluster.yml up -d --force-recreate sophia
