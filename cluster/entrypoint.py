@@ -43,8 +43,12 @@ def _ensure_vault() -> None:
     passphrase = secrets.token_urlsafe(32)
     PASSPHRASE_FILE.write_text(passphrase + "\n")
     PASSPHRASE_FILE.chmod(0o600)
-    os.environ.setdefault("PYCURITY_DB_PATH", str(VAULT_DB))
-    os.environ.setdefault("PYCURITY_SALT_PATH", str(SALT_BIN))
+    # Use direct os.environ[] assignment (not setdefault) so we
+    # override any empty / stale value the container inherited
+    # (otherwise PyKeyStore's default-fallback uses the home dir
+    # and creates a second vault there).
+    os.environ["PYCURITY_DB_PATH"] = str(VAULT_DB)
+    os.environ["PYCURITY_SALT_PATH"] = str(SALT_BIN)
     sys.stderr.write("First boot - initialising PyKeyStore vault\n")
     try:
         from pycurity.pykey import PyKeyStore
