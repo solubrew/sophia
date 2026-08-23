@@ -92,10 +92,14 @@ ENV SB_STACK_MANIFEST=$SB_STACK_MANIFEST
 # to avoid any shell layer stripping the @-syntax in tokens.
 RUN SB_INSTALL_ARGS="$(python3 /tmp/sb_resolve.py \
         --vein /mnt/overse/SBST01/vein/GitVein \
-        --branch gamma --null)" && \
+        --branch gamma)" && \
     set -x && \
-    printf '%s\0' "$SB_INSTALL_ARGS" \
-        | xargs -0 pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps && \
+    # printf newline-terminated -> xargs -d '\n' splits on the
+    # newline that the helper already emits. xargs -d avoids
+    # whitespace-split which would corrupt tokens with spaces.
+    printf '%s'
+ "$SB_INSTALL_ARGS" | xargs -d '\\n' \
+        pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps && \
     rm /tmp/sb_resolve.py
 
 # Two-step install:
