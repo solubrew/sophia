@@ -163,6 +163,8 @@ def create_app(config=None) -> FastAPI:
                         strategy=strategy, model=model,
                     ):
                         chunks.append(chunk)
+                        if not chunk:
+                            continue  # skip empty deltas
                         payload = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -174,9 +176,13 @@ def create_app(config=None) -> FastAPI:
                     yield b"data: [DONE]\n\n"
                     elapsed_ms = int((time.monotonic() - t0) * 1000)
                     full = "".join(chunks)
+                    # Prefer ladyol's real usage event when present;
+                    # fall back to word-count estimates.
+                    su = getattr(pool, "last_stream_usage", {}) or {}
+                    pt = int(su.get("tokens_in") or su.get("prompt_tokens") or len(prompt.split()))
+                    ct = int(su.get("tokens_out") or su.get("completion_tokens") or len(full.split()))
                     _record(req, requestor, completion_id, model, strategy,
-                            prompt_tokens=len(prompt.split()),  # rough proxy
-                            completion_tokens=len(full.split()),
+                            prompt_tokens=pt, completion_tokens=ct,
                             elapsed_ms=elapsed_ms, status="ok",
                             error_kind=None)
                     if requestor.store_payload:

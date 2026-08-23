@@ -34,6 +34,9 @@ class SophiaPool:
         self._config = config
         self._lock = asyncio.Lock()
         self._pool = None
+        # Populated by stream(): the last usage event ladyol emitted,
+        # so the server can record real token counts after [DONE].
+        self.last_stream_usage: dict = {}
 
     async def _ensure_pool(self):
         # Defer the heavy import until the first chat call. Sophia
@@ -163,10 +166,36 @@ class SophiaPool:
         strategy: str = "random",
         model: Optional[str] = None,
     ) -> AsyncIterator[str]:
+        """Yield plain text chunks, translating ladyol's event dicts.
+
+        ladyol's ProviderPool.stream yields dicts with a ``type`` key:
+        ``{"type": "token", "content": "..."}`` for content,
+        ``{"type": "usage", "tokens": {...}}`` for accounting, and
+        ``{"type": "done", ...}`` at the end. We surface only the
+        token text as str chunks (OpenAI-SSE style) and stash the
+        last usage payload on ``self.last_stream_usage`` so the
+        server can record real token counts after [DONE].
+        """
         pool = await self._ensure_pool()
+        self.last_stream_usage = {}
         async for chunk in pool.stream(model_name=model or "", messages=_to_messages(prompt, sprompt),
                                        strategy=strategy, temperature=temperature):
-            yield chunk
+            if isinstance(chunk, dict):
+                ctype = chunk.get("type")
+                if ctype == "token":
+                    yield str(chunk.get("content") or "")
+                elif ctype == "usage":
+                    self.last_stream_usage = chunk.get("tokens") or {}
+                    # usage events carry no displayable content
+                    continue
+                elif ctype == "done":
+                    continue
+                else:
+                    # Unknown event shape — don't stream junk to the client.
+                    continue
+            elif isinstance(chunk, str):
+                yield chunk
+            # anything else (bytes, None) is ignored
 
     async def list_models(self) -> list:
         try:
