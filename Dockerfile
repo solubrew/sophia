@@ -38,6 +38,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # README.md is required by hatchling's metadata step (readme field in
 # pyproject.toml). COPY it before the first pip install.
 COPY pyproject.toml README.md ./
+# PyYAML is needed by cluster/sb_resolve.py below (parses the manifest
+# YAML). Install it minimally before invoking the resolver — the SB
+# install itself doesn't depend on PyYAML (the redirected pip URLs
+# don't require it).
+RUN pip install --no-cache-dir --no-build-isolation "PyYAML>=6.0,<7.0"
 
 # SB-stack deps (kahndor, subtrix, pycurity, ladyol, glain, xskillaber,
 # knightsort, goalt, mindot, squirl, thingery, senbai, eaglis,
