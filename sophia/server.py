@@ -335,8 +335,19 @@ def create_app(config=None) -> FastAPI:
         # alias the operator wrote in providers.yaml — same thing
         # today, but the split keeps the door open for one provider
         # having N aliases later (multi-account rotation).
-        provider_name = pm.get("provider_name") or ""
+        #
+        # NB: ladyol's ``Provider`` is a dataclass with a ``.name``
+        # string attribute — historically the pool stashed the raw
+        # Provider object here, not the string. Coerce to str so the
+        # UsageRow tuple stays sqlite-bindable.
+        raw_provider_name = pm.get("provider_name") or ""
+        if not isinstance(raw_provider_name, str):
+            raw_provider_name = getattr(raw_provider_name, "name", str(raw_provider_name))
+        provider_name = raw_provider_name or ""
         provider_account = pm.get("account_alias") or provider_name or ""
+        # Same coercion for account_alias in case it's also a Provider
+        if not isinstance(provider_account, str):
+            provider_account = getattr(provider_account, "name", str(provider_account))
         usage.record(UsageRow(
             requestor=requestor.name,
             provider_account=provider_account,

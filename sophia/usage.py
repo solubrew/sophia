@@ -43,13 +43,37 @@ class UsageRow:
     captured_path: Optional[str] = None
 
     def as_tuple(self) -> tuple:
+        # Coerce every field to a sqlite-bindable primitive. The original
+        # dataclass had no schema drift — the recent bug came from
+        # provider_name / provider_account being non-str (the ladyol
+        # ``Provider`` dataclass leaks through ``provider_meta`` if no
+        # server-side coercion runs). All fields below are now defended;
+        # a future caller passing a richer object would just stringify
+        # rather than 500 the chat endpoint.
+        def _s(v):
+            return v if isinstance(v, str) else ("" if v is None else str(v))
+        def _i(v):
+            return 0 if v is None else int(v)
+        def _f(v):
+            return 0.0 if v is None else float(v)
         return (
-            self.requestor, self.provider_account, self.provider_name,
-            self.model, self.strategy, self.completion_id,
-            self.prompt_tokens, self.completion_tokens, self.total_tokens,
-            self.cost_input_usd, self.cost_output_usd, self.cost_total_usd,
-            self.status, self.error_kind, _utc_now_iso(), self.elapsed_ms,
-            self.captured_path,
+            _s(self.requestor),
+            _s(self.provider_account),
+            _s(self.provider_name),
+            _s(self.model),
+            _s(self.strategy),
+            _s(self.completion_id),
+            _i(self.prompt_tokens),
+            _i(self.completion_tokens),
+            _i(self.total_tokens),
+            _f(self.cost_input_usd),
+            _f(self.cost_output_usd),
+            _f(self.cost_total_usd),
+            _s(self.status),
+            _s(self.error_kind),
+            _utc_now_iso(),
+            _i(self.elapsed_ms),
+            _s(self.captured_path),
         )
 
 
