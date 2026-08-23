@@ -48,42 +48,58 @@ def _next_reset_utc(now: Optional[datetime] = None) -> datetime:
 
 
 class _ProviderCooldowns:
-    """Tracks per-provider pause-until timestamps (UTC epoch seconds).
+    """Tracks per-ACCOUNT pause-until timestamps (UTC epoch seconds).
 
-    A provider that returns 429 (rate limit) is paused until the next
-    reset window; entries whose pause has lapsed are considered active
-    again automatically (lazily on read). Guarded by no lock — single
-    asyncio event loop mutates it, so plain dict ops suffice.
+    Quotas are per ACCOUNT (one API key = one allotment), not per
+    provider: minimax-000.000.000 exhausting its quota says nothing
+    about minimax-000.000.001. So a 429 pauses only the account whose
+    key was refused, until the next reset window; entries from other
+    accounts on the same provider remain active. Lapsed pauses
+    reactivate lazily on read. No lock — single asyncio loop mutates.
     """
 
     def __init__(self) -> None:
         self._paused_until: dict[str, float] = {}
 
-    def pause(self, provider: str, until_utc: datetime) -> None:
+    def pause(self, account: str, until_utc: datetime) -> None:
         ts = until_utc.timestamp()
-        self._paused_until[provider] = ts
+        self._paused_until[account] = ts
         logma.warning(
-            f"[cooldown] provider '{provider}' paused until "
+            f"[cooldown] account '{account}' paused until "
             f"{until_utc.astimezone(_EDT).strftime('%Y-%m-%d %H:%M EDT')} "
             f"({int(ts - time.time())}s remaining)"
         )
 
-    def is_paused(self, provider: str) -> bool:
-        ts = self._paused_until.get(provider)
+    def is_paused(self, account: str) -> bool:
+        ts = self._paused_until.get(account)
         if ts is None:
             return False
         if ts <= time.time():
             # Window lapsed — reactivate lazily.
-            del self._paused_until[provider]
-            logma.info(f"[cooldown] provider '{provider}' reset window reached; reactivated")
+            del self._paused_until[account]
+            logma.info(f"[cooldown] account '{account}' reset window reached; reactivated")
             return False
         return True
 
-    def remaining(self, provider: str) -> int:
-        ts = self._paused_until.get(provider)
+    def remaining(self, account: str) -> int:
+        ts = self._paused_until.get(account)
         if ts is None:
             return 0
         return max(0, int(ts - time.time()))
+
+
+def _account_of(entry) -> str:
+    """Stable identity for the ACCOUNT (API key allotment) behind an entry.
+
+    Entries are (account, model) pairs; all of one account's entries
+    share the same provider.api_key. We fingerprint provider + the
+    first 8 chars of the key so logs are readable without leaking the
+    full secret.
+    """
+    prov = getattr(entry, "provider", None)
+    name = getattr(prov, "name", "?") or "?"
+    key = getattr(prov, "api_key", "") or ""
+    return f"{name}:{key[:8]}"
 
 
 class SophiaPool:
@@ -179,44 +195,83 @@ class SophiaPool:
         temperature: float = 0.7,
         strategy: str = "random",
         model: Optional[str] = None,
+        max_retries: int = 3,
     ) -> str:
-        """Chat with provider-level 429 cooldowns.
+        """Chat with per-ACCOUNT 429 cooldowns + cross-account rotation.
 
-        ladyol's chat already retries across entries; we add a
-        provider-level filter so rate-limited providers (paused until
-        their next reset window) are excluded from selection. If a
-        429 still slips through, we pause that provider until the
-        next reset window and retry once on the remainder.
+        Quotas are per API key (account): when one account 429s we
+        pause just that account until the next reset window (1am/6am/
+        11am/4pm/8pm EDT) and retry immediately on a different entry —
+        including other accounts on the SAME provider. Selection honors
+        cooldowns; explicit (non-auto) model requests still rotate
+        across accounts offering that model. Mirrors stream()'s retry.
         """
-        for attempt in range(2):
-            pool = await self._ensure_pool()
-            original = pool._entries
-            active = [e for e in original
-                      if not self.cooldowns.is_paused(e.provider.name)]
-            if not active:
-                raise RuntimeError(
-                    "all providers are rate-limited (paused until their "
-                    "next reset window); try again after the next window"
-                )
-            pool._entries = active
+        pool = await self._ensure_pool()
+        excluded: set = set()
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(max_retries + 1):
+            available = [e for e in pool._entries
+                         if id(e) not in excluded
+                         and not self.cooldowns.is_paused(_account_of(e))]
+            if model:
+                available = [e for e in available if e.model.name == model]
+            if not available:
+                break
+            entry = available[0]
+            if attempt == 0 and not model:
+                # Initial auto pick: ladyol's selector for strategy fidelity.
+                try:
+                    sel = pool._select_entry(model or "", strategy=strategy)
+                    if sel is not None and id(sel) not in excluded \
+                            and not self.cooldowns.is_paused(_account_of(sel)):
+                        entry = sel
+                except Exception:
+                    pass  # fall back to available[0]
+
             try:
-                return await pool.chat(
+                client = pool._client_for(entry)
+                text = await client.chat(
                     prompt=prompt,
-                    sprompt=sprompt,
+                    model=entry.model.name,
+                    system=sprompt or "You are a helpful assistant.",
                     temperature=temperature,
-                    strategy=strategy,
-                    model=model,
                 )
-            except Exception as exc:  # noqa: BLE001
-                if attempt == 0 and _is_rate_limit(exc):
-                    prov = _provider_of(pool)
-                    if prov:
-                        self.cooldowns.pause(prov, _next_reset_utc())
+                # Stash meta the same way ladyol.chat does, so
+                # chat_with_meta's getattr probing still works.
+                # (setattr keeps static checkers quiet; the attrs are
+                # dynamic stash points ladyol versions may or may not
+                # define.)
+                try:
+                    setattr(pool, "last_provider", entry.provider)
+                    setattr(pool, "last_model", entry.model.name)
+                except Exception:
+                    pass
+                return text
+            except Exception as exc:  # noqa: BLE001 — rotate on ANY provider error
+                last_exc = exc
+                acct = _account_of(entry)
+                if _is_rate_limit(exc):
+                    self.cooldowns.pause(acct, _next_reset_utc())
+                if model is None:
+                    excluded.add(id(entry))
+                    logma.warning(
+                        f"[SophiaPool.chat] attempt {attempt + 1} failed on "
+                        f"{acct}/{entry.model.name}: {exc}; rotating to another account"
+                    )
                     continue
                 raise
-            finally:
-                pool._entries = original
-        raise RuntimeError("unreachable")
+        if last_exc is not None:
+            raise last_exc
+        # No entries were available at all.
+        active = [e for e in pool._entries
+                  if not self.cooldowns.is_paused(_account_of(e))]
+        if not active:
+            raise RuntimeError(
+                "all accounts are rate-limited (paused until their next "
+                "reset window); try again after the next window"
+            )
+        raise RuntimeError("chat exhausted all account retries without success")
 
     async def chat_with_meta(
         self,
@@ -293,7 +348,7 @@ class SophiaPool:
             # Candidate selection, honoring this call's exclusions.
             available = [e for e in pool._entries
                          if id(e) not in excluded
-                         and not self.cooldowns.is_paused(e.provider.name)]
+                         and not self.cooldowns.is_paused(_account_of(e))]
             if model:
                 available = [e for e in available if e.model.name == model]
             if not available:
@@ -344,11 +399,12 @@ class SophiaPool:
             if model:
                 raise last_exc
             excluded.add(id(entry))
-            # Rate limit? Pause the whole PROVIDER until its next
-            # reset window (1am/6am/11am/4pm/8pm EDT) so subsequent
-            # requests skip it entirely, not just this call.
+            # Rate limit? Pause just this ACCOUNT (its API key's
+            # allotment is exhausted) until the next reset window
+            # (1am/6am/11am/4pm/8pm EDT). Other accounts on the same
+            # provider keep serving.
             if err is not None and _is_rate_limit(err):
-                self.cooldowns.pause(entry.provider.name, _next_reset_utc())
+                self.cooldowns.pause(_account_of(entry), _next_reset_utc())
             logma.warning(
                 f"[SophiaPool.stream] attempt {attempt + 1} failed on "
                 f"{getattr(entry.provider, 'name', '?')}/{entry.model.name}: "
@@ -401,22 +457,6 @@ def _is_rate_limit(exc: BaseException) -> bool:
         if code == 429:
             return True
     return False
-
-
-def _provider_of(pool) -> Optional[str]:
-    """Best-effort: which provider served the pool's last call?
-
-    ladyol doesn't uniformly expose the picked entry after a failure,
-    so we check the attrs different versions stash, then fall back to
-    parsing 'provider=<name>' out of recent log-shaped messages on
-    the exception itself. Returns None if undeterminable.
-    """
-    for attr in ("last_provider_name", "last_provider"):
-        v = getattr(pool, attr, None)
-        name = getattr(v, "name", None) or v
-        if isinstance(name, str) and name:
-            return name
-    return None
 
 
 def _load_providers_dict(yaml_path: str) -> dict:

@@ -22,12 +22,47 @@ class _FakeConfig:
         return self._data.get(key)
 
 
+class _FakeProvider:
+    def __init__(self, name="fake", api_key="fk-test1234"):
+        self.name = name
+        self.api_key = api_key
+
+
+class _FakeModel:
+    def __init__(self, name="fake-model"):
+        self.name = name
+
+
+class _FakeEntry:
+    """Mirrors ladyol's ModelProviderEntry: (provider, model) pair."""
+    def __init__(self, provider=None, model=None):
+        self.provider = provider or _FakeProvider()
+        self.model = model or _FakeModel()
+
+
+class _FakeClient:
+    def __init__(self, pool):
+        self._pool = pool
+    async def chat(self, *, prompt, model, system="", temperature=0.7, **kw):
+        self._pool.chat_calls.append({
+            "prompt": prompt, "system": system, "temperature": temperature,
+            "model": model,
+        })
+        return "echo: " + prompt
+
+
 class FakePool:
-    """Drop-in replacement for ladyol's ProviderPool for SophiaPool tests."""
+    """Drop-in replacement for ladyol's ProviderPool for SophiaPool tests.
+
+    SophiaPool drives entries directly (per-account cooldown rotation),
+    so the fake exposes _entries / _client_for / _select_entry plus the
+    legacy chat() for compatibility.
+    """
     def __init__(self, memory, decision_engine=None, agent_path=None, cfg=None):
         self.config = _FakeConfig()
         self.providers = self.config.get("providers")
         self.chat_calls = []
+        self._entries = [_FakeEntry()]
 
     def available(self):
         return {"fake": ["fake-model"]}
@@ -35,6 +70,12 @@ class FakePool:
     def _initialize_pool(self):
         """No-op for tests — real ProviderPool reads PyKeyStore and builds entries."""
         pass
+
+    def _select_entry(self, model_name=None, strategy="random"):
+        return self._entries[0]
+
+    def _client_for(self, entry):
+        return _FakeClient(self)
 
     async def chat(self, *, prompt, sprompt, temperature=0.7, strategy="random",
                    retry=True, _failed_entries=None, model=None):
@@ -79,21 +120,21 @@ def test_list_models_returns_model_cards(pool):
 
 
 def test_chat_propagates_strategy_and_model(pool, fake_pool_instance):
-    """Strategy and model are forwarded to ProviderPool.chat()."""
+    """Explicit model + params reach the low-level client for the right entry."""
     async def run():
         return await pool.chat(
             prompt="hi", sprompt="sys", temperature=0.5,
-            strategy="cheapest", model="specific-model",
+            strategy="cheapest", model="fake-model",
         )
     result = asyncio.run(run())
     assert result == "echo: hi"
     assert len(fake_pool_instance.chat_calls) == 1
     call = fake_pool_instance.chat_calls[0]
-    assert call["strategy"] == "cheapest"
-    assert call["model"] == "specific-model"
+    # SophiaPool now drives entries directly; sprompt flows as `system`.
+    assert call["model"] == "fake-model"
     assert call["temperature"] == 0.5
     assert call["prompt"] == "hi"
-    assert call["sprompt"] == "sys"
+    assert call["system"] == "sys"
 
 
 def test_pool_is_lazy(monkeypatch):
