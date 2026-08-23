@@ -47,6 +47,20 @@ COPY pyproject.toml README.md ./
 # layout (pip 25 retries against "remote HEAD" and rejects non-bare
 # paths). Bump to 26.x BEFORE any other pip invocation. Locked-in
 # spec; verified via tests/integration/test_install_branching.py.
+# Trust GitVein source paths under the bind mount.
+#
+# git 2.35+ refuses to operate on a .git/ it doesn't trust
+# ("safe.directory" guard). The Dockerfile's builder stage runs as
+# root (USER sophia is set much later) and reads SB source under
+# /mnt/overse/.../<name>.git/.git/, where files are userns-mapped
+# to 1000:1000 (different owner) in the container. Without this,
+# git returns "detected dubious ownership ..." and the SB installs
+# fail. Safe for a build stage: input is operator-vetted Vein
+# content; the runtime image inherits no such config (the runtime
+# stage doesn't bind-mount /mnt).
+RUN git config --global --add safe.directory /mnt/*/GitVein/*
+RUN git config --global --add safe.directory /mnt/*/gitvein/*
+
 # pin pip<26 so it doesn't use --filter=blob:none at clone time.
 # pip 25.x and 26.x both pass --filter=blob:none --quiet to
 # `git clone`, which requires a bare git source — incompatible with
