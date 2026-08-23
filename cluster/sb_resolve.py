@@ -2,7 +2,7 @@
 """Build-time sibling of shieldface.spec_router.resolve_spec.
 
 Mirrors the runtime spec_router byte-for-byte so the redirect from
-`name@branch` → `git+file://<vein>/name.git@branch` is owned by code,
+`name@branch` → `git+file://<vein>/name.git/.git@branch` is owned by code,
 not baked into a build config. Used by the Dockerfile (no spec_router
 interceptor available at build time, but the same translation must
 still run).
@@ -55,12 +55,16 @@ def sb_namespaces(manifest_path: Path) -> Iterable[str]:
 
 
 def resolve_spec(token: str, vein_root: str, branch: str = "gamma") -> str:
-    """Rewrite SB spec `name@branch` → `git+file://<vein>/name.git@branch`.
+    """Rewrite SB spec `name@branch` → `git+file://<vein>/name.git/.git@branch`.
 
     Mirrors shieldface.spec_router.resolve_spec. Bare names (no
     @branch) are returned unchanged so they resolve via devpi/PyPI.
     Third-party specs (no entry in sb_namespace) are also returned
     unchanged.
+
+    The ``/.git`` before ``@<branch>`` points pip+git at the bare-repo
+    database inside the Vein mirror's working-tree clone — see
+    shieldface.spec_router.resolve_spec for the full explanation.
     """
     if not token or token.startswith("-"):
         return token
@@ -76,13 +80,13 @@ def resolve_spec(token: str, vein_root: str, branch: str = "gamma") -> str:
     name, br = m.group(1), m.group(2)
     if not br:
         return token  # no branch → wheel path, leave
-    return f"{name} @ git+file://{vein_root}/{name}.git@{br}"
+    return f"{name} @ git+file://{vein_root}/{name}.git/.git@{br}"
 
 
 def build_resolve_args(sb_names: Iterable[str], vein_root: str, branch: str) -> Iterable[str]:
     """Emit pip-install argv tokens, one per SB dep."""
     for n in sb_names:
-        yield f"{n} @ git+file://{vein_root}/{n}.git@{branch}"
+        yield f"{n} @ git+file://{vein_root}/{n}.git/.git@{branch}"
 
 
 def main() -> int:
