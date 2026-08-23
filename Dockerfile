@@ -31,75 +31,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         libffi-dev \
         libssl-dev \
-        git \
     && rm -rf /var/lib/apt/lists/*
 
 # Runtime deps first (cache layer reuse).
 # README.md is required by hatchling's metadata step (readme field in
 # pyproject.toml). COPY it before the first pip install.
 COPY pyproject.toml README.md ./
-# PyYAML is needed by cluster/sb_resolve.py below (parses the manifest
-# YAML). Install it minimally before invoking the resolver — the SB
-# install itself doesn't depend on PyYAML (the redirected pip URLs
-# don't require it).
-RUN pip install --no-cache-dir --no-build-isolation "PyYAML>=6.0,<7.0"
-
-# SB-stack deps (kahndor, subtrix, pycurity, ladyol, glain, xskillaber,
-# knightsort, goalt, mindot, squirl, thingery, senbai, eaglis,
-# metrologic) are local first-party modules: they are NOT on PyPI and
-# they are NOT pre-built as wheels. Per operator policy (2026-08-23),
-# every internal project installs straight from the GitVein checkout
-# at @gamma — that way commits land without a wheel upload cycle and
-# every consumer host picks up the same source.
+# SB-stack (kahndor, subtrix, pycurity, ladyol, goalt, mindot,
+# squirl, thingery, knightsort, glain, xskillaber, metrologic) is
+# local-only — not on PyPI. Wheels are pre-built ON THE HOST by
+# scripts/build-sophia.sh (from the workspace checkouts, which mirror
+# GitVein @gamma) and vendored into sb-dist/ before this build. The
+# container never runs git: all clone/build work happens on the host
+# where git works. (In-container git+file:// clones fail on git
+# safe.directory + bind-mount case-folding + pip --filter=blob:none —
+# see docs/DEPLOY.md troubleshooting and the Glain record; do not
+# retry that path.)
 #
-# The redirect from `name@branch` → `git+file://<vein>/name.git@branch`
-# is owned by CODE — the runtime spec_router (in shieldface.cli /
-# shieldface.interceptor) for installs, and a build-time sibling
-# `cluster/sb_resolve.py` for Docker builds (no spec_router interceptor
-# available in the build stage). The Dockerfile calls the helper
-# rather than embedding URL strings, so all redirects stay code-driven
-# and stay in sync with the runtime resolver.
-#
-# Pins come from shieldface/_data_/sb_stack_manifest.yaml — the same
-# file the runtime spec_router reads — so the SB namespace set in
-# `sb_namespace` (this commit pushed to gamma) is the single source.
-#
-# Each SB transitive is installed --no-deps to avoid the resolver
-# pulling the public-PyPI placeholder stubs (e.g. kahndor 0.0.0);
-# the PyPI bulk install below explicitly lists the third-party
-# versions those SB projects need, and the final . install does its
-# own full resolver pass once PyPI deps are in place.
-#
-# cluster/sb_resolve.py is a copy of the relevant logic from
-# shieldface.spec_router (zero deps beyond pyyaml) so the build
-# container doesn't need shieldface installed at build time. The
-# runtime spec_router is the canonical source — when its resolve_spec
-# changes, mirror the change here. Single-source comment at the top
-# of cluster/sb_resolve.py.
-COPY cluster/sb_resolve.py /tmp/sb_resolve.py
-# `SB_STACK_MANIFEST` is a --build-arg (override via the orchestrator
-# script: `docker build --build-arg SB_STACK_MANIFEST=$(cat ...) .`).
-# Default empty so test builds still work; orchestrator flow on the
-# dev host reads the live manifest from
-# /home/solubrew/.hermes/projects/shieldface/shieldface/_data_/sb_stack_manifest.yaml.
-ARG SB_STACK_MANIFEST=""
-# Propagate the build-arg into the runtime env so the helper can read
-# it (ARG alone only exposes the value on its own line; ENV copies
-# its current value into subsequent RUN steps).
-ENV SB_STACK_MANIFEST=$SB_STACK_MANIFEST
-# SB_INSTALL_ARGS is a NUL-delimited list of PEP-508 direct
-# references from cluster/sb_resolve.py. Use printf "\0" + xargs -0
-# to avoid any shell layer stripping the @-syntax in tokens.
-# Run sb_resolve.py to expand sb_namespace into PEP-508 direct
-# references (git+file://...@gamma), then invoke pip as a subprocess
-# from python so no shell quoting layer interferes with the @-syntax
-# (xargs / $IFS splits corrupt tokens with embedded spaces).
-RUN SB_ARGS="$(python3 /tmp/sb_resolve.py \
-        --vein /mnt/overse/SBST01/vein/GitVein \
-        --branch gamma)" && \
-    set -x && \
-    python3 -c "import sys,subprocess; sys.exit(subprocess.call(['pip','install','--prefix=/install','--no-cache-dir','--no-build-isolation','--no-deps', *sys.argv[1].splitlines()]))" "$SB_ARGS" && \
-    rm /tmp/sb_resolve.py
+# If sb-dist/ is missing, the build fails loudly — run
+# scripts/build-sophia.sh (or --no-build for wheels only) first.
+COPY sb-dist/*.whl /tmp/sb-dist/
+RUN pip install --prefix=/install --no-deps /tmp/sb-dist/*.whl \
+    && rm -rf /tmp/sb-dist
 
 # Two-step install:
 #   1) PyPI runtime deps for sophia itself (--no-deps so they don't

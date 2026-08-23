@@ -64,23 +64,15 @@ Watch it: `docker logs -f sophia_sophia_1 2>&1 | grep -E "cooldown|rotating"`
 ```bash
 cd /home/solubrew/.hermes/projects/sophia
 
-# 1. Build the image. The Dockerfile installs every SB transitive
-#    (kahndor, subtrix, pycurity, ladyol, goalt, mindot, glain,
-#    thingery, squirl, knightsort, xskillaber, senbai, eaglis,
-#    metrologic) directly from the GitVein via git+file://.../X.git@gamma.
-#    No sb-dist/ vendoring step required. The vein path is
-#    /mnt/overse/SBST01/vein/GitVein (.67) — bind-mount or symlink it
-#    on build hosts where that path doesn't exist natively.
-#
-#    The build reads the live SB namespace from the shieldface
-#    manifest (read by `cluster/sb_resolve.py` — a build-time
-#    mirror of `shieldface.spec_router.resolve_spec`). The host
-#    orchestrator passes the manifest as a build arg:
-#
-SB_STACK_MANIFEST="$(cat /home/solubrew/.hermes/projects/shieldface/shieldface/_data_/sb_stack_manifest.yaml)" \
-./cluster/docker-compose -f docker-compose.cluster.yml build \
-    --build-arg SB_STACK_MANIFEST="$SB_STACK_MANIFEST" \
-    --no-cache sophia
+# 1. Vendor SB wheels + build the image. All git work happens on the
+#    HOST (workspace checkouts or GitVein @gamma via --from-vein); the
+#    container only sees wheel files. In-container git+file:// clones
+#    do NOT work (git safe-directory + bind-mount case-folding +
+#    pip --filter=blob:none) — don't retry that path.
+PYTHON=/home/solubrew/ENVs/shieldface/bin/python3 \
+    ./scripts/build-sophia.sh          # wheels + docker build in one
+# or: ./scripts/build-sophia.sh --no-build   (wheels only)
+# or: ./scripts/build-sophia.sh --from-vein  (clone fresh from GitVein)
 
 # 2. Seed keys (wipes the sophia volume; merges ONLY the 5 LLM account
 #    keys from the system-wide vault; writes sophia_cluster_master_passphrase

@@ -62,24 +62,59 @@ cp cluster/.env.example .env
 $EDITOR .env
 ```
 
-## Step 3 — SB-stack is installed from GitVein automatically
+## Step 3 — Vendor the SB-stack wheels (host-side)
 
 The SB-stack (kahndor, subtrix, pycurity, ladyol, goalt, mindot,
-glain, thingery, squirl, knightsort, xskillaber, senbai, eaglis,
-metrologic) is local-only — not on PyPI. As of 2026-08-23, the
-Dockerfile installs each package directly from the GitVein checkout
-via `git+file://.../X.git@gamma` — no pre-vendoring step needed.
+squirl, thingery, knightsort, glain, xskillaber, metrologic) is
+local-only — not on PyPI. Wheels are pre-built **on the host** and
+vendored into `sb-dist/` before the Docker build; the container only
+ever sees wheel FILES (no git inside the build — in-container
+`git+file://` clones fail on git safe-directory + bind-mount
+case-folding + pip `--filter=blob:none`; do not retry that path).
 
 ```bash
-# Just build. The Dockerfile clones each SB repo at build time.
-sudo docker build -f Dockerfile -t sophia-web:local .
+# One command: builds all 12 SB wheels + the uuid_extensions stub
+# into sb-dist/, then runs the docker build.
+PYTHON=/home/solubrew/ENVs/shieldface/bin/python3 \
+    ./scripts/build-sophia.sh
+
+# Wheels only (skip the docker build):
+PYTHON=/home/solubrew/ENVs/shieldface/bin/python3 \
+    ./scripts/build-sophia.sh --no-build
+
+# Force fresh clones from the GitVein @gamma instead of workspace
+# checkouts (requires the vein mounted at
+# /mnt/overse/SBST01/vein/GitVein):
+./scripts/build-sophia.sh --from-vein
 ```
 
-The vein path is hardcoded to `/mnt/overse/SBST01/vein/GitVein`. For
-builds running on `.67` (sbst01) this resolves directly. On other
-hosts the bind-mount or symlink should be set up before building.
+Details the script handles:
 
-> `sb-dist/` is `.gitignore`d (these are build artefacts, not source).
+- **Source**: workspace checkouts under `/home/solubrew/.hermes/projects/`
+  (default) — same content as GitVein @gamma as long as commits are
+  pushed (`git push origin gamma`, the normal flow). The script warns
+  when a workspace has unpushed commits so wheels can't silently
+  diverge from gamma. `--from-vein` clones fresh from the vein instead.
+- **Python**: needs setuptools+wheel+hatchling; the script auto-picks
+  `/home/solubrew/ENVs/shieldface/bin/python3` (bare `/usr/bin/python3.12`
+  fails pyproject builds with `BackendUnavailable`).
+- **uuid_extensions**: squirl/subtrix `from uuid_extensions import
+  uuid7` at runtime, but the package is not on PyPI. The script builds
+  a stub wheel from an existing venv's site-packages copy (original
+  build did the same — see git history `03d9b9a`).
+- **Ordering**: `SB_PACKAGES` lists dependencies first (kahndor before
+  ladyol/pycurity); `--no-deps` means the wheel build never pulls the
+  public-PyPI placeholder stubs.
+
+`sb-dist/` is `.gitignore`d (build artefacts, not source). If it's
+missing or stale, the Dockerfile's `COPY sb-dist/*.whl` fails loudly —
+re-run the script.
+
+**Fresh-checkout duplication path** (what a new host needs):
+1. Mount or clone the workspace repos (or the GitVein) — every repo in
+   `SB_PACKAGES` above.
+2. Have a python with setuptools (`ENVs/shieldface` or equivalent).
+3. Run `scripts/build-sophia.sh` — that's the whole SB-side setup.
 
 ## Step 4 — Build the image
 
@@ -90,8 +125,8 @@ hosts the bind-mount or symlink should be set up before building.
 The image (`sophia_sophia:latest`) ships:
 - `/etc/sophia/agent/` — provider pool config + account list
 - `cluster/entrypoint.py` — vault init + filtered merge + uvicorn exec
-- The 12 SB-stack wheels + their transitive PyPI deps installed
-  `--no-deps`
+- The 13 vendored wheels (12 SB-stack + uuid_extensions stub) +
+  their transitive PyPI deps installed `--no-deps`
 
 ## Step 5 — Seed provider keys
 
@@ -266,9 +301,11 @@ vars stay in plain `.env` files.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Build fails: `git+file://...X.git@gamma` clone errors | Vein path `/mnt/overse/SBST01/vein/GitVein` not mounted on the build host | Bind-mount or symlink the GitVein onto the build host before `docker build` |
+| Build fails: `COPY sb-dist/*.whl` empty | `sb-dist/` not vendored; first build needs the 13 wheels | Run `scripts/build-sophia.sh --no-build`, then rebuild |
 | Container exits: `PermissionError: '/host-pycurity/secure_store.db'` | `seed-keys.sh` chmod step didn't take effect (rare; happens if source vault dir is root-owned) | Check `stat -c '%a' ~/.local/share/pycurity` — should be 700 with files 600 |
-| Container exits: `vault.db exists but temp.key missing` | Orphaned vault state (previous run aborted mid-init) | `docker compose -f docker-compose.cluster.yml down -v && ./cluster/seed-keys.sh ...` |
+| Container exits: `vault.db exists but temp.key missing` | Entrypoint checks `temp.key` but PyKeyStore's cache is named `master.key.temp` (filename mismatch), OR the vault volume was written by an older entrypoint | **No reseed needed** — refresh the cached key from the stored passphrase: `docker exec sophia_sophia_1 sh -c 'cat /var/lib/sophia/pycurity/.master_passphrase > /var/lib/sophia/pycurity/master.key.temp && chmod 600 /var/lib/sophia/pycurity/master.key.temp'` then `docker restart sophia_sophia_1`. Only wipe + reseed (`down -v` + `seed-keys.sh`) if the vault itself is corrupt |
+| `/healthz` says `providers: 0, pool not initialized` + logs show `EOFError` at `getpass` | PyKeyStore's cached key (`master.key.temp`) **expires after 4h** by mtime; after long downtime it self-deletes and the vault falls back to a passphrase prompt, which EOFs in a non-TTY container | Same fix as above: refresh `master.key.temp` from `.master_passphrase` (the entrypoint stores the generated passphrase there at first boot) with a **fresh mtime** (don't `cp -p`), then restart. Root fix pending: entrypoint should refresh the temp key at every boot |
+| `/healthz` says `pool unreachable (ModuleNotFoundError: No module named 'uuid_extensions')` | Image built without the uuid_extensions stub wheel (squirl imports it; not on PyPI) | Run `scripts/build-sophia.sh` (it vendors the stub from an existing venv) and rebuild the image |
 | `PermissionError: Invalid passphrase` in source-vault pre-flight | Wrong passphrase to `seed-keys.sh` | Re-run with the correct passphrase; the source vault perms are restored even on failure |
 | `/healthz` returns `providers: 0` | Accts.yaml allowlist is empty or doesn't match PyKeyStore keys | `cat cluster/agent/agent_accts.yaml` — `name:` fields must match keys in the source vault |
 | `/v1/models` returns `{"detail":"missing or invalid API key"}` | Requestor key not valid OR key is `requestor` role hitting `/v1/usage/*` (returns 403 by design) | `manage_keys list` to confirm the key; match role to endpoint |
