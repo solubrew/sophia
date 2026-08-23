@@ -47,7 +47,7 @@ services:
       # `docker build` without the arg only installs Sophia + the
       # explicit PyPI list. Orchestrator: see cluster/README.md.
       args:
-        SB_STACK_MANIFEST: ""
+        SB_STACK_MANIFEST: "${SB_STACK_MANIFEST:-}"
     restart: unless-stopped
     environment:
       # LAN bind — exposed on the host's loopback for the test (open
