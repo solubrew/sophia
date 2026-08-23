@@ -42,12 +42,7 @@ COPY pyproject.toml README.md ./
 # YAML). Install it minimally before invoking the resolver — the SB
 # install itself doesn't depend on PyYAML (the redirected pip URLs
 # don't require it).
-# NB: bundled pip on python:3.12-slim-bookworm is 25.x and uses an
-# older git+file:// code path that breaks on the GitVein working-tree
-# layout (pip 25 retries against "remote HEAD" and rejects non-bare
-# paths). Bump to 26.x BEFORE any other pip invocation. Locked-in
-# spec; verified via tests/integration/test_install_branching.py.
-RUN pip install --no-cache-dir --no-build-isolation "pip>=26.0" "PyYAML>=6.0,<7.0"
+RUN pip install --no-cache-dir --no-build-isolation "PyYAML>=6.0,<7.0"
 
 # SB-stack deps (kahndor, subtrix, pycurity, ladyol, glain, xskillaber,
 # knightsort, goalt, mindot, squirl, thingery, senbai, eaglis,
