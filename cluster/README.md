@@ -64,17 +64,16 @@ Watch it: `docker logs -f sophia_sophia_1 2>&1 | grep -E "cooldown|rotating"`
 ```bash
 cd /home/solubrew/.hermes/projects/sophia
 
-# 1. Wheels — sb-dist/ is gitignored + gets root-owned by docker binds;
-#    rebuild if empty (12 wheels: 11 SB pkgs + uuid_extensions):
-bash -c 'mkdir -p sb-dist && for p in kahndor subtrix pycurity ladyol goalt \
-  mindot glain thingery squirl knightsort xskillaber; do
-  /home/solubrew/ENVs/shieldface/bin/python3 -m pip wheel --no-deps \
-    --no-build-isolation -w sb-dist /home/solubrew/.hermes/projects/$p; done'
-
-# 2. Build the image
+# 1. Build the image. The Dockerfile installs every SB transitive
+#    (kahndor, subtrix, pycurity, ladyol, goalt, mindot, glain,
+#    thingery, squirl, knightsort, xskillaber, senbai, eaglis,
+#    metrologic) directly from the GitVein via git+file://.../X.git@gamma.
+#    No sb-dist/ vendoring step required. The vein path is
+#    /mnt/overse/SBST01/vein/GitVein (.67) — bind-mount or symlink it
+#    on build hosts where that path doesn't exist natively.
 ./cluster/docker-compose -f docker-compose.cluster.yml build --no-cache sophia
 
-# 3. Seed keys (wipes the sophia volume; merges ONLY the 5 LLM account
+# 2. Seed keys (wipes the sophia volume; merges ONLY the 5 LLM account
 #    keys from the system-wide vault; writes sophia_cluster_master_passphrase
 #    back to the system-wide vault; restores all source perms on exit)
 ./cluster/seed-keys.sh /home/solubrew/.local/share/pycurity/secure_store.db '<passphrase>'

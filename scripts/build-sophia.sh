@@ -1,85 +1,27 @@
 #!/usr/bin/env bash
-# Vendor SB-stack packages into sb-dist/ for the Docker build.
+# build-sophia.sh — DEPRECATED no-op.
 #
-# The SB-stack (kahndor, subtrix, pycurity, ladyol) is not on PyPI —
-# it lives as local editable installs in /home/solubrew/.hermes/projects/.
-# For a portable Docker build, we pre-build wheels into sb-dist/ and
-# COPY them into the builder stage. This mirrors the nchantdoffice_com
-# pattern (see /home/solubrew/.hermes/projects/nchantdoffice_com/Dockerfile
-# + sb-dist/).
+# As of 2026-08-23 (operator policy), the SB-stack is installed directly
+# from the GitVein checkouts via `git+file://.../<sb>.git@gamma` in the
+# Dockerfile. Pre-vendoring wheels into sb-dist/ is no longer required
+# or supported — the Dockerfile clones each SB repo at build time.
 #
-# Usage:
-#   ./scripts/build-sophia.sh                 # builds wheels + runs docker build
-#   ./scripts/build-sophia.sh --no-build      # wheels only
-#   ./scripts/build-sophia.sh --image sophia-web:local
-#
-# Requirements: a Python with the SB-stack editable-installed. The
-# shieldface venv python shim can't be invoked directly — use
-# /usr/bin/python3.12, which has the same sys.path after the venv's
-# site-packages are added.
-
-# ShieldFace note (2026-08-21): the interception stack is now fully
-# live — server at http://192.168.1.210:3141 (approval) + :3142 (devpi
-# mirror), interceptor gates install-class execs only (pip wheel/list
-# are unaffected), and SHIELDFACE_FAIL_OPEN=1 covers API outages on dev
-# hosts. The re-exec below is kept as defense-in-depth: if the daemon
-# is ever misconfigured again it still un-blocks this script.
-if [[ -n "${LD_PRELOAD:-}" ]]; then
-    if [[ -z "${_SHIELDFACE_REEXEC_DONE:-}" ]]; then
-        export _SHIELDFACE_REEXEC_DONE=1
-        exec env -u LD_PRELOAD bash "$0" "$@"
-    fi
-fi
+# This script is kept as a stub so legacy CI invocations don't break.
+# It only runs `docker build` against the Dockerfile; if sb-dist/ is
+# ever present from an older build, it's ignored.
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-SB_DIST="$PROJECT_ROOT/sb-dist"
-SB_ROOT="${SB_STACK_ROOT:-/home/solubrew/.hermes/projects}"
-PYTHON="${PYTHON:-/usr/bin/python3.12}"
+echo "[build-sophia] DEPRECATED no-op — SB wheels now installed from GitVein in the Dockerfile."
+echo "[build-sophia] See Dockerfile SB-stack deps section (commit 03d9b9a)."
 
-# Packages to vendor, in dependency order (kahndor first because
-# ladyol/pycurity depend on it).
-SB_PACKAGES=(kahndor subtrix pycurity ladyol)
-
-# Parse flags.
-DO_BUILD=1
-IMAGE_TAG="sophia-web:local"
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --no-build) DO_BUILD=0 ; shift ;;
-        --image)    IMAGE_TAG="${2:?--image requires a tag}"; shift 2 ;;
-        *)          echo "Unknown arg: $1" >&2; exit 2 ;;
-    esac
-done
-
-echo "[build-sophia] Ensuring build tooling is present"
-"$PYTHON" -m pip install --quiet --upgrade pip hatchling build 2>&1 | tail -3 || true
-
-echo "[build-sophia] Vendoring SB-stack wheels into $SB_DIST"
-mkdir -p "$SB_DIST"
-for pkg in "${SB_PACKAGES[@]}"; do
-    pkg_path="$SB_ROOT/$pkg"
-    if [ ! -d "$pkg_path" ]; then
-        echo "[build-sophia] ERROR: $pkg_path does not exist. Install it or set SB_STACK_ROOT." >&2
-        exit 1
-    fi
-    echo "[build-sophia]   - $pkg"
-    # --no-build-isolation: use the host's pip/build tooling instead of
-    # creating an ephemeral build env. The SB-stack packages are already
-    # editable-installed on this host, so pip can see their build deps.
-    "$PYTHON" -m pip wheel --no-deps --no-build-isolation \
-        --wheel-dir "$SB_DIST" "$pkg_path" 2>&1 | tail -5
-done
-
-echo "[build-sophia] Vendored wheels:"
-ls -la "$SB_DIST"/*.whl 2>&1
-
-if [ "$DO_BUILD" -eq 1 ]; then
-    echo "[build-sophia] Running docker build"
-    cd "$PROJECT_ROOT"
-    docker build -f Dockerfile -t "$IMAGE_TAG" .
+if [[ "${1:-}" == "--image" ]]; then
+    IMAGE_TAG="${2:-sophia-web:local}"
+else
+    IMAGE_TAG="sophia-web:local"
 fi
 
+cd "$(dirname "$0")/.."
+echo "[build-sophia] Running: docker build -f Dockerfile -t $IMAGE_TAG ."
+docker build -f Dockerfile -t "$IMAGE_TAG" .
 echo "[build-sophia] Done."

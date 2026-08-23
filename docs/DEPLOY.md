@@ -62,40 +62,22 @@ cp cluster/.env.example .env
 $EDITOR .env
 ```
 
-## Step 3 — Vendor the SB wheels into `sb-dist/`
+## Step 3 — SB-stack is installed from GitVein automatically
 
 The SB-stack (kahndor, subtrix, pycurity, ladyol, goalt, mindot,
-glain, thingery, squirl, knightsort, xskillaber) plus uuid_extensions
-is local-only — not on PyPI. The Dockerfile expects 12 wheels in
-`sb-dist/`. Vendor them before the first build:
+glain, thingery, squirl, knightsort, xskillaber, senbai, eaglis,
+metrologic) is local-only — not on PyPI. As of 2026-08-23, the
+Dockerfile installs each package directly from the GitVein checkout
+via `git+file://.../X.git@gamma` — no pre-vendoring step needed.
 
 ```bash
-mkdir -p sb-dist
-for pkg in kahndor subtrix pycurity ladyol goalt mindot glain thingery \
-           squirl knightsort xskillaber; do
-    /usr/bin/python3.12 -m pip wheel --no-deps --no-build-isolation \
-        --wheel-dir sb-dist /home/solubrew/.hermes/projects/$pkg
-done
-# uuid_extensions (subtrix dep, not on PyPI):
-mkdir -p /tmp/uuid_ext_build && rm -rf /tmp/uuid_ext_build/*
-cp -r /home/solubrew/EDN/AGTs/hermes/projects/glain/.venv/lib/python3.12/site-packages/uuid_extensions \
-    /tmp/uuid_ext_build/
-cat > /tmp/uuid_ext_build/pyproject.toml <<EOF
-[build-system]
-requires = ['setuptools>=61']
-build-backend = 'setuptools.build_meta'
-[project]
-name = 'uuid_extensions'
-version = '0.1.0'
-EOF
-cat > /tmp/uuid_ext_build/setup.py <<EOF
-from setuptools import setup, find_packages
-setup(name='uuid_extensions', version='0.1.0', packages=find_packages())
-EOF
-/usr/bin/python3.12 -m pip wheel --no-deps --no-build-isolation \
-    --wheel-dir sb-dist /tmp/uuid_ext_build
-ls sb-dist/*.whl | wc -l   # should be 12
+# Just build. The Dockerfile clones each SB repo at build time.
+sudo docker build -f Dockerfile -t sophia-web:local .
 ```
+
+The vein path is hardcoded to `/mnt/overse/SBST01/vein/GitVein`. For
+builds running on `.67` (sbst01) this resolves directly. On other
+hosts the bind-mount or symlink should be set up before building.
 
 > `sb-dist/` is `.gitignore`d (these are build artefacts, not source).
 
@@ -284,8 +266,7 @@ vars stay in plain `.env` files.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Build fails: `COPY sb-dist/*.whl` empty | `sb-dist/` not populated; first build needs 12 wheels vendored | Run the vendor loop in §3, then rebuild |
-| Build fails: `Could not find a version that satisfies the requirement kahndor<1.0.0` | SB wheels missing | Same fix — vendor + rebuild |
+| Build fails: `git+file://...X.git@gamma` clone errors | Vein path `/mnt/overse/SBST01/vein/GitVein` not mounted on the build host | Bind-mount or symlink the GitVein onto the build host before `docker build` |
 | Container exits: `PermissionError: '/host-pycurity/secure_store.db'` | `seed-keys.sh` chmod step didn't take effect (rare; happens if source vault dir is root-owned) | Check `stat -c '%a' ~/.local/share/pycurity` — should be 700 with files 600 |
 | Container exits: `vault.db exists but temp.key missing` | Orphaned vault state (previous run aborted mid-init) | `docker compose -f docker-compose.cluster.yml down -v && ./cluster/seed-keys.sh ...` |
 | `PermissionError: Invalid passphrase` in source-vault pre-flight | Wrong passphrase to `seed-keys.sh` | Re-run with the correct passphrase; the source vault perms are restored even on failure |

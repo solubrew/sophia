@@ -188,17 +188,13 @@ with open('$TMP_YAML') as f:
 SRC_MOUNT_DIR = os.environ['SRC_MOUNT_DIR']
 bind = f'      - \"{SRC_MOUNT_DIR}:/host-pycurity:ro\"\n'
 if '/host-pycurity' not in text or SRC_MOUNT_DIR not in text:
-    new_text = text.replace(
-        '      - ./sb-dist:/opt/sophia/sb-dist:ro',
-        '      - ./sb-dist:/opt/sophia/sb-dist:ro\n' + bind,
-        1,
-    )
-    if new_text == text:
-        print('WARN: sb-dist bind line not found; mount injection skipped', file=__import__('sys').stderr)
-    else:
-        with open('$TMP_YAML', 'w') as f:
-            f.write(new_text)
-        print('injected bind mount for', SRC_MOUNT_DIR)
+    # As of 2026-08-23 the Dockerfile no longer references sb-dist
+    # (SB-stack transitives install from GitVein at build time), so we
+    # just append the host vault bind to the volumes list, no replace.
+    new_text = text + ('\n' + bind)
+    with open('$TMP_YAML', 'w') as f:
+        f.write(new_text)
+    print('appended bind mount for', SRC_MOUNT_DIR)
 "
 unset SRC_MOUNT_DIR
 ./cluster/docker-compose -f "$TMP_YAML" up -d --force-recreate sophia
