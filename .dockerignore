@@ -19,9 +19,10 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-# But DO allow our own vendored SB-stack wheels under sb-dist/
-# (mirrors nchantdoffice_com's pattern; .dockerignore rules are
-# additive, so the explicit allow below re-includes it).
+# But DO include the SB-stack source checkouts if anyone ever runs
+# this build with a populated sb-dist/ as a fallback (no current use;
+# the primary install path is git+file:///mnt/overse/SBST01/vein/... as
+# declared by the Dockerfile).
 !sb-dist/
 
 # Virtual environments
