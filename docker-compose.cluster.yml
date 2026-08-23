@@ -40,6 +40,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # SB_STACK_MANIFEST is the GitVein SB namespace manifest piped
+      # in at build time so cluster/sb_resolve.py can mirror the
+      # runtime spec_router (which reads the same file). Required
+      # for the GitVein redirect to work; default empty so a fresh
+      # `docker build` without the arg only installs Sophia + the
+      # explicit PyPI list. Orchestrator: see cluster/README.md.
+      args:
+        SB_STACK_MANIFEST: ""
     restart: unless-stopped
     environment:
       # LAN bind — exposed on the host's loopback for the test (open
