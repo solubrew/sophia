@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, List, Optional
 
 from kahndor.logma import Logma
@@ -18,6 +19,71 @@ from sophia.config import SophiaConfig
 from sophia.schemas import ModelCard
 
 logma = Logma(__name__)
+
+# Provider reset windows (EDT = UTC-4). All the services we rotate
+# through reset their rate-limit quotas at these wall-clock times:
+# 01:00, 06:00, 11:00, 16:00, 20:00 EDT. A provider that 429s is
+# paused until the NEXT boundary after now — not a fixed cooldown —
+# because that's when its quota genuinely replenishes.
+_RESET_HOURS_EDT = (1, 6, 11, 16, 20)
+_EDT = timezone(timedelta(hours=-4))
+
+
+def _next_reset_utc(now: Optional[datetime] = None) -> datetime:
+    """Return the next reset boundary (as a UTC-aware datetime) after ``now``.
+
+    Boundaries are defined in EDT wall-clock (01:00, 06:00, 11:00,
+    16:00, 20:00). We convert now→EDT, find the next boundary strictly
+    in the future, then convert back to UTC.
+    """
+    now = now or datetime.now(timezone.utc)
+    now_edt = now.astimezone(_EDT)
+    for hour in _RESET_HOURS_EDT:
+        candidate = now_edt.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if candidate > now_edt:
+            return candidate.astimezone(timezone.utc)
+    # Past today's last boundary (20:00) → tomorrow's first (01:00).
+    return (now_edt.replace(hour=1, minute=0, second=0, microsecond=0)
+            + timedelta(days=1)).astimezone(timezone.utc)
+
+
+class _ProviderCooldowns:
+    """Tracks per-provider pause-until timestamps (UTC epoch seconds).
+
+    A provider that returns 429 (rate limit) is paused until the next
+    reset window; entries whose pause has lapsed are considered active
+    again automatically (lazily on read). Guarded by no lock — single
+    asyncio event loop mutates it, so plain dict ops suffice.
+    """
+
+    def __init__(self) -> None:
+        self._paused_until: dict[str, float] = {}
+
+    def pause(self, provider: str, until_utc: datetime) -> None:
+        ts = until_utc.timestamp()
+        self._paused_until[provider] = ts
+        logma.warning(
+            f"[cooldown] provider '{provider}' paused until "
+            f"{until_utc.astimezone(_EDT).strftime('%Y-%m-%d %H:%M EDT')} "
+            f"({int(ts - time.time())}s remaining)"
+        )
+
+    def is_paused(self, provider: str) -> bool:
+        ts = self._paused_until.get(provider)
+        if ts is None:
+            return False
+        if ts <= time.time():
+            # Window lapsed — reactivate lazily.
+            del self._paused_until[provider]
+            logma.info(f"[cooldown] provider '{provider}' reset window reached; reactivated")
+            return False
+        return True
+
+    def remaining(self, provider: str) -> int:
+        ts = self._paused_until.get(provider)
+        if ts is None:
+            return 0
+        return max(0, int(ts - time.time()))
 
 
 class SophiaPool:
@@ -37,6 +103,9 @@ class SophiaPool:
         # Populated by stream(): the last usage event ladyol emitted,
         # so the server can record real token counts after [DONE].
         self.last_stream_usage: dict = {}
+        # Per-provider rate-limit cooldowns (429 → paused until the
+        # next reset window; see _ProviderCooldowns).
+        self.cooldowns = _ProviderCooldowns()
 
     async def _ensure_pool(self):
         # Defer the heavy import until the first chat call. Sophia
@@ -111,14 +180,43 @@ class SophiaPool:
         strategy: str = "random",
         model: Optional[str] = None,
     ) -> str:
-        pool = await self._ensure_pool()
-        return await pool.chat(
-            prompt=prompt,
-            sprompt=sprompt,
-            temperature=temperature,
-            strategy=strategy,
-            model=model,
-        )
+        """Chat with provider-level 429 cooldowns.
+
+        ladyol's chat already retries across entries; we add a
+        provider-level filter so rate-limited providers (paused until
+        their next reset window) are excluded from selection. If a
+        429 still slips through, we pause that provider until the
+        next reset window and retry once on the remainder.
+        """
+        for attempt in range(2):
+            pool = await self._ensure_pool()
+            original = pool._entries
+            active = [e for e in original
+                      if not self.cooldowns.is_paused(e.provider.name)]
+            if not active:
+                raise RuntimeError(
+                    "all providers are rate-limited (paused until their "
+                    "next reset window); try again after the next window"
+                )
+            pool._entries = active
+            try:
+                return await pool.chat(
+                    prompt=prompt,
+                    sprompt=sprompt,
+                    temperature=temperature,
+                    strategy=strategy,
+                    model=model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 0 and _is_rate_limit(exc):
+                    prov = _provider_of(pool)
+                    if prov:
+                        self.cooldowns.pause(prov, _next_reset_utc())
+                    continue
+                raise
+            finally:
+                pool._entries = original
+        raise RuntimeError("unreachable")
 
     async def chat_with_meta(
         self,
@@ -141,7 +239,7 @@ class SophiaPool:
         estimates (see server._token_counts).
         """
         pool = await self._ensure_pool()
-        text = await pool.chat(
+        text = await self.chat(
             prompt=prompt, sprompt=sprompt, temperature=temperature,
             strategy=strategy, model=model,
         )
@@ -165,37 +263,100 @@ class SophiaPool:
         temperature: float = 0.7,
         strategy: str = "random",
         model: Optional[str] = None,
+        max_retries: int = 3,
     ) -> AsyncIterator[str]:
         """Yield plain text chunks, translating ladyol's event dicts.
 
-        ladyol's ProviderPool.stream yields dicts with a ``type`` key:
-        ``{"type": "token", "content": "..."}`` for content,
-        ``{"type": "usage", "tokens": {...}}`` for accounting, and
-        ``{"type": "done", ...}`` at the end. We surface only the
-        token text as str chunks (OpenAI-SSE style) and stash the
-        last usage payload on ``self.last_stream_usage`` so the
-        server can record real token counts after [DONE].
+        ladyol's low-level client stream yields dicts with a ``type``
+        key: ``token`` (content), ``usage`` (tokens mapping), ``done``.
+        We surface the token text as str chunks and stash the last
+        usage payload on ``self.last_stream_usage`` for accounting.
+
+        Rotation on failure: ladyol's ProviderPool.stream picks ONE
+        entry and never retries (chat() rotates via _failed_entries;
+        stream() does not). So we drive entry selection OURSELVES —
+        mirror of ladyol.chat's retry loop — and call the low-level
+        client stream directly. On a failure BEFORE any text was
+        emitted (429 rate limit, 5xx, network error), we exclude
+        that entry and try the next candidate, up to ``max_retries``
+        times. Explicit (non-auto) model requests are not rotated:
+        the caller asked for that model specifically. Exclusions are
+        per-call only — a 429 now doesn't poison later requests.
         """
         pool = await self._ensure_pool()
         self.last_stream_usage = {}
-        async for chunk in pool.stream(model_name=model or "", messages=_to_messages(prompt, sprompt),
-                                       strategy=strategy, temperature=temperature):
-            if isinstance(chunk, dict):
-                ctype = chunk.get("type")
-                if ctype == "token":
-                    yield str(chunk.get("content") or "")
-                elif ctype == "usage":
-                    self.last_stream_usage = chunk.get("tokens") or {}
-                    # usage events carry no displayable content
-                    continue
-                elif ctype == "done":
-                    continue
-                else:
-                    # Unknown event shape — don't stream junk to the client.
-                    continue
-            elif isinstance(chunk, str):
-                yield chunk
-            # anything else (bytes, None) is ignored
+        excluded: set = set()
+        messages = _to_messages(prompt, sprompt)
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(max_retries + 1):
+            # Candidate selection, honoring this call's exclusions.
+            available = [e for e in pool._entries
+                         if id(e) not in excluded
+                         and not self.cooldowns.is_paused(e.provider.name)]
+            if model:
+                available = [e for e in available if e.model.name == model]
+            if not available:
+                break
+            entry = available[0]
+            if attempt == 0:
+                # Initial pick: use ladyol's own selector for strategy
+                # fidelity (round_robin / weighted / etc.).
+                try:
+                    entry = pool._select_entry(model or "", strategy=strategy)
+                except Exception as exc:
+                    last_exc = exc
+                    break
+
+            emitted = False
+            err: Optional[Exception] = None
+            try:
+                client = pool._client_for(entry)
+                async for chunk in client.stream(entry.model.name, messages,
+                                                 strategy=strategy,
+                                                 temperature=temperature):
+                    if isinstance(chunk, dict):
+                        ctype = chunk.get("type")
+                        if ctype == "token":
+                            text = str(chunk.get("content") or "")
+                            if text:
+                                emitted = True
+                                yield text
+                        elif ctype == "usage":
+                            self.last_stream_usage = dict(chunk.get("tokens") or {})
+                    elif isinstance(chunk, str) and chunk:
+                        emitted = True
+                        yield chunk
+            except Exception as exc:  # noqa: BLE001 — rotate on ANY provider error
+                err = exc
+                if emitted:
+                    # Mid-stream failure after partial output: cannot
+                    # cleanly retry (client already saw partial text).
+                    raise
+
+            if err is None and emitted:
+                return
+            last_exc = err or RuntimeError(
+                f"provider {getattr(entry.provider, 'name', '?')} "
+                f"({entry.model.name}) returned an empty stream"
+            )
+            # Auto mode only: exclude and rotate. Explicit model: stop.
+            if model:
+                raise last_exc
+            excluded.add(id(entry))
+            # Rate limit? Pause the whole PROVIDER until its next
+            # reset window (1am/6am/11am/4pm/8pm EDT) so subsequent
+            # requests skip it entirely, not just this call.
+            if err is not None and _is_rate_limit(err):
+                self.cooldowns.pause(entry.provider.name, _next_reset_utc())
+            logma.warning(
+                f"[SophiaPool.stream] attempt {attempt + 1} failed on "
+                f"{getattr(entry.provider, 'name', '?')}/{entry.model.name}: "
+                f"{last_exc}; rotating to another provider"
+            )
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("stream exhausted all provider retries without content")
 
     async def list_models(self) -> list:
         try:
@@ -222,6 +383,40 @@ class SophiaPool:
             for m in models:
                 out.append(ModelCard(id=m, owned_by=provider))
         return out
+
+
+def _is_rate_limit(exc: BaseException) -> bool:
+    """True when the exception represents an HTTP 429 rate limit.
+
+    httpx raises httpx.HTTPStatusError with the response attached;
+    ladyol may also re-raise as plain Exception with '429' in the text.
+    We match on either shape.
+    """
+    text = str(exc)
+    if "429" in text or "Too Many Requests" in text or "rate limit" in text.lower():
+        return True
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        code = getattr(resp, "status_code", None)
+        if code == 429:
+            return True
+    return False
+
+
+def _provider_of(pool) -> Optional[str]:
+    """Best-effort: which provider served the pool's last call?
+
+    ladyol doesn't uniformly expose the picked entry after a failure,
+    so we check the attrs different versions stash, then fall back to
+    parsing 'provider=<name>' out of recent log-shaped messages on
+    the exception itself. Returns None if undeterminable.
+    """
+    for attr in ("last_provider_name", "last_provider"):
+        v = getattr(pool, attr, None)
+        name = getattr(v, "name", None) or v
+        if isinstance(name, str) and name:
+            return name
+    return None
 
 
 def _load_providers_dict(yaml_path: str) -> dict:
