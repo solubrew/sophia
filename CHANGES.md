@@ -78,3 +78,109 @@ Sophia's master passphrase is stored in the **main** PyKeyStore instance (`/home
 
 ### Build environment note
 ladyol's hatchling build backend needs `hatchling` AND `trove-classifiers` available in the build venv. `scripts/build-sophia.sh` will install these before `pip wheel` if missing. ladyol.git's HEAD in the GitVein references a missing `master` branch — building from the local working tree (`~/.hermes/projects/ladyol`) is the supported path; tracked for follow-up.
+
+---
+
+## [Unreleased] — 2026-08-22 (Cluster wire-up + cooldowns + docs refresh)
+
+### Added
+- **Cluster directory**: `cluster/{docker-compose.cluster.yml, seed-keys.sh, entrypoint.py, agent/, inject-merge-vars.py}` — the running two-service compose (sophia + open-webui) on `.67`.
+- **Per-account 429 cooldowns** (`sophia/pool.py:_ProviderCooldowns`):
+  a returned 429 pauses just that API key's allotment until the
+  next reset window (1am/6am/11am/4pm/8pm EDT). Other accounts —
+  including siblings on the same provider — keep serving.
+  Lazy reactivation when the window lapses. Verified live with the
+  minimax ×3 accounts.
+- **`sophia-auto` pseudo-model** (`sophia/pool.py:list_models`,
+  `sophia/schemas.py`): first model in `/v1/models`, server maps
+  `"auto"` / `"sophia-auto"` / `""` to `pool.chat(model=None)`.
+  Response's `model` field reports the actual backend picked.
+- **OpenAI SSE streaming translation** (`sophia/pool.py:stream`):
+  ladyol's event-dict stream (`{type:token|usage|done}`) → text
+  frames, with empty-delta suppression, real usage capture, and
+  same-call rotation across non-paused accounts.
+- **system-message injection** (`sophia/pool.py:_to_messages`):
+  always injects a leading `system` message so ladyol's sequence
+  validator doesn't reject client requests that omit one.
+- **`seed-keys.sh` operator flow** (`cluster/seed-keys.sh`):
+  one-shot bootstrap that opens the host system-wide vault, binds
+  it into the container at `/host-pycurity/`, passes an allowlist
+  of LLM account names (parsed from `agent_accts.yaml`), and merges
+  only those keys into the container's local vault. Backfills the
+  auto-generated master passphrase to the source vault as
+  `sophia_cluster_master_passphrase`. Restores all source perms on
+  exit.
+- **Ladyol entry-selection aware cooldown filtering**: `chat()` and
+  `stream()` skip paused entries when picking candidates; if a 429
+  slips through, the offending account is paused and the retry picks
+  the next non-paused entry (including siblings on the same provider).
+- **`_account_of(entry)` helper** fingerprints an entry as
+  `'<provider>:<api_key[:8]>'` so cooldown keys identify accounts
+  rather than providers.
+
+### Fixed
+- **v1 docker-compose `ContainerConfig` KeyError** when recreating
+  containers originally started by `docker run`. Workaround: use raw
+  `docker run` for open-webui.
+- **Stream 500: `sequence item 0: expected str instance, dict found`**
+  — `_to_messages` + `stream()` now translates ladyol's dict events
+  to str chunks instead of passing them through to `"".join`.
+- **Stream 500: `leading role must be 'system', got 'user'`** —
+  `_to_messages` injects `"You are a helpful assistant."` for any
+  call without a sprompt.
+- **base_urls** (`cluster/agent/agent.yaml`): corrected against ladyol's
+  bundled `providers.yaml` — `minimax.io/v1`, `api.z.ai/api/coding/paas/v4`,
+  `api.groq.com/openai/v1`, `host.docker.internal:11434`.
+- **Ollama DNS** — open-webui launched with
+  `--add-host=host.docker.internal:host-gateway` so the ollama
+  fallback resolves on Linux docker.
+- **Source vault perms during merge** — `seed-keys.sh` chmods the
+  source dir to 755 + every file to 644 just for the bind, then
+  chmod 644 → 444 for the merge step, then restores on exit.
+- **`/etc/sophia/agent/` directory layout** — ladyol's
+  `_initialize_pool` expects a directory (for `<name>_accts.yaml`),
+  not a YAML file; SophiaPool accordingly treats
+  `SOPHIA_PROVIDER_POOL` as a directory.
+- **`_load_providers_dict`** accepts either a YAML file or a directory
+  containing `agent.yaml` (with a `ProviderPool.providers` sub-tree).
+- **`provider_meta` model reported** — `/v1/chat/completions` response
+  uses the actual backend model from ladyol's `provider_meta` instead
+  of echoing the request's `"sophia-auto"`.
+
+### Tests
+- `tests/test_pool.py::test_chat_propagates_strategy_and_model` updated
+  for the new direct-driving contract (sprompt flows as `system`).
+- `FakePool` extended with `_entries` / `_select_entry` / `_client_for`
+  + `FakeClient` (chat signature is `(prompt, model, system, ...)`).
+- 39 passed, 1 env-dependent skip.
+
+### Documentation refresh
+- `cluster/README.md` — the actual bring-up flow with hex key transport
+  + raw `docker run` for open-webui; per-account cooldown table; vault
+  relationship diagram.
+- `README.md` — endpoints, model selection, per-account rate-limit
+  handling, vault layout, requestor keys, captures, tests.
+- `docs/DEPLOY.md` — architecture (per-account cooldown pattern),
+  Step 5 rewritten around seed-keys.sh (was: `manage_secrets init` +
+  `manage_secrets set`), troubleshooting table updated with the actual
+  failure modes (PermissionError, orphan vault, 401, 429 rotation,
+  wrong base_url, etc.).
+- `docs/HERMES_SETUP.md` — TL;DR now references `192.168.1.67`;
+  rotation section now documents per-account 429 cooldowns;
+  "not implemented" list shortened to the three items still open
+  (structured_call endpoint, connection metadata, token-budget
+  partitioning); verify-wire examples updated.
+- `TODOs.md` — banner notes 2026-08-22 reset; "recently completed"
+  block lists the now-done items; "new features" block narrowed to
+  the 4 still-open items; operator-workflow section appended.
+
+### Operator handoff notes
+- Running image: `sophia_sophia:latest` (commit `088fcfc`)
+- Active accounts: 5 LLM keys (3× minimax, 1× zai, 1× xai)
+- Open WebUI at `http://192.168.1.67:3000` — model dropdown shows
+  `sophia-auto` first, then concrete ids (minimax-m2.7, minimax-m3,
+  glm-4.7, glm-5.2, grok-2).
+- To add a new provider account: edit `cluster/agent/agent.yaml` +
+  `cluster/agent/agent_accts.yaml`, put the key in the host vault via
+  `python -m sophia.cmds.manage_secrets set <account>`, rebuild +
+  re-run `seed-keys.sh`.

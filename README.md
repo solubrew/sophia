@@ -1,28 +1,78 @@
-Sophia is an intelligence pipe that leverages the provider pool from ladyol to provide an interface for any harness (hermes, senbai/ladyol) to get
-an api connection to an intelligence provider allowing us to automatically rotate between providers for capability, cost, availability etc.
+# Sophia
 
-will need to rotate between providers, models, parameters, etc
+A single-process, OpenAI-compatible gateway that rotates between
+multiple LLM provider **accounts** so that any one account's quota
+becomes a non-event. Built on [ladyol](https://github.com/...) for the
+provider pool; the small wrapper here adds per-account 429 cooldowns,
+streaming + non-streaming OpenAI Chat Completions, requestor API
+keys with RBAC, capture-to-disk for forensics, and per-request usage
+accounting.
 
-take requests given an api key and return the response
-
-
-this will be run on a lan for now
-
----
+Runs LAN-side today (the cluster is on `192.168.1.67`); no external
+exposure yet.
 
 ## Quickstart
 
 ```bash
 cd /home/solubrew/.hermes/projects/sophia
 pip install -e .[dev]
-python -m sophia
+# Or, the way the cluster actually runs:
+./cluster/seed-keys.sh /home/solubrew/.local/share/pycurity/secure_store.db '<passphrase>'
 ```
 
-Then point any OpenAI-compatible client at `http://<lan-host>:8765/v1`.
+Then point any OpenAI-compatible client at `http://192.168.1.67:8765/v1`
+with a Sophia requestor key (`sk-sophia-...`).
+
+## Endpoints (live)
+
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| GET  | `/healthz`              | none | liveness; reports provider + model counts |
+| GET  | `/v1/models`            | requestor+ | OpenAI-compatible; prepends `sophia-auto` |
+| POST | `/v1/chat/completions` | requestor+ | OpenAI Chat Completions; SSE streaming supported |
+| GET  | `/v1/usage/summary`    | collection / admin | aggregated usage; 403 for requestor role |
+| GET  | `/v1/usage/by-requestor` | collection / admin | per-key totals |
+| GET  | `/v1/captures/...`     | collection / admin | read stored prompt/response payloads |
+
+`/v1/chat/completions` extra field: `strategy` (OpenAI ignores
+it; tools that want explicit rotation policy set it). Allowed:
+`random`, `round_robin`, `round_robin_weighted`, `weighted`,
+`cheapest`, `cheapest_weighted`, `least_used`,
+`least_used_weighted`, `least_used_cheapest`,
+`least_used_cheapest_weighted`, `best_available`. Default `random`.
+
+## Model selection
+
+The `model` body field accepts either:
+
+- **`"sophia-auto"`** (default) — backend picks the actual
+  provider+account per the strategy and per-account cooldown
+  state. The response's `"model"` field reports what served it.
+- A concrete model name (`"minimax-m2.7"`, `"glm-5.2"`, `"grok-2"`,
+  …) — explicit selection; still rotates across accounts offering
+  that model when one 429s.
+
+## Per-account rate-limit handling
+
+Quotas are per **API key** (account), not per provider. When an
+account returns HTTP 429:
+
+1. That request rotates immediately to another entry — including
+   sibling accounts on the SAME provider.
+2. The 429ing account is paused until the next reset window:
+   **01:00 / 06:00 / 11:00 / 16:00 / 20:00 EDT** (when quotas
+   replenish).
+3. Other accounts (same provider or different) keep serving.
+4. Paused accounts auto-reactivate when their window lapses.
+
+Watch it:
+```bash
+docker logs -f sophia_sophia_1 2>&1 | grep -E "cooldown|rotating|account"
+```
 
 ## Configuration
 
-All bind / logging / provider-pool settings live in `sophia/_data_/sophia.yaml`:
+`sophia/_data_/sophia.yaml` (or override via `SOPHIA_*` env vars):
 
 ```yaml
 sophia:
@@ -32,38 +82,48 @@ sophia:
   logging:
     level: "INFO"
   provider_pool:
-    # null = use ladyol's bundled providers.yaml. Override with a path,
-    # or set the SOPHIA_PROVIDER_POOL env var at runtime.
-    config_path: null
+    config_path: "/etc/sophia/agent"   # dir with agent.yaml + agent_accts.yaml
 ```
 
-CLI flags (`--host`, `--port`, `--log-level`, `--config`) override the YAML.
+CLI flags (`--host`, `--port`, `--log-level`, `--config`) override.
 
-## Endpoints
+## Vault layout
 
-| Method | Path | Notes |
-|---|---|---|
-| GET | `/healthz` | liveness; reports provider + model counts |
-| GET | `/v1/models` | OpenAI-compatible model list |
-| POST | `/v1/chat/completions` | OpenAI Chat Completions + optional `strategy` field |
+- Host system-wide: `~/.local/share/pycurity/secure_store.db` — 22
+  keys incl. the 5 LLM ones (owner: solubrew; mode 600).
+- Container local: `/var/lib/sophia/pycurity/vault.db` — only the
+  keys passed by `SOPHIA_MERGE_ALLOWLIST` (set by seed-keys.sh from
+  `agent_accts.yaml`).
+- `cluster/seed-keys.sh` keeps both sides in sync on every run: it
+  copies the LLM keys from system-wide → container, and writes the
+  container's auto-generated master passphrase BACK to the system-wide
+  vault as `sophia_cluster_master_passphrase`.
 
-## Model selection
+## Requestor keys
 
-The `model` field accepts either:
+Issued by `python -m sophia.cmds.manage_keys create <name>`. Roles:
 
-- `"auto"` (default) — let the `strategy` pick the best entry from the pool.
-- A concrete model name, e.g. `"claude-3-sonnet"` — forces that model.
+| Role | Capabilities |
+|---|---|
+| `requestor` | chat only (`/v1/chat/completions`, `/v1/models`) |
+| `collection` | usage + capture reads only |
+| `admin` | chat + usage + key management |
 
-## Strategy hint
+Keys are SHA-256 hashed at rest; the raw 53-char secret is shown
+**once** at creation. Never re-shown. Prefix-only display thereafter.
 
-The optional `strategy` body field on `/v1/chat/completions` is a Sophia
-extension. OpenAI clients ignore it; tools that want a specific selection
-policy can set it.
+## Captures
 
-Allowed values mirror `ladyol.providers.ProviderPool` strategies:
-`random`, `round_robin`, `weighted`, `cheapest`, `cheapest_weighted`,
-`least_used`, `least_used_cheapest`, `best_available`,
-`most_experienced`, `most_experienced_weighted`.
+When a requestor was created with `--store-payload`, full
+prompt+response JSON is written to
+`/var/lib/sophia/captures/` (volume `sophia_sophia_data`).
+`SOPHIA_CAPTURE_MAX_BYTES` (default 1 GiB) caps the directory; oldest
+files pruned first.
 
-Default: `random`.
+## Tests
 
+```bash
+cd /home/solubrew/.hermes/projects/sophia
+/home/solubrew/ENVs/shieldface/bin/python3 -m pytest tests/ -q
+# 39 passed, 1 env-dependent skip
+```

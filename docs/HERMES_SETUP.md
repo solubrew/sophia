@@ -6,12 +6,13 @@ and avoid the mistakes the gateway is built to prevent.
 
 > **TL;DR:** issue a requestor API key with
 > `python -m sophia.cmds.manage_keys create hermes-cli`, set
-> `provider: custom` + `base_url: http://<sophia-host>:8765/v1` +
-> `api_key: <sk-sophia-…>` in Hermes' `config.yaml`, use
-> `strategy: auto` and `model: auto` on the wire, point Sophia at
-> ladyol's `providers.yaml`, and Hermes rotates for free. Every call
-> is logged into `sophia.db` (`sophia_usage`); opt-in capture stores
-> prompt+response JSON files capped at `SOPHIA_CAPTURE_MAX_BYTES`.
+> `provider: custom` + `base_url: http://192.168.1.67:8765/v1` +
+> `api_key: <sk-sophia-…>` in Hermes' `config.yaml`, send
+> `model: "sophia-auto"` (or any concrete model id) and let Sophia
+> pick the backend. Per-account 429 cooldowns rotate around any
+> exhausted quota automatically. Every call is logged into
+> `sophia.db` (`sophia_usage`); opt-in capture stores prompt+response
+> JSON files capped at `SOPHIA_CAPTURE_MAX_BYTES`.
 
 ---
 
@@ -36,20 +37,23 @@ and avoid the mistakes the gateway is built to prevent.
                                                        └──────────────────────┘
 ```
 
-Hermes sends one of three things per request:
+Hermes sends one of two payloads per request:
 
-- **`model: "<concrete>"`** (e.g. `"anthropic/claude-sonnet-4.5"`) →
-  Sophia forces that model, picks a credential that can serve it
-- **`model: "auto"` + `strategy: "..."`** (body-field extension) →
-  Sophia's ladyol pool picks via the strategy (round_robin,
-  least_used, cheapest, weighted, task_router, etc.)
-- **`strategy: "auto"`** → Sophia falls back to the YAML's
-  `task_router.defaults`
+- **`model: "sophia-auto"`** (or `"auto"`, `""`) — Sophia's backend picks
+  the actual provider + account via the configured strategy, honoring
+  per-account 429 cooldowns. The response's `"model"` field reports
+  what served it (e.g. `"minimax-m3"`).
+- **`model: "<concrete>"`** (e.g. `"minimax-m2.7"`, `"glm-5.2"`) —
+  Sophia forces that model, still rotates across the accounts that
+  can serve it. Optional `strategy` body field overrides the default
+  (`random`).
 
-Rotation today is **per-request**, driven by ladyol's
-`model-provider-selection` strategies — NOT by time-window resets.
-The "rotate accounts on a 75M-token schedule" idea from Sophia's
-TODOs is **not implemented yet** (see §6).
+Rotation is **per-request AND per-account**: per-request via ladyol's
+strategy; per-account via Sophia's cooldown registry. When one
+account returns 429 it's paused until the next reset window
+(01:00 / 06:00 / 11:00 / 16:00 / 20:00 EDT); other accounts — including
+siblings on the same provider — keep serving. Watch it:
+`docker logs -f sophia_sophia_1 2>&1 | grep -E "cooldown|rotating|account"`.
 
 ---
 
@@ -141,43 +145,34 @@ requestor-side response (chat completions + their `/v1/usage` rollups
 embedded in the response) is unaffected; per-requestor reports stay
 accessible to the requestor itself when we wire that in.
 
-## 5. Migration to Postgres
+## 5. Cluster state — what's wired right now
 
-Every Sophia-internal table lives in **one** SQLite file (`sophia.db`)
-today, with the DDL centralised in `sophia/sophia.py: SCHEMA_DDL`.
-Tables are Postgres-shaped (no SQLite-only types, no auto-increment
-PKs hidden behind `INTEGER PRIMARY KEY` — those will become BIGSERIAL
-on migration). The next step is a thin `backend` module that swaps
-the connection layer from `sqlite3` to SQLAlchemy Core /
-`psycopg`+`pg8000` while reading the same DDL string. The
-`schema_versions` table tracks applied migrations so the upgrade is
-online + auditable.
+The LAN-side cluster on `.67` is the running reality today. From
+`cluster/README.md`:
 
-Sophia runs as a Docker Compose service on the LAN host. Full
-deployment is in `sophia/docs/DEPLOY.md`. For the wiring to work, you
-need at minimum:
-
-```bash
-# 1. Vault is initialised (creates vault.db + salt.bin)
-docker compose exec sophia python -m sophia.cmds.manage_secrets init
-
-# 2. One key per provider account in the rotation. Whitelist in
-#    sophia/cmds/manage_secrets.py — common names: anthropic_api_key,
-#    openai_api_key, openrouter_api_key, deepinfra_api_key, …
-docker compose exec -it sophia python -m sophia.cmds.manage_secrets set anthropic_api_key
-docker compose exec -it sophia python -m sophia.cmds.manage_secrets set openai_api_key
-docker compose exec -it sophia python -m sophia.cmds.manage_secrets set openrouter_api_key
-docker compose exec -it sophia python -m sophia.cmds.manage_secrets set deepinfra_api_key
-
-# 3. Sophia reads its model/account config from ladyol's bundled
-#    providers.yaml. To override, set SOPHIA_PROVIDER_POOL=/path/to/your.yaml
-#    in .env. The same account can appear N times under different
-#    `name:` aliases to give ladyol separate budget trackers per account.
-
-docker compose restart sophia
-curl -fsS http://localhost:8765/healthz
-# {"status":"ok","providers":N,"models":M}
-```
+- **Sophia image** (`sophia_sophia:latest`, currently head `088fcfc`):
+  built from this repo's `Dockerfile`; bundles 12 SB wheels into
+  `/install` + transitive PyPI deps installed `--no-deps`. Ships
+  `/etc/sophia/agent/agent.yaml` (provider pool config) and
+  `/etc/sophia/agent/agent_accts.yaml` (account list).
+- **Open WebUI** (`sophia_open-webui_1`): running with
+  `--add-host=host.docker.internal:host-gateway` so ollama fallback
+  resolves on Linux.
+- **Vault**: container's `/var/lib/sophia/pycurity/vault.db` seeded
+  from the host system-wide PyKeyStore by
+  `cluster/seed-keys.sh`. 5 LLM accounts (3× minimax, zai, xai).
+  Container's auto-generated master passphrase is written BACK to the
+  host vault as `sophia_cluster_master_passphrase`.
+- **Per-account 429 cooldowns**: reset windows at 1am/6am/11am/4pm/8pm
+  EDT. Verified live: a 429 on one account pauses ONLY that account,
+  sibling accounts keep serving.
+- **Migration to Postgres**: every Sophia-internal table lives in
+  one SQLite file (`sophia.db`); the `schema_versions` table is in
+  place for the migration. The next step is a thin `backend` module
+  that swaps the connection layer from `sqlite3` to SQLAlchemy Core
+  / `psycopg`+`pg8000` while reading the same DDL string. Not
+  done yet — per-cluster-portability is the main blocker for
+  multi-host deployments.
 
 **Multi-account rotation pattern:** add each of your N accounts under
 its own key in `providers.yaml`, sharing the same `base_url:` /
@@ -221,37 +216,26 @@ hermes-agent's `AGENTS.md`):
 model:
   # Use Sophia as the active provider
   provider: custom
-  base_url: "http://<sophia-host>:8765/v1"
+  base_url: "http://192.168.1.67:8765/v1"
 
-  # The key value is a placeholder — Sophia doesn't require auth
-  # when SHIELDFACE_API_KEY is unset (internal mode on trusted LAN).
-  # Hermes still wants *something* in OPENAI_API_KEY to satisfy its
-  # SDK; we use a non-secret placeholder and let Sophia trust the
-  # LAN.
-  api_key: "sophia-local"
+  # Sophia auth: a REAL requestor key issued via `manage_keys create`.
+  # The placeholder mode (SHIELDFACE_API_KEY unset on Sophia = internal
+  # allow-mode) still requires SOMETHING in api_key for Hermes' SDK
+  # to start; for LAN testing we used a non-secret placeholder, but
+  # for production-style wire-up, issue a key + paste it here.
+  api_key: "sk-sophia-..."
 
-  default: "auto"   # let the strategy pick a model each turn
+  # `sophia-auto` → backend picks the actual provider+account per turn.
+  # Concrete ids ("minimax-m2.7", "glm-5.2", etc.) force that model,
+  # still rotate across accounts that can serve it.
+  default: "sophia-auto"
 ```
 
-If you set `SHIELDFACE_API_KEY` on the Sophia host, paste the same
-value here so Hermes sends `Authorization: Bearer …`:
-
-```yaml
-model:
-  provider: custom
-  base_url: "http://<sophia-host>:8765/v1"
-  api_key: "${SHIELDFACE_API_KEY}"   # read from .env
-```
-
-Startup-time constraints (set in `.env`):
-
-```
-OPENAI_API_KEY=sophia-local
-OPENAI_BASE_URL=http://<sophia-host>:8765/v1
-```
-
-These env vars feed the SDK directly, so they win over `config.yaml`.
-Pick one source of truth and stick to it.
+Internal-mode caveat (LAN-only): Sophia with no
+`SHIELDFACE_API_KEY` set treats any Authorization header as
+acceptable. That's fine for the trusted LAN; expose Sophia outside
+the LAN only behind a proxy that requires real auth. Sophia's
+internal-mode is currently the running config.
 
 ### Per-route overrides (optional)
 
@@ -301,28 +285,42 @@ defaults to `"random"`. If you want a specific strategy, either:
 
 ### What "automatic rotation" actually means
 
-For a `model: auto` request with `strategy: round_robin_weighted`,
-every call walks the pool in order — `(alice, sonnet, 0.7)`,
-`(bob, sonnet, 0.7)`, `(charlie, haiku, 0.3)`, etc. — and sends to the
-first account whose model is enabled and within budget.
+For a `model: "sophia-auto"` request, the backend picks via the
+strategy in `cluster/agent/agent.yaml` (default `round_robin` from
+the strategies list). Each call walks the pool in some order
+depending on the strategy:
 
-For `strategy: least_used`, the pool picks the account with the
-lowest recent usage. Good for steady throughput.
+- `round_robin(_weighted)` — walks pool entries in order, picking
+  the first whose model is enabled.
+- `least_used(_weighted|cheapest|cheapest_weighted)` — picks the
+  account with the lowest recent usage.
+- `cheapest(_weighted)` — picks the lowest
+  `costs_per_1k_input/output` account that meets the capability floor.
+- `random` / `weighted` — weight- or randomly-chosen entry.
+- `best_available` / `most_experienced(_weighted)` — picks the most
+  reliable / most-used entry.
 
-For `strategy: cheapest`, the pool picks the lowest `costs_per_1k_*`
-account that meets the capability floor. Best for cost-control.
+The **per-account 429 cooldown** layer is independent: when an
+account returns HTTP 429, Sophia pauses JUST THAT ACCOUNT (its API
+key's allotment is spent) until the next reset window (1am/6am/11am/
+4pm/8pm EDT). The next request skips the paused account and tries
+others — including sibling accounts on the same provider. The
+paused account auto-reactivates when its window lapses.
+
+So "automatic rotation" here means **per-request strategy AND
+per-account quota-aware cooldown**. When one account exhausts its
+quota, others continue serving.
 
 Per-model override: set the account's `enabled: false` (or
-`reliability: <threshold>`) and that account drops out of rotation
-for that model.
+`reliability: <threshold>`) in `cluster/agent/agent.yaml` and that
+account drops out of rotation for that model.
 
 ### Per-turn behaviour you can predict
 
-Hermes uses `model: "auto"` (or whatever you set as `model.default`)
-for every turn unless overridden by the user with `--model
-anthropic/claude-opus`. Sophia will pick whatever strategy is set.
-There is **no hour-of-day rotation** — these strategies are
-per-request, not time-windowed.
+Hermes uses `model: "sophia-auto"` (or whatever you set as
+`model.default`) for every turn unless overridden by the user with
+`--model minimax-m3`. Sophia will pick whatever strategy is set and
+will skip accounts that are currently paused for 429 cooldowns.
 
 ---
 
@@ -330,27 +328,32 @@ per-request, not time-windowed.
 
 ```bash
 # 1. Sophia is healthy
-curl -fsS http://<sophia-host>:8765/healthz
+curl -fsS http://192.168.1.67:8765/healthz
 # {"status":"ok","providers":N,"models":M}
 
-# 2. Sophia exposes the model list (and what Ladyol thinks is enabled)
-curl -fsS http://<sophia-host>:8765/v1/models | head -c 600
-# {"object":"list","data":[{"id":"anthropic/claude-sonnet-4.5", ...}]}
+# 2. Sophia exposes the model list (sophia-auto + concrete ids)
+curl -fsS -H "Authorization: Bearer <sk-sophia-...>" \
+  http://192.168.1.67:8765/v1/models | head -c 600
+# {"object":"list","data":[{"id":"sophia-auto",...},
+#                         {"id":"minimax-m2.7",...},
+#                         {"id":"minimax-m3",...}, ...]}
 
-# 3. Sophia actually talks to a provider (auto-strategy picks)
-curl -fsS -X POST http://<sophia-host>:8765/v1/chat/completions \
+# 3. Sophia actually talks to a provider (sophia-auto picks)
+curl -fsS -X POST -H "Authorization: Bearer <sk-sophia-...>" \
   -H "Content-Type: application/json" \
-  -d '{"model":"auto","strategy":"least_used","messages":[{"role":"user","content":"ping"}]}' | head -c 400
-# {"id":"...","model":"anthropic/claude-sonnet-4.5","choices":[...]}
+  -d '{"model":"sophia-auto","messages":[{"role":"user","content":"ping"}]}' \
+  http://192.168.1.67:8765/v1/chat/completions | head -c 400
+# {"id":"...","model":"minimax-m3",...}  ← actual model picked
 
 # 4. Force a specific model to confirm rotation across accounts
 for i in 1 2 3; do
-  curl -fsS -X POST http://<sophia-host>:8765/v1/chat/completions \
+  curl -fsS -X POST -H "Authorization: Bearer <sk-sophia-...>" \
     -H "Content-Type: application/json" \
-    -d '{"model":"anthropic/claude-sonnet-4.5","messages":[{"role":"user","content":"ping"}]}' \
-    | head -c 200; echo
+    -d '{"model":"minimax-m2.7","messages":[{"role":"user","content":"ping"}]}' \
+    http://192.168.1.67:8765/v1/chat/completions | head -c 200; echo
 done
-# Look at Sophia's logs — the credential picked will rotate.
+# Look at Sophia's logs — the picked model stays the same (forced),
+# but the underlying ACCOUNT rotates among the 3 minimax entries.
 
 # 5. From Hermes itself — a minimal smoke test from inside a session:
 #    "/model"        (shows current provider/base_url/model)
@@ -370,26 +373,32 @@ Three of Sophia's TODOs from the `## New Features` section are NOT
 implemented yet — they're listed in `sophia/TODOs.md` and quoted here
 so this guide stays honest about what you get:
 
-1. **Per-account named connections with rotating token schedules**
-   ("75M tokens reset at 1am/6am/11am…"). Ladyol's pool doesn't track
-   time-windowed quotas today; the closest strategy is
-   `least_used_cheapest_weighted`. To add reset-window rotation:
-   - extend `ladyol.providers` with a `quotas:` block
-     (`{reset_at: "01:00", tokens_per_window: 75_000_000}`)
-   - add a `reset_window` strategy that prefers accounts whose window
-     is freshest
-   - have Sophia log "picked because X resets in 14m" for observability
-2. **Connection naming + per-account metadata**
-   (`name`, `email`, `notes`) — not surfaced via `ladyol.providers` yet
-3. **Automatic token-budget partitioning** (Sophia should split the
+1. **Automatic token-budget partitioning** (Sophia should split the
    available 75M tokens across the day so all capabilities stay
    available). Closest existing lever: schedule a cron that calls
    `manage_secrets set <account>` to rotate keys at the window
    boundaries; Sophia does pick up new keys on restart today.
+2. **Connection naming + per-account metadata** (`name`, `email`,
+   `notes`) — not surfaced via `ladyol.providers` yet.
+3. **Structured-call endpoint** — OpenAI-style structured output for
+   `sophia-auto` calls that need typed JSON responses.
 
-If you need any of these, open an issue on `sophia.git` against
-`gamma`. The vault + strategy hooks are in place; only the time-aware
-scheduling is missing.
+Already implemented and verified (these used to be in this list):
+
+- ✅ **Per-account named connections**: `cluster/agent/agent_accts.yaml`
+  maps `<provider>:<account>` to PyKeyStore keys; seed-keys.sh copies
+  the allowlisted ones.
+- ✅ **Per-provider rotation via ladyol strategies**:
+  `round_robin_weighted`, `cheapest`, `least_used`, etc.
+- ✅ **Per-account 429 cooldowns aligned to the provider's reset
+  windows** (1am/6am/11am/4pm/8pm EDT) — sibling accounts on the same
+  provider keep serving when one 429s.
+- ✅ **Capture-to-disk for forensics**: opt-in via
+  `manage_keys set-payload`, JSON files capped at
+  `SOPHIA_CAPTURE_MAX_BYTES`.
+
+If you need any of the remaining three, open an issue on `sophia.git`
+against `gamma`.
 
 ---
 
@@ -397,10 +406,12 @@ scheduling is missing.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `401 unauthorized` from Sophia | `SHIELDFACE_API_KEY` set on Sophia but not on Hermes, or vice versa | Pick one source of truth: unset the key on both sides for internal-mode LAN, or paste the same value into both `config.yaml` and `.env` |
+| `401 unauthorized` from Sophia | Key missing/invalid, OR the requestor role hit `/v1/usage/*` (RBAC denies with 403 by design) | `manage_keys list` to verify; use a collection/admin role for analytics endpoints |
 | `404` on every request | Wrong base_url (missing `/v1`) | Must end with `/v1` |
 | `400 messages must not be empty` | Hermes sent an empty completion (rare) | Restart Hermes; usually a transient prompt-cache invalidation |
-| Sophia picks the same account every time | `strategy` not set; `random` with too-small pool | Use `strategy: least_used` via the body-field; or add more accounts |
-| `/v1/models` returns 0 models | `providers.yaml` not loaded — usually an env_key unset on Sophia's side | Check `docker compose logs sophia` for "provider anthropic_alice: env_key ANTHROPIC_API_KEY_ALICE not set" |
-| Hermes logs the wrong provider | `OPENAI_BASE_URL` from `.env` overriding `config.yaml` | Pick one; the env var wins at runtime |
-| Account keeps getting picked then 429-ing | Quota/rate-limit hit on that account | Disable it in `providers.yaml` (`enabled: false`) or lower its `reliability:` score so the strategy deprioritises it |
+| `400 invalid message sequence for ProviderPool.stream: leading role must be 'system', got 'user'` | Client sent no system message — ladyol requires one as the first item | Fixed in Sophia: `_to_messages` injects `"You are a helpful assistant."` automatically. If you see this, you're hitting an older image; rebuild with `--no-cache` |
+| Sophia picks the same account every time | `strategy: random` is OK but the pool is small | Use the body-field `strategy: least_used`; or add more accounts |
+| `/v1/models` returns 0 models | `agent_accts.yaml` allowlist is empty OR names don't match PyKeyStore keys | `cat cluster/agent/agent_accts.yaml` — `name:` fields must exactly match keys in source vault; check `seed-keys.sh` "Merged N keys" output |
+| Chat returns `[Errno -2] Name or service not known` | `agent.yaml` has a wrong base_url | Compare against `ladyol/_data_/providers.yaml` in the running image; the four live URLs are in cluster/README.md |
+| Chat returns `429 Too Many Requests` | An account's quota is spent — expected behaviour, Sophia rotates to a sibling account | `docker logs ... | grep cooldown` — paused accounts auto-resume at the next window |
+| `[Errno -2]` *during* a 429 — first attempt rotated but then ALL accounts paused | The first request hit a 429 and Sophia didn't have a non-paused sibling | Wait until the next reset window or add another account for that provider |

@@ -1,143 +1,162 @@
 # Sophia cluster — local testing harness
 
-Three-service compose (was four; bootstrap removed) for end-to-end
-testing against the live Sophia gateway before connecting Hermes.
-Runs on this host alongside nchantdoffice_com.
+Two-service compose for end-to-end testing of the Sophia gateway
+before connecting Hermes. Runs on this host (`.67`) alongside
+nchantdoffice_com, exposed to the LAN.
 
-## Topology
+## Topology (live)
 
 ```
-                    ┌─────────────────────────────┐
-   open-webui       │ sophia                       │       ┌──────────────┐
-   (browser,        │  FastAPI :8765               │       │  ollama      │
-    :3000)  ──────▶ │  /healthz, /v1/models        │──────▶│  :11434      │
-                    │  /v1/chat/completions        │       │  (existing)  │
-   hermes (later)   │  /v1/usage/* (admin only)     │       └──────────────┘
-        └─────────▶│  /v1/captures (admin/coll.)  │
-                    └─────────────────────────────┘
+                    ┌────────────────────────────────────┐
+   open-webui       │ sophia (FastAPI :8765)             │      upstream providers
+   (browser,        │  /healthz                          │     ┌──────────────────┐
+    :3000)  ──────▶ │  /v1/models  (incl. sophia-auto)   │────▶│ minimax ×3 accts │
+                    │  /v1/chat/completions (SSE stream) │     │ zai  (api.z.ai)  │
+   hermes (later)   │  /v1/usage/* (admin/collection)    │     │ xai  (via Groq)  │
+        └─────────▶ │  /v1/captures (admin/collection)   │     │ ollama (host GW) │
+                    └────────────────────────────────────┘     └──────────────────┘
                               ▲
-                              │ future: provider accounts
-                              │ (ladyol pool → upstream)
-                              └─────────────────────────────┘
+                              │ PyKeyStore vault /var/lib/sophia/pycurity/
+                              │ seeded from host system-wide vault by
+                              │ cluster/seed-keys.sh (LLM keys only)
+                              └───────────────────────────────────────────┘
 ```
+
+Verified provider config (`cluster/agent/agent.yaml` — base_urls from
+ladyol's bundled `providers.yaml`):
+
+| Provider | base_url | Models | Accounts |
+|---|---|---|---|
+| minimax | `https://api.minimax.io/v1` | minimax-m2.7, minimax-m3 | 3 (000/001/002) |
+| zai | `https://api.z.ai/api/coding/paas/v4` | glm-4.7, glm-5.2 | 1 |
+| xai | `https://api.groq.com/openai/v1` | grok-2 | 1 |
+| ollama | `http://host.docker.internal:11434/v1` | qwen3.5:4b, llama3 | local |
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `docker-compose.cluster.yml` | the 2-service compose (sophia + open-webui) |
-| `cluster/.env.example` | what to put in `.env` (Sophia requestor key) |
-| `cluster/docker-compose` | thin wrapper around `/usr/bin/docker-compose` that patches a docker-py bug; safe to delete when the host upgrades to docker-compose-plugin v2 |
-| `cluster/bootstrap_db.sh` | (unused — kept for the day the postgres adapter lands) |
-| `Dockerfile` | build context — Sophia's existing image, now with `${PORT}` honoured |
+| `cluster/agent/agent.yaml` | provider pool config (base_urls, models, strategies) |
+| `cluster/agent/agent_accts.yaml` | account list — names must match PyKeyStore keys |
+| `cluster/seed-keys.sh` | one-shot: wipe vault, merge LLM keys from the system-wide vault, backfill cluster passphrase |
+| `cluster/entrypoint.py` | container entrypoint: vault init, filtered merge, exec uvicorn |
+| `cluster/inject-merge-vars.py` | temp-YAML helper (v1-compose env injection) |
+| `cluster/docker-compose` | v1.29 wrapper patching a docker-py bug; delete when host gets compose v2 |
+| `Dockerfile` | image build; ships `/etc/sophia/agent/` config |
 
-## First-time bring-up
+## Key rotation / rate-limit behavior (live)
+
+Quotas are per **account** (API key), not per provider. On a 429:
+
+1. The failed request rotates immediately to another entry —
+   including sibling accounts on the SAME provider.
+2. The 429ing **account** is paused until the next reset window
+   (01:00, 06:00, 11:00, 16:00, 20:00 EDT) — when quotas replenish.
+   Other accounts keep serving.
+3. Paused accounts lazily reactivate when their window lapses.
+4. If every account is paused, requests fail fast with a clear error.
+
+Watch it: `docker logs -f sophia_sophia_1 2>&1 | grep -E "cooldown|rotating"`
+
+## Bring-up (the real flow)
 
 ```bash
 cd /home/solubrew/.hermes/projects/sophia
 
-# 1. Make sure sb-dist/ has the SB wheels (the Dockerfile COPY expects them).
-ls sb-dist/*.whl   # should have 4 wheels from the earlier session
-# If empty, rebuild:
-#   /home/solubrew/ENVs/shieldface/bin/python3 -m shieldface.cli sb wheels \
-#     --out-dir sb-dist --only kahndor,subtrix,pycurity,ladyol
+# 1. Wheels — sb-dist/ is gitignored + gets root-owned by docker binds;
+#    rebuild if empty (12 wheels: 11 SB pkgs + uuid_extensions):
+bash -c 'mkdir -p sb-dist && for p in kahndor subtrix pycurity ladyol goalt \
+  mindot glain thingery squirl knightsort xskillaber; do
+  /home/solubrew/ENVs/shieldface/bin/python3 -m pip wheel --no-deps \
+    --no-build-isolation -w sb-dist /home/solubrew/.hermes/projects/$p; done'
 
-# 2. Seed .env (placeholder for the requestor key — generate after first up)
-cp cluster/.env.example .env
+# 2. Build the image
+./cluster/docker-compose -f docker-compose.cluster.yml build --no-cache sophia
 
-# 3. Bring the cluster up
-./cluster/docker-compose -f docker-compose.cluster.yml up -d --build
+# 3. Seed keys (wipes the sophia volume; merges ONLY the 5 LLM account
+#    keys from the system-wide vault; writes sophia_cluster_master_passphrase
+#    back to the system-wide vault; restores all source perms on exit)
+./cluster/seed-keys.sh /home/solubrew/.local/share/pycurity/secure_store.db '<passphrase>'
 
-# 4. Watch sophia start
-./cluster/docker-compose -f docker-compose.cluster.yml logs -f sophia
+# 4. Issue the requestor key for Open WebUI — hex transport so the raw
+#    key never touches terminal display:
+HEX=$(docker exec sophia_sophia_1 sh -c 'python3 - <<PYEOF
+import sys; sys.path.insert(0, "/app")
+from pathlib import Path
+from sophia.sophia import SophiaDB
+from sophia.keys import KeyStore
+db = SophiaDB(Path("/var/lib/sophia/sophia.db"))
+rec, raw = KeyStore(db).create(name="openwebui")
+print(raw.encode().hex())
+PYEOF
+')
+python3 -c "print('SOPHIA_REQUESTOR_KEY=' + bytes.fromhex('$HEX').decode())" > .env
+chmod 600 .env
 
-# 5. Create the requestor key Open WebUI will use
-RAW=$(./cluster/docker-compose -f docker-compose.cluster.yml exec -T sophia \
-  python -m sophia.cmds.manage_keys create open-webui 2>&1 \
-  | awk -F'API key' '/API key/{print $NF}' | tail -1)
-echo "issued: $RAW"
+# 5. Open WebUI (raw docker run — v1 compose hits a ContainerConfig bug
+#    on recreate; --add-host makes host.docker.internal resolve on Linux):
+KEY=$(sed 's/^SOPHIA_REQUESTOR_KEY=//' .env)
+docker run -d --name sophia_open-webui_1 --network sophia_default \
+  --add-host=host.docker.internal:host-gateway -p 3000:8080 \
+  -e OPENAI_API_BASE_URL=http://sophia_sophia_1:8765/v1 \
+  -e "OPENAI_API_KEY=$KEY" \
+  -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
+  -e WEBUI_AUTH=false ghcr.io/open-webui/open-webui:main bash start.sh
 
-# 6. Paste $RAW into .env as SOPHIA_REQUESTOR_KEY, then restart open-webui.
-#    (Open WebUI reads the env at boot.)
-echo "SOPHIA_REQUESTOR_KEY=$RAW" >> .env
-./cluster/docker-compose -f docker-compose.cluster.yml restart open-webui
-
-# 7. Smoke-test the wire (from the host)
-curl -fsS http://127.0.0.1:8765/healthz
-# {"status":"ok","providers":...,"models":...}
-
-# 8. Open WebUI on http://127.0.0.1:3000. Auth is disabled; you can start
-#    chatting right away. New conversations route through Sophia.
+# 6. Smoke tests (~2 min: open-webui warms its embedding model)
+curl -fsS http://192.168.1.67:8765/healthz
+curl -fsS -H "Authorization: Bearer $KEY" http://192.168.1.67:8765/v1/models
+curl -N -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"sophia-auto","stream":true,
+       "messages":[{"role":"user","content":"Say banana"}]}' \
+  http://192.168.1.67:8765/v1/chat/completions
+# → data: {"choices":[{"delta":{"content":"banana"...}}]} ... data: [DONE]
 ```
+
+Then open `http://192.168.1.67:3000` — pick **sophia-auto**.
+
+## Model selection
+
+- `sophia-auto` (default) — the BACKEND picks the model/account per
+  the strategy + cooldown state. The response reports the actual
+  model that served it.
+- Concrete ids (`minimax-m2.7`, `glm-5.2`, `grok-2`, …) — explicit
+  selection; still rotates across accounts offering that model.
 
 ## Layout of the named volumes
 
 | Volume | Mounted at | Contents |
 |---|---|---|
-| `sophia_sophia_data` | `/var/lib/sophia` (inside sophia container) | `sophia.db` (SQLite), `captures/` |
-| `sophia_openwebui_data` | `/app/backend/data` (inside open-webui container) | Open WebUI's own SQLite (chats, users) |
+| `sophia_sophia_data` | `/var/lib/sophia` | `sophia.db`, `captures/`, `pycurity/vault.db` (LLM keys) |
+| `sophia_openwebui_data` | `/app/backend/data` | Open WebUI's own SQLite (chats, users) |
 
-## Why no postgres here
+## Vault relationship (live)
 
-The first cut of this cluster tried to bootstrap a `sophia` database
-on the existing `ncho-postgres` container (you saw it in the early
-compose versions). We pulled that because:
-
-- `ncho-postgres`'s launch env carries `POSTGRES_PASSWORD=...` that
-  **does not actually authenticate** against the running cluster
-  (likely rotated since the container was first created, or the env
-  was wrong from day one).
-- Touching the postgres password would lock nchantdoffice_com's web
-  service out of its own DB.
-- Sophia uses SQLite today; the postgres path is a future-port feature.
-
-The `cluster/bootstrap_db.sh` shim is kept in the repo for when the
-postgres adapter lands (per HERMES_SETUP.md §5).
-
-## Verifying the wire
-
-```bash
-# Sophia is up + has at least one requestor key
-curl -fsS http://127.0.0.1:8765/healthz
-./cluster/docker-compose -f docker-compose.cluster.yml exec -T sophia \
-  python -m sophia.cmds.manage_keys list
-
-# Open WebUI can reach sophia (in-network DNS + bearer auth)
-./cluster/docker-compose -f docker-compose.cluster.yml exec -T open-webui \
-  wget -qO- http://sophia:8765/v1/models \
-  -H "Authorization: Bearer $SOPHIA_REQUESTOR_KEY"
-
-# Provider-model expansion
-# Until you wire one or more provider accounts into Sophia's
-# PyKeyStore (anthropic_api_key, openai_api_key, ...), every chat
-# completion will return 502 with no upstream. Add one via:
-#   ./cluster/docker-compose -f docker-compose.cluster.yml exec -T sophia \
-#     python -m sophia.cmds.manage_secrets set anthropic_api_key
-#     # paste sk-ant-...
-```
-
-## When the test passes
-
-Once Open WebUI is happy chatting through Sophia:
-
-1. Promote the Sophia image: `docker tag sophia-web:local 192.168.1.210/sophia-web:0.1.0`
-2. Push to your registry
-3. Issue an admin key for the Hermes setup wizard
-4. Update `~/.hermes/config.yaml` per `docs/HERMES_SETUP.md` §3 + §6
-5. Decommission this test compose (or keep it as the dev cluster)
+- Host system-wide vault (`~/.local/share/pycurity/`, passphrase
+  protected) is the source of truth: 22 keys incl. the 5 LLM ones.
+- `seed-keys.sh` copies ONLY the LLM keys (allowlist from
+  `agent_accts.yaml`) into the container's local vault at
+  `/var/lib/sophia/pycurity/vault.db`.
+- The container's auto-generated master passphrase is written BACK to
+  the system-wide vault as `sophia_cluster_master_passphrase`, so any
+  host-side tool can unlock the container vault.
+  (`nchantdoffice_cluster_master_passphrase` is a DIFFERENT cluster's
+  key — untouched.)
+- seed-keys chmods source files to world-readable for the duration
+  (bind-mount) and restores original perms on exit.
 
 ## Known limits
 
-- **Sophia uses SQLite only**, no postgres yet (the bootstrap service
-  was removed; the shim is kept).
-- **No TLS termination.** Host-level only. Don't expose port 8765 on
-  `0.0.0.0` until you've put Caddy (or equivalent) in front of it.
-- **No Sophia admin UI.** Use `manage_keys create/list/disable` over
-  `docker compose exec` until we ship `manage_web.py` (tracked in
-  TODOs.md "New Features").
-- **Open WebUI has WEBUI_AUTH=false.** Disable before exposing to
-  anyone but yourself; production deployments should flip that to
-  true and configure an admin user.
-- **The cluster's `docker-compose` is v1.29 with a one-line shim.**
-  Delete `cluster/docker-compose` once the host gets the docker-cli
-  v2 plugin; the file will be unused then.
+- **SQLite only** (postgres port is future work; schema_versions table
+  is in place for it).
+- **No TLS.** LAN-internal; don't expose :8765 past the LAN without a proxy.
+- **No Sophia admin UI** — `manage_keys` over docker exec.
+- **WEBUI_AUTH=false** on Open WebUI — flip before real users.
+- **v1 docker-compose quirk**: `up -d` after config changes can hit
+  `KeyError: 'ContainerConfig'`; workaround = remove containers
+  (`docker rm -f sophia_sophia_1 sophia_open-webui_1`) then bring up
+  again, or use raw `docker run` for open-webui as above.
+- **Streaming retry caveat**: a failure AFTER partial text was streamed
+  surfaces to the client (can't cleanly retry mid-stream); rotation
+  still applies to failures before first token.

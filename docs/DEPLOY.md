@@ -15,22 +15,27 @@
 
 ## Architecture
 
-Sophia follows the **single-unlock vault pattern**:
+Sophia follows the **per-account 429 cooldown** pattern with a
+**single-unlock vault** for provider keys:
 
 ```
-host main vault       /home/solubrew/.local/share/pycurity/  (passphrase: brewerkey)
+host system-wide vault       /home/solubrew/.local/share/pycurity/
 ├── telegram, coingecko, kalshi_zeta, ...
-└── sophia_master_passphrase  ← generated once, exported into SOPHIA_MASTER_PASSPHRASE
+├── minimax-000.000.000, zai-000.000.000, xai-000.000.000  ← LLM keys
+└── sophia_cluster_master_passphrase  ← container's vault passphrase
+       (backfilled by seed-keys.sh after every fresh boot)
 
-sophia container      /var/lib/sophia/pycurity/vault.db  (sophia_pycurity volume)
-├── anthropic_api_key
-├── openai_api_key
-└── kalshi_api_key
+sophia container             /var/lib/sophia/pycurity/vault.db
+├── minimax-000.000.000, zai-000.000.000, xai-000.000.000  ← seeded
+├── master.key.temp (cached passphrase)
+└── + salt.bin
+
+rotation: per-account (one API key = one allotment)
+cooldown:  paused until next reset window (1am/6am/11am/4pm/8pm EDT)
 ```
 
-The container unlocks its vault using `SOPHIA_MASTER_PASSPHRASE`, which is
-itself pulled from the host's main vault at deploy time. One unlock per
-host; Sophia handles its own provider keys independently.
+seed-keys.sh is the single-unlock handoff: who has the host vault
+open can populate Sophia's container vault without re-typing.
 
 ## Step 1 — Provision the host
 
@@ -52,96 +57,169 @@ sudo -iu deploy
 cd /opt/sophia
 git clone https://github.com/solubrew/sophia.git .
 git checkout gamma
-cp .env.docker.example .env
+# The cluster ships its own .env.example (cluster/.env.example); copy + edit
+cp cluster/.env.example .env
 $EDITOR .env
 ```
 
-## Step 3 — Generate + store the master passphrase
+## Step 3 — Vendor the SB wheels into `sb-dist/`
 
-```bash
-# 1. Generate a random master passphrase for Sophia's internal vault.
-SOPHIA_MASTER=$(openssl rand -base64 32)
-
-# 2. Add it to the host's main PyKeyStore under service name
-#    `sophia_master_passphrase`. This is the single-unlock handoff:
-#    whoever has the main vault open can derive Sophia's passphrase
-#    without re-typing anything.
-python3 -c "
-from pycurity.pykey import PyKeyStore
-PyKeyStore().set('sophia_master_passphrase', {'api_key': '$SOPHIA_MASTER'})
-print('Stored sophia_master_passphrase in main vault')
-"
-
-# 3. Export the value into .env so docker-compose can pass it through.
-echo "SOPHIA_MASTER_PASSPHRASE=$SOPHIA_MASTER" >> .env
-unset SOPHIA_MASTER   # don't leave the plaintext lying around in shell history
-```
-
-## Step 4 — Build the image
-
-The SB-stack (kahndor, subtrix, pycurity, ladyol) is local-only — not on
-PyPI. The Dockerfile expects wheels in `sb-dist/`. The build script
-vendors them automatically:
-
-```bash
-./scripts/build-sophia.sh
-# Vendors the 4 SB-stack packages into sb-dist/, then runs `docker build`.
-```
-
-If the build host has the SB-stack pre-installed (standard dev host), the
-script runs cleanly. For CI / clean production hosts, vendor the wheels
-into `sb-dist/` separately before invoking `docker build`:
+The SB-stack (kahndor, subtrix, pycurity, ladyol, goalt, mindot,
+glain, thingery, squirl, knightsort, xskillaber) plus uuid_extensions
+is local-only — not on PyPI. The Dockerfile expects 12 wheels in
+`sb-dist/`. Vendor them before the first build:
 
 ```bash
 mkdir -p sb-dist
-for pkg in kahndor subtrix pycurity ladyol; do
+for pkg in kahndor subtrix pycurity ladyol goalt mindot glain thingery \
+           squirl knightsort xskillaber; do
     /usr/bin/python3.12 -m pip wheel --no-deps --no-build-isolation \
         --wheel-dir sb-dist /home/solubrew/.hermes/projects/$pkg
 done
-docker build -f Dockerfile -t sophia-web:local .
+# uuid_extensions (subtrix dep, not on PyPI):
+mkdir -p /tmp/uuid_ext_build && rm -rf /tmp/uuid_ext_build/*
+cp -r /home/solubrew/EDN/AGTs/hermes/projects/glain/.venv/lib/python3.12/site-packages/uuid_extensions \
+    /tmp/uuid_ext_build/
+cat > /tmp/uuid_ext_build/pyproject.toml <<EOF
+[build-system]
+requires = ['setuptools>=61']
+build-backend = 'setuptools.build_meta'
+[project]
+name = 'uuid_extensions'
+version = '0.1.0'
+EOF
+cat > /tmp/uuid_ext_build/setup.py <<EOF
+from setuptools import setup, find_packages
+setup(name='uuid_extensions', version='0.1.0', packages=find_packages())
+EOF
+/usr/bin/python3.12 -m pip wheel --no-deps --no-build-isolation \
+    --wheel-dir sb-dist /tmp/uuid_ext_build
+ls sb-dist/*.whl | wc -l   # should be 12
 ```
 
-## Step 5 — Start + initialise the internal vault
+> `sb-dist/` is `.gitignore`d (these are build artefacts, not source).
+
+## Step 4 — Build the image
 
 ```bash
-docker compose up -d sophia
-
-# Init the internal vault (creates vault.db + salt.bin under the
-# sophia_pycurity volume, encrypted with $SOPHIA_MASTER_PASSPHRASE).
-docker compose exec -it sophia python -m sophia.cmds.manage_secrets init
+./cluster/docker-compose -f docker-compose.cluster.yml build --no-cache sophia
 ```
 
-## Step 6 — Set provider keys
+The image (`sophia_sophia:latest`) ships:
+- `/etc/sophia/agent/` — provider pool config + account list
+- `cluster/entrypoint.py` — vault init + filtered merge + uvicorn exec
+- The 12 SB-stack wheels + their transitive PyPI deps installed
+  `--no-deps`
+
+## Step 5 — Seed provider keys
+
+The cluster's bring-up merges keys from the **host system-wide**
+PyKeyStore (`~/.local/share/pycurity/secure_store.db`, the
+operator's existing vault of all credentials) into the **container
+local** vault at `/var/lib/sophia/pycurity/vault.db`. The merge
+filters to LLM-provider keys only (per
+`cluster/agent/agent_accts.yaml`); non-LLM keys (telegram, coingecko,
+gmail, etc.) stay in the host vault untouched.
+
+**One-shot seed (what `seed-keys.sh` does):**
 
 ```bash
-docker compose exec -it sophia python -m sophia.cmds.manage_secrets set anthropic_api_key
+# Run from the sophia repo root.
+./cluster/seed-keys.sh \
+    /home/solubrew/.local/share/pycurity/secure_store.db '<host-vault-passphrase>'
+```
+
+What it does, in order:
+
+1. **Pre-flight**: opens the source vault with the supplied passphrase
+   (errors out cleanly if wrong).
+2. **chmod 444** on every file in the source vault dir + **chmod 755**
+   on the directory itself (the bind-mount's container side runs as
+   `sophia` user / uid 1001; without these, the entrypoint hits
+   `PermissionError` on the read-only `.db` / `.salt` / `.db-wal`).
+3. **Build a temp YAML** (`sophia-compose-XXXXXX.yml`) with the source
+   vault bind-mounted at `/host-pycurity/` inside the container, and
+   the merge env vars injected:
+   - `SOPHIA_MERGE_FROM_PYCURITY_PATH=/host-pycurity/secure_store.db`
+   - `SOPHIA_MERGE_PASSPHRASE=<passphrase>`
+   - `SOPHIA_MERGE_ALLOWLIST=<comma-separated account names from
+     agent_accts.yaml>`
+4. **Wipe the sophia volume** (`docker compose ... down -v`) and
+   **recreate**, so the entrypoint's first-boot vault init runs on
+   a fresh slate.
+5. **Entrypoint** (`cluster/entrypoint.py`):
+   - Generate a random master passphrase + write it to
+     `.master_passphrase` inside the container.
+   - Initialize the local PyKeyStore with it.
+   - Open the source vault with the operator's passphrase; for each
+     key in `SOPHIA_MERGE_ALLOWLIST`, copy the record into the local
+     vault.
+   - **Backfill**: write the cluster's master passphrase BACK to the
+     source vault under `sophia_cluster_master_passphrase` so host-side
+     tools can unlock the container vault without re-deriving.
+   - **Unset the merge env vars** before exec'ing uvicorn so secrets
+     don't leak into the running process.
+6. **Restore source perms** (trap on EXIT) — both the directory and
+   every modified file.
+7. **Verify** by reading the local vault with the auto-generated
+   passphrase and listing the keys.
+
+Add a new LLM account later:
+
+```bash
+# 1. Put the API key in the host system-wide vault (one-time):
+docker compose -f docker-compose.cluster.yml exec -T sophia \
+    python -m sophia.cmds.manage_secrets set anthropic_api_key
 # paste sk-ant-...
-# Ctrl-D
 
-docker compose exec -it sophia python -m sophia.cmds.manage_secrets set openai_api_key
-# paste sk-...
-# Ctrl-D
+# 2. Add a row to cluster/agent/agent_accts.yaml mapping
+#    the account name to the provider.
 
-docker compose exec -it sophia python -m sophia.cmds.manage_secrets set kalshi_api_key
-# paste the API key
-# Ctrl-D
+# 3. Re-run seed-keys.sh — it'll pick up the new account on next run
+#    (since the allowlist is rebuilt from agent_accts.yaml each time).
 ```
 
-Or migrate from a .env file in one shot:
+## Step 6 — Issue a requestor key for Open WebUI / Hermes
+
+Requestor keys live in Sophia's own SQLite (`sophia.db`, table
+`sophia_keys`), separate from the PyKeyStore vault. They're the
+wire-facing auth.
 
 ```bash
-docker compose exec sophia python -m sophia.cmds.manage_secrets migrate-from-env /path/to/.env
-# Remember to delete the .env file afterwards.
+# Issue a chat-only key for Open WebUI (hex transport so the raw secret
+# never touches terminal display):
+HEX=$(docker exec sophia_sophia_1 sh -c 'python3 - <<PYEOF
+import sys; sys.path.insert(0, "/app")
+from pathlib import Path
+from sophia.sophia import SophiaDB
+from sophia.keys import KeyStore
+db = SophiaDB(Path("/var/lib/sophia/sophia.db"))
+rec, raw = KeyStore(db).create(name="openwebui")
+print(raw.encode().hex())
+PYEOF
+')
+python3 -c "print('SOPHIA_REQUESTOR_KEY=' + bytes.fromhex('$HEX').decode())" >> .env
+chmod 600 .env
+
+# For an admin key (manage_keys + usage), pass --role admin to create().
+# For a usage-only collector, --role collection.
 ```
+
+Roles available: `requestor` (chat), `collection` (analyst),
+`admin` (operator).
 
 ## Step 7 — Restart + verify
 
 ```bash
-docker compose restart sophia
-docker compose logs -f sophia
+docker compose -f docker-compose.cluster.yml restart sophia open-webui
+docker compose -f docker-compose.cluster.yml logs -f sophia
 curl -fsS http://localhost:8765/healthz
 # {"status":"ok","providers":N,"models":M}
 ```
+
+Open WebUI is at `http://<sophia-host>:3000`. Pick `sophia-auto` for
+backend-driven rotation, or any concrete model id for explicit
+selection.
 
 ## Optional: TLS fronting with Caddy
 
@@ -165,19 +243,19 @@ docker compose --profile tls up -d caddy
 
 - **`SOPHIA_ALLOW_ENV_FALLBACK=0`** in production. Missing secrets
   cause a hard `ValueError` at startup, not a silent fallback.
-- **`SOPHIA_MASTER_PASSPHRASE` lives in the main vault, not in `.env`**
-  long-term. The deploy workflow is: pull from main vault → write to
-  `.env` → `docker compose up` → `unset` plaintext. For multi-host
-  deployments, generate once and store in the main vault; all hosts
-  pull the same passphrase.
-- **Volume-level encryption** on the `sophia_pycurity` Docker volume
-  (LUKS on the host, or a cloud-provider encrypted volume).
+- **Vault separation**: PyKeyStore holds external provider secrets
+  (LLM API keys); Sophia's `sophia.db` holds the requestor auth
+  (SHA-256 hashed). They're different concerns, intentionally
+  separate stores.
+- **Volume-level encryption** on the `sophia_sophia_data` Docker
+  volume (LUKS on the host, or a cloud-provider encrypted volume).
 - **Rotating a provider key** is a 1-step process:
-  ```bash
-  docker compose exec sophia python -m sophia.cmds.manage_secrets set anthropic_api_key
-  docker compose restart sophia
-  ```
-  PyKeyStore is re-read at app startup; there is no in-process refresh.
+  1. Put the new key in the host system-wide vault:
+     `docker exec <sophia> python -m sophia.cmds.manage_secrets set anthropic_api_key`
+  2. Re-run `seed-keys.sh` — it copies only the keys in the
+     `SOPHIA_MERGE_ALLOWLIST` allowlist (rebuilt from
+     `agent_accts.yaml` each time).
+  3. Restart `sophia_sophia_1` so the entrypoint re-reads the vault.
 
 ## CLI reference
 
@@ -206,8 +284,13 @@ vars stay in plain `.env` files.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Build fails: `Readme file does not exist: README.md` | `pip install .` ran before `README.md` was COPY'd | Already fixed in this Dockerfile — `COPY pyproject.toml README.md ./` is the first COPY |
-| Build fails: `Could not find a version that satisfies the requirement kahndor<1.0.0` | SB-stack not yet vendored | Run `./scripts/build-sophia.sh` first |
-| Container exits: `PermissionError: Invalid passphrase` | `SOPHIA_MASTER_PASSPHRASE` wrong | Re-pull from main vault: `python3 -c "from pycurity.pykey import PyKeyStore; print(PyKeyStore().get('sophia_master_passphrase'))"` |
-| `ValueError: Secret 'anthropic_api_key' not found in PyKeyStore` | Provider key not yet set | `docker compose exec sophia python -m sophia.cmds.manage_secrets set anthropic_api_key` |
-| `/healthz` returns 500 | Internal vault can't open | Check `docker compose logs sophia` — usually a passphrase mismatch |
+| Build fails: `COPY sb-dist/*.whl` empty | `sb-dist/` not populated; first build needs 12 wheels vendored | Run the vendor loop in §3, then rebuild |
+| Build fails: `Could not find a version that satisfies the requirement kahndor<1.0.0` | SB wheels missing | Same fix — vendor + rebuild |
+| Container exits: `PermissionError: '/host-pycurity/secure_store.db'` | `seed-keys.sh` chmod step didn't take effect (rare; happens if source vault dir is root-owned) | Check `stat -c '%a' ~/.local/share/pycurity` — should be 700 with files 600 |
+| Container exits: `vault.db exists but temp.key missing` | Orphaned vault state (previous run aborted mid-init) | `docker compose -f docker-compose.cluster.yml down -v && ./cluster/seed-keys.sh ...` |
+| `PermissionError: Invalid passphrase` in source-vault pre-flight | Wrong passphrase to `seed-keys.sh` | Re-run with the correct passphrase; the source vault perms are restored even on failure |
+| `/healthz` returns `providers: 0` | Accts.yaml allowlist is empty or doesn't match PyKeyStore keys | `cat cluster/agent/agent_accts.yaml` — `name:` fields must match keys in the source vault |
+| `/v1/models` returns `{"detail":"missing or invalid API key"}` | Requestor key not valid OR key is `requestor` role hitting `/v1/usage/*` (returns 403 by design) | `manage_keys list` to confirm the key; match role to endpoint |
+| Chat returns `[Errno -2] Name or service not known` | `agent.yaml` has a wrong base_url | Compare against `ladyol/_data_/providers.yaml` in the running image — the four live ones are listed in cluster/README.md |
+| Chat returns `429 Too Many Requests` | An account's quota is spent — this is EXPECTED behavior, Sophia should rotate to another account | Check `docker logs ... | grep cooldown` — the 429ing account is paused until the next reset window (1am/6am/11am/4pm/8pm EDT) |
+| Open WebUI shows "no models available" | Auth wrong or backend unreachable | Confirm `OPENAI_API_KEY=sk-sophia-...` in container env; restart open-webui after editing `.env` |

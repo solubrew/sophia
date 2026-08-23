@@ -1,151 +1,91 @@
 # Sophia TODOs
 
-> **Session 2026-08-21:** S1 + S2 from the previous ShieldFace handoff
-> RESOLVED. Shieldface server is live at http://192.168.1.210:3141 (API)
-> + :3142 (devpi PyPI mirror); devpi can be reached from subprocess exec,
-> so `pip wheel` / `pip install` no longer get blocked. The vendored
-> `sb-dist/` directory is populated with the 4 SB wheels (kahndor +
-> subtrix + pycurity @ 0.0.1.0.1.2, ladyol 0.2.0) that the Dockerfile
-> consumes via `COPY sb-dist/*.whl`. `scripts/build-sophia.sh` builds
-> them on demand. See CHANGES.md for details.
+> **Session 2026-08-22:** Major reset. The cluster is now fully wired
+> end-to-end on `.67` (sophia + open-webui). Provider pool rotation
+> works, per-account 429 cooldowns pause only the 429ing account
+> until its reset window (1am/6am/11am/4pm/8pm EDT), and `sophia-auto`
+> is the entry-point model that lets the backend pick.
 
-## New Features
-- each connection should be a service url + apikey (if needed) such that one service url can be used multiple times with different api keys
-- each of these connection accounts should have a name, user account email, and usage schedule like a rotateing 75million tokens reset at 1am, 6am, 11am, 4pm, 8pm or other schedule and/or weekly, monthly limits
-- the system should break up the time available from each account schedule and use accordingly to make sure all capabilities are available
-- structured_call end point
-- ensure interface compatibility with hermes - use either the custom API or Custom endpoint setup and add details to the documentation on setup for hermes
-   (○) Azure Foundry (OpenAI-style or Anthropic-style endpoint, your Azure AI deployment)
-   (○) custom (direct API)
-   (○) DeepInfra — 100+ open models, pay-per-use
-   (○) Upstage (Solar API)
-   (○) Custom endpoint (enter URL manually)
-   (○) Configure auxiliary models...
-   (○) Leave unchanged
+## Recently completed (moved to CHANGES.md)
 
----
+The following items from the previous TODOs.md are DONE as of 2026-08-22:
 
+- ✅ **Per-provider rotation via ladyol strategies**
+  (`round_robin_weighted`, `cheapest`, `least_used`, etc.)
+- ✅ **Per-account 429 cooldowns aligned to provider reset windows**
+  (1am/6am/11am/4pm/8pm EDT) — sibling accounts keep serving
+  when one 429s
+- ✅ **Capture-to-disk for forensics** — opt-in via
+  `manage_keys set-payload`, JSON files capped at
+  `SOPHIA_CAPTURE_MAX_BYTES`
+- ✅ **Per-account named connections** — `cluster/agent/agent_accts.yaml`
+  maps each account to its PyKeyStore key
+- ✅ **sophia-auto pseudo-model** — `/v1/models` prepends it so
+  clients can pick "backend decides" instead of a concrete id
+- ✅ **OpenAI SSE streaming translation** — ladyol's event-dict
+  stream translated to OpenAI `chat.completion.chunk` text frames,
+  with empty-delta suppression and per-request usage capture
+- ✅ **system-message injection** — `_to_messages` always injects a
+  leading `system` message so ladyol's sequence validator doesn't
+  reject client requests that omit one
+- ✅ **Wire-up to operator's host system-wide vault** — `cluster/seed-keys.sh`
+  merges only LLM keys from `~/.local/share/pycurity/` into the
+  container vault, then backfills the auto-generated master passphrase
+  back to the source vault as `sophia_cluster_master_passphrase`
 
-### 1. Pre-vendored SB-stack wheels under `sb-dist/`
+## New Features (still open)
 
-**What:** A `sb-dist/` directory in the sophia repo containing pre-built
-`.whl` files for the 4 SB-stack packages Sophia depends on:
+- **structured_call endpoint** — OpenAI-style structured output for
+  `sophia-auto` calls that need typed JSON responses
+- **Connection naming + per-account metadata** (`name`, `email`,
+  `notes`) — not surfaced via `ladyol.providers` yet
+- **Automatic token-budget partitioning** — Sophia should split the
+  available 75M tokens across the day so all capabilities stay
+  available. Closest existing lever: schedule a cron that calls
+  `manage_secrets set <account>` to rotate keys at the window
+  boundaries; Sophia does pick up new keys on restart today.
+- **Hermes compatibility doc kept current** — see
+  `docs/HERMES_SETUP.md` (last reviewed 2026-08-22)
 
-- `kahndor` (namespace package — needed by all SB-stack)
-- `subtrix` (namespace package — needed by ladyol)
-- `pycurity` (provides `PyKeyStore`, `pykey`)
-- `ladyol` (provides `ProviderPool`)
+## Setup / vendor infrastructure
 
-**Why:** The Dockerfile's `COPY sb-dist/*.whl /tmp/sb-dist/` + `pip
-install --no-deps /tmp/sb-dist/*.whl` step is the only reliable way to
-ship a portable image — Docker build context can't reach the host's
-`/home/solubrew/.hermes/projects/` directly. See `scripts/build-sophia.sh`
-+ `Dockerfile` for the contract.
+- **Pre-vendored SB-stack wheels under `sb-dist/`** — DONE. The
+  Dockerfile consumes them; script in §3 of `docs/DEPLOY.md`
+  reproduces them from local sources on the dev host. 12 wheels
+  total (11 SB pkgs + uuid_extensions). See CHANGES.md for the
+  historic context (S1+S2 from ShieldFace handoff).
 
-**How to vendor** (one-time, on a host with the SB-stack editable-installed):
+## Failure modes / edge cases (lessons-learned)
 
-```bash
-# From /home/solubrew/.hermes/projects/sophia
-mkdir -p sb-dist
-for pkg in kahndor subtrix pycurity ladyol; do
-    /usr/bin/python3.12 -m pip wheel --no-deps --no-build-isolation \
-        --wheel-dir sb-dist /home/solubrew/.hermes/projects/$pkg
-done
-ls -la sb-dist/*.whl
-```
+- **v1 docker-compose bug** — `ContainerConfig` KeyError on
+  `up -d --force-recreate` when the container was created by raw
+  `docker run`. Workaround: use raw `docker run` for open-webui
+  (with `--add-host=host.docker.internal:host-gateway` for ollama
+  fallback). Delete `cluster/docker-compose` once host gets compose
+  v2 plugin.
 
-The `.gitignore` in `sb-dist/` already excludes `*.whl` from version
-control — these are build artefacts, not source.
+- **Source vault bind-mount perms** — the source vault dir is mode
+  700 + files mode 600 (operator's security default). The merge
+  entrypoint runs as `sophia` user (uid 1001) inside the container,
+  so it gets `PermissionError` unless seed-keys.sh chmods the dir
+  to 755 + the files to 444 first. Currently handled by
+  seed-keys.sh's preamble + trap-restored perms.
 
-**Then update `Dockerfile` if the vendoring approach changes**: today
-the Dockerfile expects wheels at `sb-dist/*.whl` and installs them
-with `--no-deps`. If ShieldFace moves to sdist-only or a different
-layout, the Dockerfile's `COPY sb-dist/*.whl /tmp/sb-dist/` line needs
-to match.
+- **Sophia DB collision in `sophia/_data/`** — `SophiaConfig`
+  defaults to `sophia/_data/sophia.db` if `SOPHIA_DB` isn't set;
+  the cluster sets `SOPHIA_DB=/var/lib/sophia/sophia.db`. Don't
+  accidentally commit the default-path DB into git. `.gitignore`
+  now excludes `sophia/_data/sophia.db`.
 
-### 2. ShieldFace daemon live so devpi proxy is reachable
+## Operator workflow
 
-**What:** The `LD_PRELOAD=/home/solubrew/.shieldface/intercept.so`
-daemon intercepting subprocess exec and proxying through
-`http://localhost:3141` (the devpi server). Today the daemon is
-loaded but the devpi server is NOT running — that's why every shell
-invocation of pip/python in this env returns
-`[SHIELDFACE] Error: Server not available at http://localhost:3141`
-followed by `No such file or directory: '/usr/bin/bash'`.
-
-**Why this blocks Sophia:**
-
-- `python -m pip install ...` fails (interceptor blocks subprocess exec).
-- `pip wheel ...` during Docker build fails for the same reason.
-- `python -m pytest ...` from the terminal tool fails — that's why we
-  use the `bash /tmp/<script>.sh` workaround everywhere.
-
-**The current workaround** (in `scripts/build-sophia.sh`): self-reexec
-the entire script under `env -u LD_PRELOAD` so the LD_PRELOAD-modified
-dynamic linker doesn't load. This works for build-time `pip wheel`
-but is brittle — it requires `bash` to be available without going
-through the interceptor.
-
-**What's needed:**
-
-- Bring the devpi server up on `localhost:3141`. This is one config
-  line (`~/.shieldface/shieldface.sh` already exports the env vars).
-- OR: keep the daemon loaded but configure the interceptor to
-  no-op when the devpi target is unreachable (passthrough mode).
-- OR: remove the `LD_PRELOAD` from `~/.bashrc` entirely so subprocess
-  exec works normally — the trade-off is losing whatever network
-  policy the interceptor was enforcing (probably PyPI install
-  gating).
-
-**Verification:** Once live, this command should succeed without the
-`[SHIELDFACE]` error and without the `bash /tmp/script.sh` workaround:
-
-```bash
-python -m pip install --quiet some-pkg
-```
-
-### Acceptance criteria for this next session
-
-- [ ] `sb-dist/` contains 4 wheels: `kahndor-*.whl`, `subtrix-*.whl`,
-  `pycurity-*.whl`, `ladyol-*.whl` (versions matching what's at
-  `/home/solubrew/.hermes/projects/*/pyproject.toml`).
-- [ ] `python -m pip install <anything>` succeeds without the
-  `[SHIELDFACE] Error: Server not available` message.
-- [ ] `bash scripts/build-sophia.sh` runs end-to-end and produces
-  `sophia-web:local` image (~1 GB).
-- [ ] `docker run --rm sophia-web:local id` returns
-  `uid=1001(sophia) gid=1001(sophia)`.
-- [ ] `docker compose up -d sophia` + `docker compose exec sophia
-  python -m sophia.cmds.manage_secrets init` succeeds, creating
-  `vault.db` + `salt.bin` under the `sophia_pycurity` named volume.
-
-### Reference docs in this repo
-
-- `docs/DEPLOY.md` — full operator workflow (assumes the above two
-  ShieldFace TODOs are resolved).
-- `scripts/build-sophia.sh` — current vendoring script (works around
-  the SHIELDFACE issue via self-reexec).
-- `Dockerfile` — multi-stage build; reads from `sb-dist/`.
-- `CHANGES.md` — "Docker build verification status" section
-  documents the known gap.
-
-### Context for whoever picks this up
-
-Sophia is a thin OpenAI-compatible HTTP gateway in front of ladyol's
-`ProviderPool`. The MVP is shipped (29 tests passing, pushed to
-`origin/gamma` at `946d8a4`). The Docker service rollout landed in
-the same push. The ONLY thing missing for a fully-portable Docker
-image is these two ShieldFace pieces. Once they're in place, a fresh
-operator on a fresh host can:
-
-1. `git clone sophia`
-2. `bash scripts/build-sophia.sh` (vendors SB-stack wheels into
-   `sb-dist/` — though if the host has the SB-stack editable-
-   installed, this step is a no-op)
-3. `docker compose up -d sophia`
-4. `docker compose exec -it sophia python -m sophia.cmds.manage_secrets init`
-5. `docker compose exec sophia python -m sophia.cmds.manage_secrets set anthropic_api_key`
-
-…and Sophia is live on `http://localhost:8765`.
-
-The two ShieldFace TODOs are the last missing pieces.
+1. Pull `gamma`: `git pull origin gamma`
+2. Add new LLM account: edit `cluster/agent/agent.yaml` (provider
+   block) + `cluster/agent/agent_accts.yaml` (account row); put the
+   key in the system-wide vault:
+   `python -m sophia.cmds.manage_secrets set <account_name>`
+3. Rebuild image: `./cluster/docker-compose -f docker-compose.cluster.yml build --no-cache sophia`
+4. Re-seed: `./cluster/seed-keys.sh /home/solubrew/.local/share/pycurity/secure_store.db '<passphrase>'`
+5. Issue / re-issue requestor keys via `manage_keys create` (hex
+   transport so the raw secret never touches terminal display)
+6. Restart open-webui with the new requestor key in its env
