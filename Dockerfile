@@ -83,7 +83,10 @@ COPY cluster/sb_resolve.py /tmp/sb_resolve.py
 # dev host reads the live manifest from
 # /home/solubrew/.hermes/projects/shieldface/shieldface/_data_/sb_stack_manifest.yaml.
 ARG SB_STACK_MANIFEST=""
-ENV SB_STACK_MANIFEST=""
+# Propagate the build-arg into the runtime env so the helper can read
+# it (ARG alone only exposes the value on its own line; ENV copies
+# its current value into subsequent RUN steps).
+ENV SB_STACK_MANIFEST=$SB_STACK_MANIFEST
 RUN SB_INSTALL_ARGS="$(python3 /tmp/sb_resolve.py \
         --vein /mnt/overse/SBST01/vein/GitVein \
         --branch gamma \
