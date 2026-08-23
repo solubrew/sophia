@@ -71,7 +71,16 @@ cd /home/solubrew/.hermes/projects/sophia
 #    No sb-dist/ vendoring step required. The vein path is
 #    /mnt/overse/SBST01/vein/GitVein (.67) — bind-mount or symlink it
 #    on build hosts where that path doesn't exist natively.
-./cluster/docker-compose -f docker-compose.cluster.yml build --no-cache sophia
+#
+#    The build reads the live SB namespace from the shieldface
+#    manifest (read by `cluster/sb_resolve.py` — a build-time
+#    mirror of `shieldface.spec_router.resolve_spec`). The host
+#    orchestrator passes the manifest as a build arg:
+#
+SB_STACK_MANIFEST="$(cat /home/solubrew/.hermes/projects/shieldface/shieldface/_data_/sb_stack_manifest.yaml)" \
+./cluster/docker-compose -f docker-compose.cluster.yml build \
+    --build-arg SB_STACK_MANIFEST="$SB_STACK_MANIFEST" \
+    --no-cache sophia
 
 # 2. Seed keys (wipes the sophia volume; merges ONLY the 5 LLM account
 #    keys from the system-wide vault; writes sophia_cluster_master_passphrase

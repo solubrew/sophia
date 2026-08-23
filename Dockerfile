@@ -47,43 +47,45 @@ COPY pyproject.toml README.md ./
 # at @gamma — that way commits land without a wheel upload cycle and
 # every consumer host picks up the same source.
 #
-# The vein path /mnt/overse/SBST01/vein/GitVein (consumer hosts) is
-# bind-mounted or read at runtime; in-container builds use the same
-# path. Pins mirror shieldface/_data_/sb_stack_manifest.yaml.
+# The redirect from `name@branch` → `git+file://<vein>/name.git@branch`
+# is owned by CODE — the runtime spec_router (in shieldface.cli /
+# shieldface.interceptor) for installs, and a build-time sibling
+# `cluster/sb_resolve.py` for Docker builds (no spec_router interceptor
+# available in the build stage). The Dockerfile calls the helper
+# rather than embedding URL strings, so all redirects stay code-driven
+# and stay in sync with the runtime resolver.
 #
-# NOTE: Each SB transitive is installed --no-deps here to avoid the
-# resolver pulling the public-PyPI placeholder stubs (e.g. kahndor
-# 0.0.0); the PyPI bulk install below explicitly lists the third-
-# party versions those SB projects need, and the constraints file from
-# gen_constraints.py pins everything consistently. The final . install
-# does its own full resolver pass once Python deps are in place.
-RUN mkdir -p /sb && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'kahndor @ git+file:///mnt/overse/SBST01/vein/GitVein/kahndor.git@gamma' && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'subtrix @ git+file:///mnt/overse/SBST01/vein/GitVein/subtrix.git@gamma' && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'goalt @ git+file:///mnt/overse/SBST01/vein/GitVein/goalt.git@gamma' && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'squirl @ git+file:///mnt/overse/SBST01/vein/GitVein/squirl.git@gamma' && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'thingery @ git+file:///mnt/overse/SBST01/vein/GitVein/thingery.git@gamma' && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'mindot @ git+file:///mnt/overse/SBST01/vein/GitVein/mindot.git@gamma' && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'pycurity @ git+file:///mnt/overse/SBST01/vein/GitVein/pycurity.git@gamma' && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'ladyol @ git+file:///mnt/overse/SBST01/vein/GitVein/ladyol.git@gamma' && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'glain @ git+file:///mnt/overse/SBST01/vein/GitVein/glain.git@gamma' && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'xskillaber @ git+file:///mnt/overse/SBST01/vein/GitVein/xskillaber.git@gamma' && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'knightsort @ git+file:///mnt/overse/SBST01/vein/GitVein/knightsort.git@gamma' && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'eaglis @ git+file:///mnt/overse/SBST01/vein/GitVein/eaglis.git@gamma' && \
-    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        'metrologic @ git+file:///mnt/overse/SBST01/vein/GitVein/metrologic.git@gamma'
+# Pins come from shieldface/_data_/sb_stack_manifest.yaml — the same
+# file the runtime spec_router reads — so the SB namespace set in
+# `sb_namespace` (this commit pushed to gamma) is the single source.
+#
+# Each SB transitive is installed --no-deps to avoid the resolver
+# pulling the public-PyPI placeholder stubs (e.g. kahndor 0.0.0);
+# the PyPI bulk install below explicitly lists the third-party
+# versions those SB projects need, and the final . install does its
+# own full resolver pass once PyPI deps are in place.
+#
+# cluster/sb_resolve.py is a copy of the relevant logic from
+# shieldface.spec_router (zero deps beyond pyyaml) so the build
+# container doesn't need shieldface installed at build time. The
+# runtime spec_router is the canonical source — when its resolve_spec
+# changes, mirror the change here. Single-source comment at the top
+# of cluster/sb_resolve.py.
+COPY cluster/sb_resolve.py /tmp/sb_resolve.py
+# `SB_STACK_MANIFEST` is a --build-arg (override via the orchestrator
+# script: `docker build --build-arg SB_STACK_MANIFEST=$(cat ...) .`).
+# Default empty so test builds still work; orchestrator flow on the
+# dev host reads the live manifest from
+# /home/solubrew/.hermes/projects/shieldface/shieldface/_data_/sb_stack_manifest.yaml.
+ARG SB_STACK_MANIFEST=""
+ENV SB_STACK_MANIFEST=""
+RUN SB_INSTALL_ARGS="$(python3 /tmp/sb_resolve.py \
+        --vein /mnt/overse/SBST01/vein/GitVein \
+        --branch gamma \
+        --as-argv)" && \
+    set -x && \
+    pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps $SB_INSTALL_ARGS && \
+    rm /tmp/sb_resolve.py
 
 # Two-step install:
 #   1) PyPI runtime deps for sophia itself (--no-deps so they don't
