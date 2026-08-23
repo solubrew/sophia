@@ -99,14 +99,8 @@ ENV SB_STACK_MANIFEST=$SB_STACK_MANIFEST
 # references (git+file://...@gamma), then invoke pip as a subprocess
 # from python so no shell quoting layer interferes with the @-syntax
 # (xargs / $IFS splits corrupt tokens with embedded spaces).
-# Lowercase the vein root in this build context. Docker bind-mounts
-# (CIFS / 9P / virtiofs on certain hosts) silently lowercase path
-# components as files flow through the bind, which clobbers git's
-# case-sensitive path resolution at clone time. Build the helper's
-# argv from a lowercase vein root so git always sees the URL the
-# build's filesystem will resolve.
 RUN SB_ARGS="$(python3 /tmp/sb_resolve.py \
-        --vein /mnt/overse/sbst01/vein/gitvein \
+        --vein /mnt/overse/SBST01/vein/GitVein \
         --branch gamma)" && \
     set -x && \
     python3 -c "import sys,subprocess; sys.exit(subprocess.call(['pip','install','--prefix=/install','--no-cache-dir','--no-build-isolation','--no-deps', *sys.argv[1].splitlines()]))" "$SB_ARGS" && \
