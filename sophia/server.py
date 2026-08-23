@@ -146,7 +146,11 @@ def create_app(config=None) -> FastAPI:
 
         strategy = req.strategy or "random"
         temperature = req.temperature if req.temperature is not None else 0.7
-        model = None if req.model == "auto" else req.model
+        model = (
+            None
+            if req.model in ("auto", "sophia-auto", "")
+            else req.model
+        )
         completion_id = new_completion_id()
         t0 = time.monotonic()
 
@@ -220,7 +224,11 @@ def create_app(config=None) -> FastAPI:
                 total_usd=total_usd)
 
         resp = ChatCompletionResponse(
-            id=completion_id, created=now_ts(), model=req.model,
+            id=completion_id, created=now_ts(),
+            # Report the ACTUAL backend model when auto-routing (the
+            # operator wants to see which provider/model/account served
+            # the request); fall back to the requested id otherwise.
+            model=(provider_meta or {}).get("model") or req.model,
             choices=[Choice(index=0, message=Message(role="assistant", content=content or ""))],
             usage=Usage(prompt_tokens=pt, completion_tokens=ct, total_tokens=pt + ct),
         )

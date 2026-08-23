@@ -184,6 +184,11 @@ class SophiaPool:
                 return []
             raise
         out: list = []
+        # Always offer the auto-routing pseudo-model first: Open WebUI
+        # clients pick "sophia-auto" and Sophia's backend decides which
+        # actual provider/model/account serves each request (rotation
+        # strategy). The concrete models follow for explicit selection.
+        out.append(ModelCard(id="sophia-auto", owned_by="sophia"))
         for provider, models in available.items():
             for m in models:
                 out.append(ModelCard(id=m, owned_by=provider))
@@ -218,9 +223,19 @@ def _load_providers_dict(yaml_path: str) -> dict:
 
 
 def _to_messages(prompt: str, sprompt: str) -> list[dict]:
+    """Build the message list ladyol expects.
+
+    ladyol's ProviderPool.stream/chat validate the sequence and
+    REQUIRE a leading system message ("invalid message sequence ...
+    leading role must be 'system', got 'user'"). Stock Open WebUI
+    clients often send no system message at all, so when the caller
+    didn't provide one we inject a minimal placeholder.
+    """
     msgs = []
     if sprompt:
         msgs.append({"role": "system", "content": sprompt})
+    else:
+        msgs.append({"role": "system", "content": "You are a helpful assistant."})
     msgs.append({"role": "user", "content": prompt})
     return msgs
 

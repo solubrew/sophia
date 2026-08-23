@@ -21,7 +21,10 @@ class Message(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
-    model: str
+    # "sophia-auto" (or empty) = let Sophia's backend pick the model
+    # via the configured rotation strategy; anything else is treated
+    # as a literal model id handed to the pool.
+    model: str = "sophia-auto"
     messages: List[Message]
     temperature: Optional[float] = None
     top_p: Optional[float] = None

@@ -83,7 +83,7 @@ cp -p docker-compose.cluster.yml "$TMP_YAML"
 # Read the LLM account names from cluster/agent/agent_accts.yaml so the
 # entrypoint only imports LLM provider keys (not telegram bots,
 # coingecko, gmail, etc.). Use Python's yaml for parse safety.
-ALLOWLIST_CSV=$(python3 -c "
+ALLOWLIST_CSV=$(cat <<'PYEOF' | python3 -
 import sys
 import yaml
 try:
@@ -94,10 +94,10 @@ try:
         sys.exit(0)
     accts = data.get('provider_accts', {}) or {}
     # Each acct entry looks like:
-    #   \"<name>\":
+    #   "the_name":
     #     enabled: True
     #     provider: minimax
-    #     name: \"<name>\"
+    #     name: "the_name"
     # We pull the value's `name` field, which is what ladyol uses as
     # the PyKeyStore lookup key.
     names = [v['name'] for v in accts.values() if v and v.get('enabled')]
@@ -105,7 +105,8 @@ try:
 except Exception as e:
     print(f'WARN: could not parse cluster/agent/agent_accts.yaml: {e}', file=sys.stderr)
     print('')
-" 2>/dev/null)
+PYEOF
+)
 if [ -z "$ALLOWLIST_CSV" ]; then
   echo "(no allowlist parsed from agent_accts.yaml — will merge all keys)"
 fi
