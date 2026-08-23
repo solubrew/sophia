@@ -90,16 +90,15 @@ ENV SB_STACK_MANIFEST=$SB_STACK_MANIFEST
 # SB_INSTALL_ARGS is a NUL-delimited list of PEP-508 direct
 # references from cluster/sb_resolve.py. Use printf "\0" + xargs -0
 # to avoid any shell layer stripping the @-syntax in tokens.
-RUN SB_INSTALL_ARGS="$(python3 /tmp/sb_resolve.py \
+# Run sb_resolve.py to expand sb_namespace into PEP-508 direct
+# references (git+file://...@gamma), then invoke pip as a subprocess
+# from python so no shell quoting layer interferes with the @-syntax
+# (xargs / $IFS splits corrupt tokens with embedded spaces).
+RUN SB_ARGS="$(python3 /tmp/sb_resolve.py \
         --vein /mnt/overse/SBST01/vein/GitVein \
         --branch gamma)" && \
     set -x && \
-    # printf newline-terminated -> xargs -d '\n' splits on the
-    # newline that the helper already emits. xargs -d avoids
-    # whitespace-split which would corrupt tokens with spaces.
-    printf '%s'
- "$SB_INSTALL_ARGS" | xargs -d '\\n' \
-        pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps && \
+    python3 -c "import sys,subprocess; sys.exit(subprocess.call(['pip','install','--prefix=/install','--no-cache-dir','--no-build-isolation','--no-deps', *sys.argv[1].splitlines()]))" "$SB_ARGS" && \
     rm /tmp/sb_resolve.py
 
 # Two-step install:
