@@ -91,7 +91,8 @@ RUN SB_INSTALL_ARGS="$(python3 /tmp/sb_resolve.py \
         --vein /mnt/overse/SBST01/vein/GitVein \
         --branch gamma)" && \
     set -x && \
-    printf '%s\n' "$SB_INSTALL_ARGS" \
+    printf '%s
+' "$SB_INSTALL_ARGS" \
         | xargs pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps && \
     rm /tmp/sb_resolve.py
 
