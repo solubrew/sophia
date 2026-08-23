@@ -87,13 +87,15 @@ ARG SB_STACK_MANIFEST=""
 # it (ARG alone only exposes the value on its own line; ENV copies
 # its current value into subsequent RUN steps).
 ENV SB_STACK_MANIFEST=$SB_STACK_MANIFEST
+# SB_INSTALL_ARGS is a NUL-delimited list of PEP-508 direct
+# references from cluster/sb_resolve.py. Use printf "\0" + xargs -0
+# to avoid any shell layer stripping the @-syntax in tokens.
 RUN SB_INSTALL_ARGS="$(python3 /tmp/sb_resolve.py \
         --vein /mnt/overse/SBST01/vein/GitVein \
-        --branch gamma)" && \
+        --branch gamma --null)" && \
     set -x && \
-    printf '%s
-' "$SB_INSTALL_ARGS" \
-        | xargs pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps && \
+    printf '%s\0' "$SB_INSTALL_ARGS" \
+        | xargs -0 pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps && \
     rm /tmp/sb_resolve.py
 
 # Two-step install:

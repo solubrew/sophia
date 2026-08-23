@@ -110,6 +110,12 @@ def main() -> int:
         action="store_true",
         help="Print shell-quoted pip-install argv string instead of one-per-line",
     )
+    p.add_argument(
+        "--null",
+        action="store_true",
+        help="Print NUL-delimited (one token per \0) — pair with `xargs -0` for safe "
+        "pip argv forwarding without shell quoting layers stripping @-syntax.",
+    )
     args = p.parse_args()
 
     if args.from_env or args.manifest is None:
@@ -133,6 +139,8 @@ def main() -> int:
     resolved = list(build_resolve_args(names, vein_root=args.vein, branch=args.branch))
     if args.as_argv:
         sys.stdout.write(" ".join(shlex.quote(t) for t in resolved) + "\n")
+    elif args.null:
+        sys.stdout.write("\0".join(resolved) + "\0")
     else:
         sys.stdout.write("\n".join(resolved) + "\n")
     return 0
