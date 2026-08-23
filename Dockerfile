@@ -47,7 +47,12 @@ COPY pyproject.toml README.md ./
 # layout (pip 25 retries against "remote HEAD" and rejects non-bare
 # paths). Bump to 26.x BEFORE any other pip invocation. Locked-in
 # spec; verified via tests/integration/test_install_branching.py.
-RUN pip install --no-cache-dir --no-build-isolation "pip>=26.0" "PyYAML>=6.0,<7.0"
+# pin pip<26 so it doesn't use --filter=blob:none at clone time.
+# pip 25.x and 26.x both pass --filter=blob:none --quiet to
+# `git clone`, which requires a bare git source — incompatible with
+# the working-tree Vein layout. pip 24.x uses plain `git clone`
+# which accepts both bare and working-tree sources.
+RUN pip install --no-cache-dir --no-build-isolation "pip>=24.0,<25" "PyYAML>=6.0,<7.0"
 
 # SB-stack deps (kahndor, subtrix, pycurity, ladyol, glain, xskillaber,
 # knightsort, goalt, mindot, squirl, thingery, senbai, eaglis,
