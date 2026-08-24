@@ -96,6 +96,57 @@ All notable changes to Sophia are documented here.
 
 ### Fixed
 
+#### 92e71bb — server-side broken-model detection
+- **Bug.** When the upstream returns <200 chars of content
+  with no tool_call while the caller supplied tool definitions,
+  the model is stuck in reasoning-only mode and isn't actually
+  executing the requested tools. Some LAN upstreams (notably
+  `minimax-m3`) hard-cap response bodies to ~935 bytes — too
+  small to fit a tool_call alongside the thinking block. Before
+  this fix, sophia returned the useless thinking-block fragment
+  to the caller; hermes' `intent_ack_continuation` knob fired 2
+  nudges (each of which produced another useless fragment);
+  hermes gave up; the user saw one response and no tool
+  execution. Reproduced live at 2026-08-24 09:28:33 UTC (4.6s
+  after the user sent the message, 1.5s before the 2-nudge
+  budget elapsed). Operator observation: "the response this time
+  alluded to continued work but the bot didn't respond any
+  further."
+- **Fix.** Two entry points in `sophia/pool.py`:
+  1. `SophiaPool.chat()` (non-streaming) — after the upstream
+     returns, if the response is <200 chars AND no tool_call
+     AND the caller supplied tools AND we're in auto-routing
+     mode, exclude the entry from the retry pool and try the
+     next model. Auto-routing only: explicit `model=<id>` pins
+     are honored even when the response is broken.
+  2. `SophiaPool.stream()` (streaming, the Telegram path) —
+     track `total_yielded` across the async-for chunk loop;
+     after the stream finishes, if `total_yielded < 200` AND
+     no tool_call AND tools were supplied AND we're in
+     auto-routing, exclude and rotate.
+- **Threshold of 200 chars.** A real "I ran this command and
+  got X" response from any tool-using model is much bigger;
+  the 935-byte upstream cap means real responses land well
+  under 200 chars only when truncated by the cap.
+- **Verified end-to-end** (2026-08-24 ~13:43 UTC):
+  - All 3 `minimax-m3` accounts returned 80-140 char thinking
+    fragments → all 3 were detected as broken and rotated.
+  - After 3 m3 failures, glm-5.2 was attempted → 429 (zai
+    weekly quota) → 11:00 EDT cooldown. With 1/4 allowlist
+    members paused, the rotation exhausts the pool and
+    returns a clear 502 to the caller (instead of returning
+    a useless fragment).
+  - Streaming path: `SophiaPool.stream] attempt 1:
+    minimax:sk-cp-t-/minimax-m3 returned 108 chars with no
+    tool_call; rotating to another model` — the same
+    detection fires.
+- **Net effect for the operator:** once the zai weekly quota
+  resets (2026-08-28 04:43 EDT), the rotation will
+  *silently* find a working `glm-5.2` and the agent will
+  complete the task — no operator intervention required. The
+  same applies if `grok-2`'s API key is fixed and added to
+  the allowlist.
+
 #### 0e05266 + a1ed646 — forward OpenAI `tools` field to upstream
 - **Bug (root cause of the leaked-tool-call symptoms).** Sophia
   was silently dropping the caller's `tools` field. The OpenAI
