@@ -2,10 +2,12 @@
 #
 # First-time setup (LAN, no TLS):
 #   1. Generate a random master passphrase and add it to the MAIN
-#      PyKeyStore instance under service name `sophia_master_passphrase`:
+#      PyKeyStore instance under service name
+#      `sophia_cluster_master_passphrase` (pattern
+#      `<cluster_name>_cluster_master_passphrase`):
 #         PYCURITY_MASTER_PASSPHRASE=$(openssl rand -base64 32)
 #         python -c "from pycurity.pykey import PyKeyStore; \
-#             PyKeyStore().set('sophia_master_passphrase', {'api_key': '$PYCURITY_MASTER_PASSPHRASE'})"
+#             PyKeyStore().set('sophia_cluster_master_passphrase', {'api_key': '$PYCURITY_MASTER_PASSPHRASE'})"
 #   2. cp .env.docker.example .env  (and set SOPHIA_MASTER_PASSPHRASE)
 #   3. docker compose build
 #   4. docker compose up -d sophia
@@ -41,7 +43,7 @@ services:
       SOPHIA_PYCURITY_DB_PATH: /var/lib/sophia/pycurity/vault.db
       SOPHIA_PYCURITY_SALT_PATH: /var/lib/sophia/pycurity/salt.bin
       # Master passphrase — sourced from the MAIN PyKeyStore at deploy time.
-      SOPHIA_MASTER_PASSPHRASE: ${SOPHIA_MASTER_PASSPHRASE:?SOPHIA_MASTER_PASSPHRASE must be set in .env (pull from main vault's sophia_master_passphrase service)}
+      SOPHIA_MASTER_PASSPHRASE: ${SOPHIA_MASTER_PASSPHRASE:?SOPHIA_MASTER_PASSPHRASE must be set in .env (pull from main vault's sophia_cluster_master_passphrase service)}
       # Provider pool YAML — defaults to ladyol's bundled file.
       SOPHIA_PROVIDER_POOL: ${SOPHIA_PROVIDER_POOL:-}
       # Logging.

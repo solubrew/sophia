@@ -4,7 +4,12 @@
 #
 #   open-webui (LAN:3000) ──┐
 #                              ├──▶ sophia (LAN:8765) ──▶ ollama / future providers
-#   hermes (later) ──────────┘
+#   senbai.service ─────────┤    ▲ (also: arthr Hermes Agent profile
+#   arthr hermes ───────────┘    │  consumes the same gateway)
+#                                   │
+#   All consumers funnel through sophia; rotation across upstreams
+#   (minimax × 3, zai, xai) happens inside sophia via the strategy
+#   body field injected by each client. See cluster/README.md.
 #
 # Sophia uses SQLite inside the named `sophia_data` volume — one
 # single SQLite file holds the requestor keys + usage log + role
