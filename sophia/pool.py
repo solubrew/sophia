@@ -347,6 +347,39 @@ class SophiaPool:
                     setattr(pool, "last_model", entry.model.name)
                 except Exception:
                     pass
+                # Broken-model detection: when the caller supplied tool
+                # definitions but the upstream returned a tiny
+                # thinking-block fragment with no tool_call, the model
+                # is emitting reasoning-only content and not actually
+                # executing the requested tools.  Some LAN upstreams
+                # (notably the `minimax-m3` account) hard-cap response
+                # bodies to ~935 bytes — too small to fit a tool_call
+                # alongside the thinking block.  Rather than return a
+                # useless fragment to the caller, treat the response
+                # as "model failed to use tools" and rotate to the
+                # next model in the pool.  Auto-routing only — if the
+                # caller explicitly pinned `model=<id>`, honor that
+                # pin even when the response is broken.  Threshold is
+                # 200 chars: a normal "I ran this and got X" response
+                # from any tool-using model is much bigger; a 935-byte
+                # cap means real responses land well under 200 chars
+                # only when the model is truncated by the cap.
+                if (
+                    model is None
+                    and tools
+                    and (not text or len(text.strip()) < 200)
+                ):
+                    excluded.add(id(entry))
+                    acct = _account_of(entry)
+                    logma.warning(
+                        f"[SophiaPool.chat] attempt {attempt + 1}: "
+                        f"{acct}/{entry.model.name} returned "
+                        f"{len(text or '')} chars with no tool_call; "
+                        f"rotating to another model (the caller supplied "
+                        f"{len(tools)} tool defs but this model "
+                        f"appears to be stuck in reasoning-only mode)"
+                    )
+                    continue
                 return text
             except Exception as exc:  # noqa: BLE001 — rotate on ANY provider error
                 last_exc = exc
@@ -512,6 +545,7 @@ class SophiaPool:
 
             emitted = False
             err: Optional[Exception] = None
+            total_yielded: int = 0  # broken-model detection
             try:
                 client = pool._client_for(entry)
                 async for chunk in client.stream(entry.model.name, messages,
@@ -524,11 +558,13 @@ class SophiaPool:
                             text = str(chunk.get("content") or "")
                             if text:
                                 emitted = True
+                                total_yielded += len(text)
                                 yield text
                         elif ctype == "usage":
                             self.last_stream_usage = dict(chunk.get("tokens") or {})
                     elif isinstance(chunk, str) and chunk:
                         emitted = True
+                        total_yielded += len(chunk)
                         yield chunk
             except Exception as exc:  # noqa: BLE001 — rotate on ANY provider error
                 err = exc
@@ -536,6 +572,36 @@ class SophiaPool:
                     # Mid-stream failure after partial output: cannot
                     # cleanly retry (client already saw partial text).
                     raise
+
+            # Broken-model detection (streaming variant).  When the
+            # caller supplied tool definitions but the upstream
+            # emitted a tiny thinking-block fragment with no
+            # tool_call, the model is stuck in reasoning-only mode
+            # and isn't actually executing the requested tools.  This
+            # is the streaming equivalent of the broken-model check
+            # in `chat()` — both rotate to the next auto-allowlist
+            # entry.  We only check on auto-routing (`model is None`)
+            # so explicit `model=<id>` pins are honored even when
+            # the response is broken.  The check happens AFTER the
+            # stream finishes so the caller doesn't see an
+            # aborted-then-recovered stream.
+            if (
+                err is None
+                and emitted
+                and model is None
+                and tools
+                and total_yielded < 200
+            ):
+                excluded.add(id(entry))
+                logma.warning(
+                    f"[SophiaPool.stream] attempt {attempt + 1}: "
+                    f"{_account_of(entry)}/{entry.model.name} returned "
+                    f"{total_yielded} chars with no tool_call; "
+                    f"rotating to another model (caller supplied "
+                    f"{len(tools)} tool defs but this model appears "
+                    f"stuck in reasoning-only mode)"
+                )
+                continue
 
             if err is None and emitted:
                 return

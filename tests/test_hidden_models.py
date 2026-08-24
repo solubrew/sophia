@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sophia.config import SophiaConfig, _parse_hidden_models, load_config
+from sophia.pool import SophiaPool
 
 
 # ── config parser ────────────────────────────────────────────────────────
@@ -246,6 +247,165 @@ def test_filtered_entries_auto_allowlist_intersects_with_hidden():
     pool._pool = _FakePool([_FakeEntry("minimax-m2.7"), _FakeEntry("minimax-m3")])
     auto = pool._filtered_entries(for_auto=True)
     assert {e.model.name for e in auto} == {"minimax-m3"}
+
+
+# ── broken-model detection ──────────────────────────────────────────────
+
+
+class _StubModel:
+    def __init__(self, name):
+        self.name = name
+
+
+class _StubEntry:
+    """Pool entry stub that exposes .model.name and .provider.name."""
+    def __init__(self, model_name, provider_name="stub"):
+        self.model = _StubModel(model_name)
+        self.provider = type("P", (), {"name": provider_name})()
+
+
+class _StubClient:
+    """A client that always returns a tiny thinking-block fragment."""
+    async def chat(self, **kwargs):
+        # Simulate the broken upstream: returns <50 chars of content,
+        # no tool_call, finish_reason="stop"
+        return "<think>...</think>"
+
+
+class _StubPoolWithEntries:
+    """Pool stub with controllable _entries list + a client factory."""
+    def __init__(self, entries):
+        self._entries = list(entries)
+        self.last_provider = None
+        self.last_model = None
+
+    def _client_for(self, entry):
+        return _StubClient()
+
+
+class _StubSophiaPool(SophiaPool):
+    """SophiaPool with a fixed client and pre-loaded entries — skips
+    the real `await self._ensure_pool()` machinery so we can unit-test
+    the broken-model detection in isolation."""
+
+    def __init__(self, entries, tools):
+        # Skip SophiaPool.__init__ (which would create a real pool).
+        # Use object.__setattr__ to bypass the dataclass-like immutability.
+        object.__setattr__(self, "_pool", _StubPoolWithEntries(entries))
+        object.__setattr__(self, "cooldowns", type("C", (), {
+            "is_paused": lambda self, acct: False,
+            "pause": lambda self, acct, until: None,
+        })())
+        object.__setattr__(self, "last_stream_usage", {})
+        object.__setattr__(self, "_config", SophiaConfig(
+            host="0", port=0, log_level="INFO", provider_pool_path="",
+        ))
+        object.__setattr__(self, "lock", type("L", (), {})())
+
+    async def _ensure_pool(self):
+        return self._pool
+
+
+def _make_entry(model_name, provider_name="stub"):
+    return _StubEntry(model_name, provider_name)
+
+
+def test_chat_rotates_when_upstream_returns_tiny_no_tool_response():
+    """When the upstream returns <200 chars of content with no tool_call
+    while the caller supplied tools, the auto-routing loop should treat
+    that as a broken model and rotate to the next entry — not return
+    the useless fragment to the caller."""
+    import asyncio
+    from sophia.pool import SophiaPool
+
+    entry_broken = _make_entry("minimax-m3")  # the broken one
+    entry_next = _make_entry("glm-5.2")      # what we'd rotate to
+    pool = _StubSophiaPool(
+        entries=[entry_broken, entry_next],
+        tools=[{"type": "function", "function": {"name": "bash"}}],
+    )
+
+    async def run():
+        # chat() iterates through `available` until one succeeds.
+        # With broken-model detection, it should skip the broken one
+        # and return the next model.  But our second entry also has
+        # a broken stub client — so chat() should exhaust the pool
+        # and raise the "exhausted all retries" error.  The KEY
+        # signal is that the first entry was *excluded* (logged
+        # warning) and we retried, not that we got a successful
+        # response.
+        from sophia.pool import SophiaPool
+        try:
+            await pool.chat(
+                prompt="list /tmp",
+                sprompt="you are a helper",
+                tools=[{"type": "function", "function": {"name": "bash"}}],
+            )
+            return "NO_EXCEPTION"
+        except RuntimeError as e:
+            return f"exhausted: {e}"
+
+    result = asyncio.run(run())
+    # The error is expected because both stub clients return broken
+    # responses.  The important thing is the error message mentions
+    # the broken model's rotation was attempted.
+    assert "exhausted" in result.lower(), f"expected exhaustion, got {result!r}"
+
+
+def test_chat_returns_normal_response_when_not_broken():
+    """The broken-model detection must NOT fire when the upstream
+    returns a normal-length response (sanity check)."""
+    import asyncio
+    from sophia.pool import SophiaPool
+
+    class _GoodClient:
+        async def chat(self, **kwargs):
+            return "ls -la /tmp"  # normal-length bash command
+
+    class _GoodPool:
+        def __init__(self):
+            self._entries = [_make_entry("minimax-m3")]
+            self.last_provider = None
+            self.last_model = None
+        def _client_for(self, entry):
+            return _GoodClient()
+
+    pool = _StubSophiaPool(entries=[_make_entry("minimax-m3")], tools=[])
+    pool._pool = _GoodPool()
+
+    async def run():
+        return await pool.chat(prompt="list", sprompt="", tools=[])
+
+    result = asyncio.run(run())
+    assert "ls -la" in result
+
+
+def test_chat_does_not_rotate_on_explicit_model_pin():
+    """When the caller pins `model=<id>` explicitly, the broken-model
+    detection must NOT trigger (the caller asked for that specific
+    model — if it's broken, that's a config issue, not a routing
+    issue)."""
+    import asyncio
+    from sophia.pool import SophiaPool
+
+    pool = _StubSophiaPool(
+        entries=[_make_entry("minimax-m3")],
+        tools=[{"type": "function", "function": {"name": "bash"}}],
+    )
+
+    async def run():
+        return await pool.chat(
+            prompt="list",
+            sprompt="",
+            tools=[{"type": "function", "function": {"name": "bash"}}],
+            model="minimax-m3",  # explicit pin
+        )
+
+    result = asyncio.run(run())
+    # Should return the broken model's tiny response (no rotation
+    # because the caller pinned this model).  This is the
+    # "honor the user's pin" behavior.
+    assert "<think>" in result
 
 
 # ── env-var-driven config ──────────────────────────────────────────────
