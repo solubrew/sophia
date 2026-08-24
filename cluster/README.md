@@ -12,14 +12,14 @@ nchantdoffice_com, exposed to the LAN.
    (browser,        │  /healthz                          │     ┌──────────────────┐
     :3000)  ──────▶ │  /v1/models  (incl. sophia-auto)   │────▶│ minimax ×3 accts │
                     │  /v1/chat/completions (SSE stream) │     │ zai  (api.z.ai)  │
-   hermes (later)   │  /v1/usage/* (admin/collection)    │     │ xai  (via Groq)  │
-        └─────────▶ │  /v1/captures (admin/collection)   │     │ ollama (host GW) │
-                    └────────────────────────────────────┘     └──────────────────┘
-                              ▲
-                              │ PyKeyStore vault /var/lib/sophia/pycurity/
-                              │ seeded from host system-wide vault by
-                              │ cluster/seed-keys.sh (LLM keys only)
-                              └───────────────────────────────────────────┘
+   senbai.service   │  /v1/usage/* (admin/collection)    │     │ xai  (via Groq)  │
+   ───────────────▶ │  /v1/captures (admin/collection)   │     │ ollama (host GW) │
+   arthr hermes     └────────────────────────────────────┘     └──────────────────┘
+   (Hermes Agent         ▲
+    profile, .67)        │ PyKeyStore vault /var/lib/sophia/pycurity/
+        └──────────────▶ │ seeded from host system-wide vault by
+                         │ cluster/seed-keys.sh (LLM keys only)
+                         └───────────────────────────────────────────┘
 ```
 
 Verified provider config (`cluster/agent/agent.yaml` — base_urls from

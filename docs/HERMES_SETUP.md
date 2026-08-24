@@ -7,12 +7,22 @@ and avoid the mistakes the gateway is built to prevent.
 > **TL;DR:** issue a requestor API key with
 > `python -m sophia.cmds.manage_keys create hermes-cli`, set
 > `provider: custom` + `base_url: http://192.168.1.67:8765/v1` +
-> `api_key: <sk-sophia-…>` in Hermes' `config.yaml`, send
-> `model: "sophia-auto"` (or any concrete model id) and let Sophia
-> pick the backend. Per-account 429 cooldowns rotate around any
-> exhausted quota automatically. Every call is logged into
-> `sophia.db` (`sophia_usage`); opt-in capture stores prompt+response
-> JSON files capped at `SOPHIA_CAPTURE_MAX_BYTES`.
+> `api_key: <sk-sophia-…>` in Hermes' `config.yaml`, set
+> `model.default: sophia-auto`, and (so the gateway actually rotates
+> per turn) add a `custom_providers:` block that injects
+> `extra_body.strategy: best_available` into every request. Sophia then
+> picks the backend account/model from the full 17-entry pool on each
+> turn, honoring per-account 429 cooldowns aligned to provider reset
+> windows (01:00 / 06:00 / 11:00 / 16:00 / 20:00 EDT). Every call is
+> logged into `sophia.db` (`sophia_usage`); opt-in capture stores
+> prompt+response JSON files capped at `SOPHIA_CAPTURE_MAX_BYTES`.
+>
+> **Live consumers** (2026-08-23): SenBai agent harness
+> (`~/.senbai/senbai_accts.yaml`, sole enabled account is
+> `sophia-000.000.000`); the **arthr** Hermes Agent profile
+> (`~/.hermes/profiles/arthr/`, `custom:sophia` provider). Both routes
+> funnel through the same gateway; rotation happens entirely upstream
+> inside sophia.
 
 ---
 
@@ -150,8 +160,8 @@ accessible to the requestor itself when we wire that in.
 The LAN-side cluster on `.67` is the running reality today. From
 `cluster/README.md`:
 
-- **Sophia image** (`sophia_sophia:latest`, currently head `088fcfc`):
-  built from this repo's `Dockerfile`; bundles 12 SB wheels into
+- **Sophia image** (`sophia_sophia:latest`, currently head `4407527`):
+  built from this repo's `Dockerfile`; bundles 13 SB wheels into
   `/install` + transitive PyPI deps installed `--no-deps`. Ships
   `/etc/sophia/agent/agent.yaml` (provider pool config) and
   `/etc/sophia/agent/agent_accts.yaml` (account list).
@@ -162,10 +172,22 @@ The LAN-side cluster on `.67` is the running reality today. From
   from the host system-wide PyKeyStore by
   `cluster/seed-keys.sh`. 5 LLM accounts (3× minimax, zai, xai).
   Container's auto-generated master passphrase is written BACK to the
-  host vault as `sophia_cluster_master_passphrase`.
+  host vault as `sophia_cluster_master_passphrase` (NOT
+  `sophia_master_passphrase` — the old name was retired; per-cluster
+  master passphrase follows the `<name>_cluster_master_passphrase`
+  service-name pattern in the main vault).
 - **Per-account 429 cooldowns**: reset windows at 1am/6am/11am/4pm/8pm
   EDT. Verified live: a 429 on one account pauses ONLY that account,
   sibling accounts keep serving.
+- **SSE streaming spec compliance**: the gateway now emits a final
+  chunk with `finish_reason: "stop"` before `data: [DONE]` (commit
+  `4407527`). Pre-fix, hermes and any spec-conforming client saw
+  `finish_reason=None` on the last delta, classified it as a partial
+  stream drop, and re-prompted the model up to 4× per turn — producing
+  4 duplicate replies for one Telegram message. The fix is in
+  `sophia/server.py:160-191`; the
+  `openai-sse-finish-reason-misreport` skill documents the
+  reproduction and resolution.
 - **Migration to Postgres**: every Sophia-internal table lives in
   one SQLite file (`sophia.db`); the `schema_versions` table is in
   place for the migration. The next step is a thin `backend` module
@@ -173,6 +195,24 @@ The LAN-side cluster on `.67` is the running reality today. From
   / `psycopg`+`pg8000` while reading the same DDL string. Not
   done yet — per-cluster-portability is the main blocker for
   multi-host deployments.
+
+**Live provider pool snapshot** (`/v1/models` returned by the running
+container on 2026-08-23):
+
+| `model` id (request field) | Owned by | Backend status |
+|---|---|---|
+| `sophia-auto` | sophia | pseudo-model — backend picks per turn |
+| `minimax-m2.7` | minimax | 3 accounts (000/001/002), all enabled |
+| `minimax-m3` | minimax | 3 accounts, all enabled |
+| `glm-4.7` | zai | 1 account (zai-000.000.000) |
+| `glm-5.2` | zai | same — weekly quota exhausted until 2026-08-28 04:43:25 |
+| `grok-2` | xai | 1 account (xai-000.000.000) |
+
+5 LLM accounts × strategy = 17 pool entries when zai recovers. Today
+the pool is 17 entries minus the one paused zai account. Sophia's
+`best_available` strategy picks the cheapest non-paused account that
+meets the capability floor — `minimax-m2.7` / `minimax-m3` carry
+production traffic while zai is cooling down.
 
 **Multi-account rotation pattern:** add each of your N accounts under
 its own key in `providers.yaml`, sharing the same `base_url:` /
@@ -219,11 +259,10 @@ model:
   base_url: "http://192.168.1.67:8765/v1"
 
   # Sophia auth: a REAL requestor key issued via `manage_keys create`.
-  # The placeholder mode (SHIELDFACE_API_KEY unset on Sophia = internal
-  # allow-mode) still requires SOMETHING in api_key for Hermes' SDK
-  # to start; for LAN testing we used a non-secret placeholder, but
-  # for production-style wire-up, issue a key + paste it here.
-  api_key: "sk-sophia-..."
+  # For LAN-only mode (operator's current config; `SOPHIA_ALLOW_ENV_FALLBACK=0`
+  # means PyKeyStore-only) the key is enforced on every /v1 call —
+  # Hermes must present it or every request returns 401.
+  api_key: "${SOPHIA_REQUESTOR_KEY}"
 
   # `sophia-auto` → backend picks the actual provider+account per turn.
   # Concrete ids ("minimax-m2.7", "glm-5.2", etc.) force that model,
@@ -231,11 +270,63 @@ model:
   default: "sophia-auto"
 ```
 
-Internal-mode caveat (LAN-only): Sophia with no
-`SHIELDFACE_API_KEY` set treats any Authorization header as
-acceptable. That's fine for the trusted LAN; expose Sophia outside
-the LAN only behind a proxy that requires real auth. Sophia's
-internal-mode is currently the running config.
+**Without the block below, sophia picks but rotation is inert.**
+Hermes must inject the strategy body-field on every chat-completions
+request; otherwise sophia falls back to its default (`random`) and
+clients see the same provider+account chosen every turn. The
+documented Hermes knob is `custom_providers:` (see
+`hermes-agent/agent/agent_init.py:_merge_custom_provider_extra_body`):
+
+```yaml
+# Match by base_url + model so every call to sophia-auto carries
+# extra_body.strategy=best_available. Strategy choices honored by
+# sophia: random, round_robin(_weighted), weighted, cheapest(_weighted),
+# least_used(_weighted|_cheapest|_cheapest_weighted), best_available,
+# task_router. Default in sophia is `random` (not what you want).
+custom_providers:
+  - name: sophia
+    base_url: http://192.168.1.67:8765/v1
+    model: sophia-auto
+    extra_body:
+      strategy: best_available
+```
+
+**Live example (the `arthr` profile, `~/.hermes/profiles/arthr/config.yaml`,
+running today):**
+
+```yaml
+model:
+  default: sophia-auto
+  provider: custom
+  base_url: http://192.168.1.67:8765/v1
+  api_key: ${SOPHIA_REQUESTOR_KEY}
+custom_providers:
+  - name: sophia
+    base_url: http://192.168.1.67:8765/v1
+    model: sophia-auto
+    extra_body:
+      strategy: best_available
+```
+
+Requestor key lives in `~/.hermes/profiles/arthr/.env` (chmod 600):
+
+```bash
+SOPHIA_REQUESTOR_KEY=sk-sophia-...
+# optional: also export OPENAI_* env vars so the OpenAI SDK reads them
+# directly (the SDK reads OPENAI_BASE_URL/OPENAI_API_KEY first and
+# overrides config.yaml — pick one source of truth per session).
+OPENAI_BASE_URL=http://192.168.1.67:8765/v1
+OPENAI_API_KEY=sk-sophia-...
+```
+
+To verify the wire (one-shot):
+
+```bash
+HERMES_HOME=$HOME/.hermes/profiles/arthr \
+  hermes chat --cli -q 'Reply with exactly one word: pong'
+# Expected: one reply "pong". Pre-fix you'll see 4 duplicates.
+# Verify in state.db: message_count == 2 (1 user + 1 assistant).
+```
 
 ### Per-route overrides (optional)
 
@@ -247,8 +338,8 @@ reasoning-heavy model), use Hermes' per-route overrides:
 model:
   provider: custom
   base_url: "http://<sophia-host>:8765/v1"
-  api_key: "${SOPHIA_KEY}"
-  default: "auto"
+  api_key: "${SOPHIA_REQUESTOR_KEY}"
+  default: "sophia-auto"
 
   routes:
     "anthropic/claude-opus-4.6":
@@ -410,8 +501,10 @@ against `gamma`.
 | `404` on every request | Wrong base_url (missing `/v1`) | Must end with `/v1` |
 | `400 messages must not be empty` | Hermes sent an empty completion (rare) | Restart Hermes; usually a transient prompt-cache invalidation |
 | `400 invalid message sequence for ProviderPool.stream: leading role must be 'system', got 'user'` | Client sent no system message — ladyol requires one as the first item | Fixed in Sophia: `_to_messages` injects `"You are a helpful assistant."` automatically. If you see this, you're hitting an older image; rebuild with `--no-cache` |
-| Sophia picks the same account every time | `strategy: random` is OK but the pool is small | Use the body-field `strategy: least_used`; or add more accounts |
+| Sophia picks the same account every time | `strategy: random` is OK but the pool is small, OR Hermes is not injecting the strategy body-field | Add the `custom_providers:` block from §6 so Hermes injects `strategy: best_available` on every request. Verify with `sophia` logs: you should see `[ProviderPool.select] strategy=best_available` per turn |
 | `/v1/models` returns 0 models | `agent_accts.yaml` allowlist is empty OR names don't match PyKeyStore keys | `cat cluster/agent/agent_accts.yaml` — `name:` fields must exactly match keys in source vault; check `seed-keys.sh` "Merged N keys" output |
 | Chat returns `[Errno -2] Name or service not known` | `agent.yaml` has a wrong base_url | Compare against `ladyol/_data_/providers.yaml` in the running image; the four live URLs are in cluster/README.md |
 | Chat returns `429 Too Many Requests` | An account's quota is spent — expected behaviour, Sophia rotates to a sibling account | `docker logs ... | grep cooldown` — paused accounts auto-resume at the next window |
 | `[Errno -2]` *during* a 429 — first attempt rotated but then ALL accounts paused | The first request hit a 429 and Sophia didn't have a non-paused sibling | Wait until the next reset window or add another account for that provider |
+| Hermes sends 4 duplicate replies to one Telegram message | Pre-`4407527` build of Sophia; SSE stream lacks `finish_reason: stop` on the final chunk | Rebuild Sophia (`./scripts/build-sophia.sh` then `docker run` per `cluster/README.md`) so the gateway emits the spec-compliant stop chunk before `[DONE]`. See `openai-sse-finish-reason-misreport` skill for the reproduction |
+| `/healthz` says `providers: 0, pool not initialized` + logs show `EOFError` at `getpass` | PyKeyStore's cached key (`master.key.temp`) **expired after 4h** (mtime check in `_load_temp_key`); the entrypoint refuses to recover without it | Recovery: pull cluster master passphrase from main PyKeyStore (`sophia_cluster_master_passphrase`), read container's local passphrase from `/var/lib/sophia/pycurity/.master_passphrase`, spawn a helper container with the sophia volume mounted and run `python3 -c "from pycurity.pykey import PyKeyStore; ks = PyKeyStore(passphrase='<local-pass>'); print(len(ks.list()))"`. PyKeyStore writes `master.key.temp`; rename it to `temp.key` to match the entrypoint's expected name. Restart the sophia container. Full procedure in the `openai-sse-finish-reason-misreport` skill §"Pitfalls" |

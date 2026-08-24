@@ -23,11 +23,14 @@ host system-wide vault       /home/solubrew/.local/share/pycurity/
 ├── telegram, coingecko, kalshi_zeta, ...
 ├── minimax-000.000.000, zai-000.000.000, xai-000.000.000  ← LLM keys
 └── sophia_cluster_master_passphrase  ← container's vault passphrase
-       (backfilled by seed-keys.sh after every fresh boot)
+       (backfilled by seed-keys.sh after every fresh boot;
+        pattern: <cluster_name>_cluster_master_passphrase)
 
 sophia container             /var/lib/sophia/pycurity/vault.db
 ├── minimax-000.000.000, zai-000.000.000, xai-000.000.000  ← seeded
-├── master.key.temp (cached passphrase)
+├── master.key.temp (cached passphrase; PyKeyStore's name)
+├── temp.key (entrypoint's expected name — entrypoint refuses
+│             to boot when vault.db exists and temp.key is missing)
 └── + salt.bin
 
 rotation: per-account (one API key = one allotment)
@@ -36,6 +39,16 @@ cooldown:  paused until next reset window (1am/6am/11am/4pm/8pm EDT)
 
 seed-keys.sh is the single-unlock handoff: who has the host vault
 open can populate Sophia's container vault without re-typing.
+
+> **Note on the master key name.** The cluster passphrase lives in
+> the main PyKeyStore under service name
+> `sophia_cluster_master_passphrase`. Older deployments referenced
+> `sophia_master_passphrase` — that key was retired and the new
+> pattern is `<cluster_name>_cluster_master_passphrase` (e.g.
+> `nchantdoffice_cluster_master_passphrase` for the nchantdoffice_com
+> cluster). If your `manage_keys` output reports
+> `KeyError: 'sophia_master_passphrase'`, you're looking at the old
+> name; use `list_services()` to find the live one.
 
 ## Step 1 — Provision the host
 
@@ -196,34 +209,71 @@ docker compose -f docker-compose.cluster.yml exec -T sophia \
 #    (since the allowlist is rebuilt from agent_accts.yaml each time).
 ```
 
-## Step 6 — Issue a requestor key for Open WebUI / Hermes
+## Step 6 — Issue requestor keys for consumers
 
 Requestor keys live in Sophia's own SQLite (`sophia.db`, table
 `sophia_keys`), separate from the PyKeyStore vault. They're the
-wire-facing auth.
+wire-facing auth used by every consumer (Open WebUI, SenBai, the
+**arthr** Hermes profile).
+
+**Issue a chat-only key (the recommended path):**
 
 ```bash
-# Issue a chat-only key for Open WebUI (hex transport so the raw secret
-# never touches terminal display):
-HEX=$(docker exec sophia_sophia_1 sh -c 'python3 - <<PYEOF
+docker exec -it sophia_sophia_1 \
+  python -m sophia.cmds.manage_keys create openwebui
+# Prints a confirmation block. The RAW key is shown once at
+# creation; copy it from the output to the consumer's .env.
+# manage_keys display truncates the secret (sk-sop...XXXX) — extract
+# the full 53-char value with:
+HEX=$(docker exec -T sophia_sophia_1 sh -c '
+  python3 - <<PYEOF
 import sys; sys.path.insert(0, "/app")
 from pathlib import Path
 from sophia.sophia import SophiaDB
 from sophia.keys import KeyStore
 db = SophiaDB(Path("/var/lib/sophia/sophia.db"))
-rec, raw = KeyStore(db).create(name="openwebui")
+rec, raw = KeyStore(db).create(name="my-consumer")
 print(raw.encode().hex())
-PYEOF
-')
-python3 -c "print('SOPHIA_REQUESTOR_KEY=' + bytes.fromhex('$HEX').decode())" >> .env
-chmod 600 .env
-
-# For an admin key (manage_keys + usage), pass --role admin to create().
-# For a usage-only collector, --role collection.
+PYEOF')
+python3 -c "print('SOPHIA_REQUESTOR_KEY=' + bytes.fromhex('$HEX').decode())" \
+  >> /path/to/consumer/.env
+chmod 600 /path/to/consumer/.env
 ```
 
-Roles available: `requestor` (chat), `collection` (analyst),
-`admin` (operator).
+**Roles available:**
+
+| Role | Capabilities | Use |
+|---|---|---|
+| `requestor` | chat + `/v1/models` only | default — Hermes, Open WebUI, agent harnesses |
+| `collection` | `/v1/usage/*` + `/v1/captures` read-only | dashboards, analytics |
+| `admin` | chat + usage + key management | operator only |
+
+```bash
+# Admin key (operator)
+docker exec -it sophia_sophia_1 \
+  python -m sophia.cmds.manage_keys create solubrew-admin --role admin
+
+# Collection key (Grafana scraper)
+docker exec -it sophia_sophia_1 \
+  python -m sophia.cmds.manage_keys create grafana-bot --role collection
+
+# Opt in to prompt+completion capture (capped at SOPHIA_CAPTURE_MAX_BYTES)
+docker exec -it sophia_sophia_1 \
+  python -m sophia.cmds.manage_keys set-payload hermes-cli on
+```
+
+**Live consumers' keys (2026-08-23):**
+- SenBai: `~/.senbai/sophia.env` (chmod 600), env var
+  `SOPHIA_REQUESTOR_KEY`. ladyol loads it via the `<agent_path>/<gateway>.env`
+  fallback (ladyol `6f70f44`).
+- arthr (Hermes Agent profile): `~/.hermes/profiles/arthr/.env`
+  (chmod 600), env vars `OPENAI_BASE_URL` +
+  `OPENAI_API_KEY` + `SOPHIA_REQUESTOR_KEY`.
+- Open WebUI: container env `OPENAI_API_KEY=<key>` set at `docker run`.
+
+**Rotation:** the raw secret is shown **once** at creation. To
+rotate, issue a new key, update the consumer's `.env`, and (for a
+hard cut-over) disable the old one: `manage_keys disable <name>`.
 
 ## Step 7 — Restart + verify
 
@@ -303,11 +353,13 @@ vars stay in plain `.env` files.
 |---|---|---|
 | Build fails: `COPY sb-dist/*.whl` empty | `sb-dist/` not vendored; first build needs the 13 wheels | Run `scripts/build-sophia.sh --no-build`, then rebuild |
 | Container exits: `PermissionError: '/host-pycurity/secure_store.db'` | `seed-keys.sh` chmod step didn't take effect (rare; happens if source vault dir is root-owned) | Check `stat -c '%a' ~/.local/share/pycurity` — should be 700 with files 600 |
-| Container exits: `vault.db exists but temp.key missing` | Entrypoint checks `temp.key` but PyKeyStore's cache is named `master.key.temp` (filename mismatch), OR the vault volume was written by an older entrypoint | **No reseed needed** — refresh the cached key from the stored passphrase: `docker exec sophia_sophia_1 sh -c 'cat /var/lib/sophia/pycurity/.master_passphrase > /var/lib/sophia/pycurity/master.key.temp && chmod 600 /var/lib/sophia/pycurity/master.key.temp'` then `docker restart sophia_sophia_1`. Only wipe + reseed (`down -v` + `seed-keys.sh`) if the vault itself is corrupt |
-| `/healthz` says `providers: 0, pool not initialized` + logs show `EOFError` at `getpass` | PyKeyStore's cached key (`master.key.temp`) **expires after 4h** by mtime; after long downtime it self-deletes and the vault falls back to a passphrase prompt, which EOFs in a non-TTY container | Same fix as above: refresh `master.key.temp` from `.master_passphrase` (the entrypoint stores the generated passphrase there at first boot) with a **fresh mtime** (don't `cp -p`), then restart. Root fix pending: entrypoint should refresh the temp key at every boot |
+| Container exits: `vault.db exists but temp.key missing` | Entrypoint checks `temp.key` but PyKeyStore's cache is named `master.key.temp` (filename mismatch), OR the vault volume was written by an older entrypoint, OR `master.key.temp` expired after 4h | **Refresh the cached key from the stored passphrase.** The container's LOCAL passphrase (NOT the cluster master) lives in `/var/lib/sophia/pycurity/.master_passphrase` (44 bytes — `secrets.token_urlsafe(32)` from first boot). Spawn a helper container that opens the vault with that passphrase; PyKeyStore then writes `master.key.temp`. Then rename it: `docker run --rm -v sophia_sophia_data:/var/lib/sophia --user 0:0 alpine:latest sh -c 'mv /var/lib/sophia/pycurity/master.key.temp /var/lib/sophia/pycurity/temp.key && chmod 600 /var/lib/sophia/pycurity/temp.key'`. Restart sophia. **Don't wipe the volume** unless the vault itself is corrupt — `down -v` destroys all requestor keys too. Full procedure in `openai-sse-finish-reason-misreport` skill §"Pitfalls" |
+| `/healthz` says `providers: 0, pool not initialized` + logs show `EOFError` at `getpass` | Same root cause as the `temp.key` row above — PyKeyStore's cached key expired after 4h and the vault falls back to a passphrase prompt, which EOFs in a non-TTY container | Same fix as above: refresh `temp.key` from `.master_passphrase` (the entrypoint stores the locally-generated passphrase there at first boot), then restart. **Root fix pending**: the entrypoint should refresh `temp.key` from `.master_passphrase` on every boot instead of erroring out |
+| Hermes sends 4 duplicate replies to one Telegram message | Pre-`4407527` Sophia build — SSE stream emitted every chunk with `finish_reason: null` and terminated with only `[DONE]`. Hermes classified the response as a partial-stream-stub and ran 4 continuation rounds | Rebuild Sophia so the gateway emits a final chunk with `finish_reason: "stop"` before `[DONE]`. Verified in `sophia/server.py:160-191` (commit `4407527`). See `openai-sse-finish-reason-misreport` skill |
+| Sophia picks the same upstream account every turn | Hermes isn't injecting the `strategy` body-field; sophia defaults to `random` which looks random over a 1-account pool but isn't rotation-aware | Add `custom_providers:` block to hermes `config.yaml` (see `docs/HERMES_SETUP.md` §6). Verify with `docker logs sophia_sophia_1 | grep "ProviderPool.select"` — you should see `strategy=best_available` per turn |
 | `/healthz` says `pool unreachable (ModuleNotFoundError: No module named 'uuid_extensions')` | Image built without the uuid_extensions stub wheel (squirl imports it; not on PyPI) | Run `scripts/build-sophia.sh` (it vendors the stub from an existing venv) and rebuild the image |
 | `PermissionError: Invalid passphrase` in source-vault pre-flight | Wrong passphrase to `seed-keys.sh` | Re-run with the correct passphrase; the source vault perms are restored even on failure |
-| `/healthz` returns `providers: 0` | Accts.yaml allowlist is empty or doesn't match PyKeyStore keys | `cat cluster/agent/agent_accts.yaml` — `name:` fields must match keys in the source vault |
+| `/healthz` returns `providers: 0` (and no EOFError) | Accts.yaml allowlist is empty or doesn't match PyKeyStore keys | `cat cluster/agent/agent_accts.yaml` — `name:` fields must match keys in the source vault |
 | `/v1/models` returns `{"detail":"missing or invalid API key"}` | Requestor key not valid OR key is `requestor` role hitting `/v1/usage/*` (returns 403 by design) | `manage_keys list` to confirm the key; match role to endpoint |
 | Chat returns `[Errno -2] Name or service not known` | `agent.yaml` has a wrong base_url | Compare against `ladyol/_data_/providers.yaml` in the running image — the four live ones are listed in cluster/README.md |
 | Chat returns `429 Too Many Requests` | An account's quota is spent — this is EXPECTED behavior, Sophia should rotate to another account | Check `docker logs ... | grep cooldown` — the 429ing account is paused until the next reset window (1am/6am/11am/4pm/8pm EDT) |

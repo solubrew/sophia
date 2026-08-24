@@ -24,9 +24,12 @@ Then point any OpenAI-compatible client at `http://192.168.1.67:8765/v1`
 with a Sophia requestor key (`sk-sophia-...`).
 
 ## Consumers (2026-08-23)
-- **SenBai** (agent harness, systemd `senbai.service` on this host) — sole provider is `sophia` via `sophia-auto`; key from `~/.senbai/sophia.env` (ladyol `6f70f44` fallback).
-- Open-webui container (`sophia_open-webui_1`).
-- Direct curl with a requestor key.
+- **SenBai** (agent harness, systemd `senbai.service` on this host) — sole provider is `sophia` via `sophia-auto`; key from `~/.senbai/sophia.env` (ladyol `6f70f44` file fallback).
+- **arthr** (Hermes Agent profile, `~/.hermes/profiles/arthr/`) — wired via `provider: custom` + `custom_providers:` with `extra_body.strategy: best_available`; key from `~/.hermes/profiles/arthr/.env` (chmod 600).
+- **Open WebUI** container (`sophia_open-webui_1`) — model dropdown shows `sophia-auto` first, then concrete ids.
+- **Direct curl** with a requestor key (`sk-sophia-…`).
+
+All three rotate through the same 17-entry upstream pool; rotation is governed entirely inside sophia via the `strategy` body field. See `docs/HERMES_SETUP.md` §6 for the canonical Hermes wire-up.
 
 ## Endpoints (live)
 
@@ -130,5 +133,5 @@ files pruned first.
 ```bash
 cd /home/solubrew/.hermes/projects/sophia
 /home/solubrew/ENVs/shieldface/bin/python3 -m pytest tests/ -q
-# 39 passed, 1 env-dependent skip
+# 40 passed
 ```

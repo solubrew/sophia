@@ -1,10 +1,12 @@
 # Sophia TODOs
 
-> **Session 2026-08-22:** Major reset. The cluster is now fully wired
-> end-to-end on `.67` (sophia + open-webui). Provider pool rotation
-> works, per-account 429 cooldowns pause only the 429ing account
-> until its reset window (1am/6am/11am/4pm/8pm EDT), and `sophia-auto`
-> is the entry-point model that lets the backend pick.
+> **Session 2026-08-23 (end of day):** arthr hermes profile is now a
+> live consumer (alongside SenBai + Open WebUI). SSE streaming is
+> spec-compliant (commit `4407527`). Vault recovery procedure
+> documented in DEPLOY.md and the `openai-sse-finish-reason-misreport`
+> skill. Item list below last reviewed 2026-08-23; zai weekly quota
+> exhausted until 2026-08-28 04:43:25 — gateway rotates through
+> minimax × 3 + xai via `best_available` until then.
 
 ## Recently completed (moved to CHANGES.md)
 
@@ -45,7 +47,8 @@ The following items from the previous TODOs.md are DONE as of 2026-08-22:
   `manage_secrets set <account>` to rotate keys at the window
   boundaries; Sophia does pick up new keys on restart today.
 - **Hermes compatibility doc kept current** — see
-  `docs/HERMES_SETUP.md` (last reviewed 2026-08-22)
+  `docs/HERMES_SETUP.md` (last reviewed 2026-08-23 after the SSE
+  finish_reason fix and the arthr profile wire-up)
 
 ## Setup / vendor infrastructure
 

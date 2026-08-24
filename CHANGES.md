@@ -2,6 +2,100 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-08-23 (arthr hermes consumer + SSE spec fix + vault recovery)
+
+### Fixed
+
+#### 4407527 — emit OpenAI-spec `finish_reason` before `[DONE]` on streaming
+- **Bug.** Sophia's `/v1/chat/completions` streaming endpoint emitted
+  every chunk with `finish_reason: null` and terminated with only
+  `data: [DONE]`. The OpenAI Chat Completions streaming spec requires
+  one final SSE chunk carrying the actual `finish_reason` (`"stop"`,
+  `"length"`, `"tool_calls"`, `"content_filter"`) with an empty delta
+  before `[DONE]`.
+- **Symptom.** Every spec-conforming client (Hermes Agent, the OpenAI
+  Python SDK, Open WebUI) classified the response as a partial stream
+  drop and either ran 4 continuation rounds (Hermes) or silently
+  truncated the turn. On the arthr Hermes profile this manifested as
+  4 duplicate replies to every single Telegram message —
+  `message_count: 8` in `state.db` (1 user + 4× continuation user +
+  assistant) instead of the correct `2`.
+- **Fix.** `sophia/server.py:160-191` — after the `async for chunk in
+  pool.stream(...)` loop ends, emit one final SSE chunk with
+  `finish_reason: "stop"` (empty delta) before `data: [DONE]`. Indent
+  is outside the inner loop so it's emitted exactly once per request.
+- **Verified end-to-end** at `192.168.1.67:8765` on 2026-08-23:
+  ```
+  [0] finish_reason=None content='<think>…'
+  [4] finish_reason='stop' content=''     ← NEW
+  [6] [DONE]
+  ```
+  `state.db` sessions under `~/.hermes/profiles/arthr/` now report
+  `message_count: 2` (was 8).
+- **Defensive hermes guard** (`agent/conversation_loop.py:2425`):
+  detects the same gateway-misreport shape from the client side
+  (visible text ends naturally + length ≪ requested cap) and rewrites
+  the upstream finish_reason to `"stop"`. Catches any future gateway
+  with the same bug. 30/30 existing continuation tests still pass.
+
+#### Vault-boot recovery procedure (documented in DEPLOY.md + skill)
+- PyKeyStore's `master.key.temp` cache auto-expires after 4h
+  (`TEMP_KEY_MAX_AGE_HOURS` in `_load_temp_key`). The sophia
+  entrypoint refuses to recover without it. Full recovery procedure:
+  pull cluster master passphrase from main PyKeyStore under
+  `sophia_cluster_master_passphrase` (NOT `sophia_master_passphrase`
+  — old name was retired), read container's LOCAL passphrase from
+  `/var/lib/sophia/pycurity/.master_passphrase`, spawn a helper
+  container that opens the vault with the local passphrase (PyKeyStore
+  writes `master.key.temp`), rename `master.key.temp` to `temp.key`
+  to match the entrypoint's expected name, restart.
+- Documented in `docs/DEPLOY.md` troubleshooting table (replaces the
+  prior single-line note) and in the
+  `openai-sse-finish-reason-misreport` skill.
+
+### Added
+
+#### arthr Hermes Agent profile consumes sophia
+- `~/.hermes/profiles/arthr/config.yaml`:
+  ```yaml
+  model:
+    provider: custom
+    base_url: http://192.168.1.67:8765/v1
+    default: sophia-auto
+    api_key: ${SOPHIA_REQUESTOR_KEY}
+  custom_providers:
+    - name: sophia
+      base_url: http://192.168.1.67:8765/v1
+      model: sophia-auto
+      extra_body:
+        strategy: best_available
+  ```
+- `~/.hermes/profiles/arthr/.env` (chmod 600): `SOPHIA_REQUESTOR_KEY`
+  + `OPENAI_BASE_URL` + `OPENAI_API_KEY`.
+- Without the `custom_providers:` block, hermes doesn't inject the
+  `strategy` body-field and sophia falls back to its `random` default
+  — single-account picks on every turn. With it, sophia picks from
+  the full 17-entry pool via `best_available`.
+- Verified: `docker logs sophia_sophia_1 | grep "ProviderPool.select"`
+  shows `strategy=best_available n_entries=17` per turn.
+
+### Consumers (2026-08-23)
+- `senbai.service` (systemd, user instance) — sole LLM provider is
+  sophia; `~/.senbai/senbai_accts.yaml` carries one enabled account
+  `sophia-000.000.000`; ladyol `6f70f44` file-fallback loads the
+  requestor key from `~/.senbai/sophia.env`.
+- `~/.hermes/profiles/arthr/` (Hermes Agent profile, PID 327696 on
+  this host) — wired via `custom_providers:` with `extra_body.strategy:
+  best_available`.
+- Open WebUI (`sophia_open-webui_1`) on `:3000`.
+- Direct curl with a requestor key.
+
+### Running image
+- `sophia_sophia:latest` (commit `4407527`), 33 build steps,
+  13 vendored SB wheels (12 SB packages + `uuid_extensions` stub).
+
+---
+
 ## [Unreleased] — 2026-08-23 (senbai consumer + reproducible build)
 
 ### Added
