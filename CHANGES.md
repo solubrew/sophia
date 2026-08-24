@@ -96,7 +96,42 @@ All notable changes to Sophia are documented here.
 
 ### Fixed
 
-#### 95afd27 — cooldown accounts after broken-model detection
+#### 7a8392d — forward `max_tokens` to upstream (THE actual tool-call bug)
+- **Bug.** Sophia was dropping the caller's `max_tokens` on the
+  floor, which forced the upstream to use its own default.  The
+  default is small enough that tool_use responses get truncated
+  to a thinking-block fragment (`finish_reason="stop"`,
+  `tool_calls: null`) on most LAN upstreams.  Reproduced live
+  2026-08-24 ~14:35 UTC.
+- **Symptoms.** Same as the upstream-tool-call-shape bug
+  described throughout this session: hermes calls
+  `sophia-auto` → sophia rotates to `minimax-m3` → m3 returns
+  `<200 char thinking fragment>` → user sees "agent stopped
+  after one response".
+- **Diagnostic path.** Added `LADYOL_DEBUG_OUTBOUND_PAYLOAD=1`
+  debug logging (commit `25ff5a7`) that dumps the actual JSON
+  body sent upstream with masked auth header.  The log line
+  showed `max_tokens: null` even when the caller (hermes) sent
+  `max_tokens: 65536`.  That was the smoking gun.
+- **Fix.** Extract `req.max_tokens` from the OpenAI request in
+  `sophia/server.py`, default to `4096` if unspecified (tunable
+  via `SOPHIA_DEFAULT_MAX_TOKENS` env), and forward through
+  `pool.chat()`, `pool.chat_with_meta()`, and `pool.stream()` to
+  the ladyol `AsyncLLMClient`.
+- **Why this is the actual tool-call bug, not the ones we fixed
+  earlier.** Previous fixes (commit `0e05266` forwarding tools,
+  commits `92e71bb` / `95afd27` broken-model detection and
+  cooldown) were necessary but not sufficient.  The full chain
+  was: tools NOT forwarded → fixed.  Tools forwarded but
+  response truncated by missing `max_tokens` → FIXED BY THIS
+  COMMIT.  With this in place, the upstream m3 endpoint emits
+  proper `tool_calls` arrays (verified with `finish_reason:
+  'tool_calls'`, `tool_calls: [{'name': 'terminal', ...}]`).
+- **Tests updated.** `FakePoolShim.chat` / `chat_with_meta` /
+  `stream` now accept `max_tokens`.  All 79 tests pass; 1
+  pre-existing `test_e2e_live` failure unchanged.
+
+#### 25ff5a7 — LADYOL_DEBUG_OUTBOUND_PAYLOAD debug logging
 - **Bug.** The broken-model detection (commit `92e71bb`)
   excluded the broken account from the **current call's**
   retry pool — but hermes makes 2-4 API calls per turn (1
