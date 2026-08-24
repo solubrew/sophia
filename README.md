@@ -23,6 +23,11 @@ pip install -e .[dev]
 Then point any OpenAI-compatible client at `http://192.168.1.67:8765/v1`
 with a Sophia requestor key (`sk-sophia-...`).
 
+## Consumers (2026-08-23)
+- **SenBai** (agent harness, systemd `senbai.service` on this host) — sole provider is `sophia` via `sophia-auto`; key from `~/.senbai/sophia.env` (ladyol `6f70f44` fallback).
+- Open-webui container (`sophia_open-webui_1`).
+- Direct curl with a requestor key.
+
 ## Endpoints (live)
 
 | Method | Path | Auth | Notes |

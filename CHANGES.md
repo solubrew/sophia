@@ -2,6 +2,29 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-08-23 (senbai consumer + reproducible build)
+
+### Added
+- **Senbai agent harness now consumes sophia** as its sole LLM provider. `~/.senbai/senbai_accts.yaml` carries a single enabled account (`sophia-000.000.000`); ladyol's ProviderPool exposes exactly one entry (`sophia` / `sophia-auto` → `http://192.168.1.67:8765/v1`) and rotation stays upstream inside sophia. Verified: 5/5 chat round-trips 200 OK, no internal ladyol rotation.
+- `docs/DEPLOY.md` Step 3 + troubleshooting rows: the vault-boot gotchas (`temp.key` vs `master.key.temp` filename mismatch; PyKeyStore 4-hour mtime expiry; `uuid_extensions` stub wheel).
+
+#### d2ccd8c — restore host-side wheel vendoring (the original pipeline)
+- `scripts/build-sophia.sh` rebuilt: 12-package SB closure vendored on the host via `pip wheel --no-deps` from workspace checkouts (or `--from-vein` for fresh gamma clones), `uuid_extensions` stub wheel copied from an existing venv (the original build's missing ingredient), python auto-selection (prefers `ENVs/shieldface` for setuptools), unpushed-commit warning.
+- `Dockerfile` back to `COPY sb-dist/*.whl` + `pip install --no-deps` — no git inside the build container at all.
+- Verified: 13 wheels vendored → image built (33 steps) → container recreated on the existing vault volume without passphrase → first healthz `providers: 4, models: 6` → chat 200 via `sophia-auto`.
+
+#### bceff2c — sb_resolve URL form reverted to plain `.git@<branch>`
+- Lockstep with shieldface `31b6bf4`. The `.git/.git@` variant existed only for the in-container git clone workaround; Docker builds now vendor wheels so the plain form is canonical everywhere (venv installs + any future git-based path).
+
+#### Revert chain (`9ce181c`, `5070243`, `bcf524b`, `db61d07`)
+- Four unsuccessful in-container git+file build attempts reverted: pip upgrade/downgrade, lowercased vein path, safe.directory trust. Post-mortem in Glain `explicit:94ba8bdb0cb06b33`; the canonical Docker pattern is documented in `shieldface/INSTALL.md` and the `sb-docker-build-vendoring` skill.
+
+### Consumers (2026-08-23)
+- `senbai.service` (systemd, user instance) — the agent harness gateway on .67, routing all LLM traffic through this gateway via `sophia-auto`.
+- Direct curl / any OpenAI-compatible client with a requestor key.
+
+---
+
 ## [Unreleased] — 2026-08-21
 
 ### Added
