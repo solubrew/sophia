@@ -96,6 +96,30 @@ All notable changes to Sophia are documented here.
 
 ### Fixed
 
+#### 95afd27 — cooldown accounts after broken-model detection
+- **Bug.** The broken-model detection (commit `92e71bb`)
+  excluded the broken account from the **current call's**
+  retry pool — but hermes makes 2-4 API calls per turn (1
+  initial + 1-3 intent-ack continuation nudges). Each call
+  re-iterated the full pool, so the broken-model detection
+  fired once per call, producing 6-12
+  `stream exhausted all provider retries without content`
+  errors per user turn. Operator observation (2026-08-24
+  ~13:55 UTC): "review again it is returning a lot of errors."
+- **Fix.** Persist a 60-second cooldown on the broken account
+  via the existing `_ProviderCooldowns.pause(until_utc)`
+  mechanism. The `is_paused(account)` check in
+  `_filtered_entries` then skips the broken account for
+  subsequent calls within the same window.
+- **Verified** (2026-08-24 ~13:59 UTC): 4-call nudge
+  simulation. Before this fix: 4 calls × 3 m3 accounts = 12
+  `stream exhausted` errors per turn. After: 1
+  `stream exhausted` + 3 clean `all accounts are rate-limited`
+  responses (one per remaining call). The cooldown persists
+  across hermes's call boundary, so the 2nd-4th calls hit
+  the early "no eligible entries" path without iterating
+  the pool.
+
 #### 92e71bb — server-side broken-model detection
 - **Bug.** When the upstream returns <200 chars of content
   with no tool_call while the caller supplied tool definitions,
