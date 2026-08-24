@@ -207,31 +207,53 @@ class SophiaPool:
         if self._pool is None:
             return
         hidden = self._config.hidden_models
-        if not hidden:
-            return
+        auto = self._config.auto_models
         all_models = {e.model.name for e in self._pool._entries}
-        filtered = sorted(all_models & hidden)
-        if filtered:
-            logma.info(
-                f"[SophiaPool] hidden_models={sorted(hidden)} — "
-                f"filtered out of _entries: {filtered}"
-            )
+        if hidden:
+            filtered = sorted(all_models & hidden)
+            if filtered:
+                logma.info(
+                    f"[SophiaPool] hidden_models={sorted(hidden)} — "
+                    f"filtered out of _entries: {filtered}"
+                )
+        if auto:
+            # Validate: every auto_model id should be a registered
+            # entry, otherwise the operator misconfigured something
+            # and `sophia-auto` will fail with "no eligible entries".
+            missing = sorted(auto - all_models)
+            available_in_auto = sorted(auto & all_models)
+            if missing:
+                logma.warning(
+                    f"[SophiaPool] auto_models={sorted(auto)} — "
+                    f"NOT registered: {missing} (sophia-auto will have no "
+                    f"eligible entries!)"
+                )
+            if available_in_auto:
+                logma.info(
+                    f"[SophiaPool] auto_models={available_in_auto} — "
+                    f"sophia-auto will rotate only across this set"
+                )
 
-    def _filtered_entries(self):
+    def _filtered_entries(self, for_auto: bool = False):
         """Return ``pool._entries`` with any operator-hidden models
-        removed.  The cached ``@lru_cache`` on ladyol's
+        removed.  If ``for_auto`` is True AND ``SOPHIA_AUTO_MODELS`` is
+        set, the list is FURTHER restricted to just the configured
+        auto-allowlist.  Returns an empty list if the pool hasn't been
+        constructed yet.
+
+        Note: the cached ``@lru_cache`` on ladyol's
         ``ProviderPool.available`` still operates on the unfiltered
-        list (we can't change ladyol's internals), so we wrap the
-        filter at every reader site that previously called
-        ``pool._entries`` directly.  Returns an empty list if the
-        pool hasn't been constructed yet (caller should re-check after
-        awaiting ``_ensure_pool``)."""
+        list (we can't change ladyol's internals), so this filter
+        happens at every reader site.
+        """
         if self._pool is None:
             return []
-        if not self._config.hidden_models:
-            return list(self._pool._entries)
         hidden = self._config.hidden_models
-        return [e for e in self._pool._entries if e.model.name not in hidden]
+        out = [e for e in self._pool._entries if e.model.name not in hidden]
+        if for_auto and self._config.auto_models:
+            allow = self._config.auto_models
+            out = [e for e in out if e.model.name in allow]
+        return out
 
     async def chat(
         self,
@@ -256,7 +278,13 @@ class SophiaPool:
         last_exc: Optional[Exception] = None
 
         for attempt in range(max_retries + 1):
-            available = [e for e in self._filtered_entries()
+            # When `model` is None the caller used `sophia-auto` and
+            # wants auto-routing.  Apply the SOPHIA_AUTO_MODELS
+            # allowlist filter in addition to the hidden filter so
+            # the operator's default-route constraint takes effect.
+            # When `model` is an explicit id, only the hidden filter
+            # applies — the caller is pinning a specific model.
+            available = [e for e in self._filtered_entries(for_auto=(model is None))
                          if id(e) not in excluded
                          and not self.cooldowns.is_paused(_account_of(e))]
             if model:
@@ -276,13 +304,28 @@ class SophiaPool:
             entry = available[0]
             if attempt == 0 and not model:
                 # Initial auto pick: ladyol's selector for strategy fidelity.
+                # We post-filter against the hidden_models set so the operator's
+                # `SOPHIA_HIDDEN_MODELS=minimax-m2.7` (etc.) actually excludes
+                # those models from auto-routing — without this, ladyol's
+                # selector returns an entry from its unfiltered pool and the
+                # filter is bypassed (verified 2026-08-24 via the
+                # auto-rotation-probe.py smoke test: 20/20 requests landed on
+                # minimax-m2.7 when only the visible-surface filter was in place).
                 try:
                     sel = pool._select_entry(model or "", strategy=strategy)
                     if sel is not None and id(sel) not in excluded \
-                            and not self.cooldowns.is_paused(_account_of(sel)):
+                            and not self.cooldowns.is_paused(_account_of(sel)) \
+                            and sel.model.name not in self._config.hidden_models:
                         entry = sel
                 except Exception:
                     pass  # fall back to available[0]
+            # Defensive belt-and-suspenders: even if the above lookup slipped
+            # through (e.g. ladyol changed its selector signature in a future
+            # version), never actually call the upstream with a hidden model.
+            if entry.model.name in self._config.hidden_models:
+                # Drop this entry from the available list and retry.
+                excluded.add(id(entry))
+                continue
 
             try:
                 client = pool._client_for(entry)
@@ -319,7 +362,12 @@ class SophiaPool:
         if last_exc is not None:
             raise last_exc
         # No entries were available at all.
-        active = [e for e in self._filtered_entries()
+        # Same filter as the rotation loop: when the caller used
+        # `sophia-auto`, the error message should reflect the
+        # SOPHIA_AUTO_MODELS-restricted pool, not the full unhidden
+        # pool (so the operator sees the real cause of "no eligible
+        # entries" without having to dig into logs).
+        active = [e for e in self._filtered_entries(for_auto=(model is None))
                   if not self.cooldowns.is_paused(_account_of(e))]
         if not active:
             raise RuntimeError(
@@ -401,7 +449,10 @@ class SophiaPool:
 
         for attempt in range(max_retries + 1):
             # Candidate selection, honoring this call's exclusions.
-            available = [e for e in self._filtered_entries()
+            # See chat() for the same for_auto logic — when the caller
+            # used `sophia-auto`, the SOPHIA_AUTO_MODELS allowlist
+            # applies on top of the hidden filter.
+            available = [e for e in self._filtered_entries(for_auto=(model is None))
                          if id(e) not in excluded
                          and not self.cooldowns.is_paused(_account_of(e))]
             if model:
@@ -420,11 +471,22 @@ class SophiaPool:
             if attempt == 0:
                 # Initial pick: use ladyol's own selector for strategy
                 # fidelity (round_robin / weighted / etc.).
+                # Post-filter against hidden_models so the operator's
+                # `SOPHIA_HIDDEN_MODELS=...` actually excludes the
+                # model from auto-routing. See the matching comment in
+                # chat() above for context.
                 try:
-                    entry = pool._select_entry(model or "", strategy=strategy)
+                    sel = pool._select_entry(model or "", strategy=strategy)
+                    if sel is not None and sel.model.name not in self._config.hidden_models:
+                        entry = sel
                 except Exception as exc:
                     last_exc = exc
                     break
+            # Defensive: never call upstream with a hidden model,
+            # even if the selector logic above slipped through.
+            if entry.model.name in self._config.hidden_models:
+                excluded.add(id(entry))
+                continue
 
             emitted = False
             err: Optional[Exception] = None

@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass, field
 from os.path import dirname, join
 from pathlib import Path
-from typing import FrozenSet, Optional, Set
+from typing import FrozenSet, Optional
 
 from kahndor import kahndor
 
@@ -30,18 +30,20 @@ except Exception:  # pragma: no cover — surfaces only if ladyol not installed
     _LADYOL_PROVIDERS_YAML = None
 
 
-def _parse_hidden_models(raw: Optional[str]) -> FrozenSet[str]:
-    """Parse `SOPHIA_HIDDEN_MODELS` (comma-separated) into a frozen set.
+def _parse_id_list(raw: Optional[str]) -> FrozenSet[str]:
+    """Parse a comma-separated env-var value into a frozen set of ids.
 
-    Used to exclude specific model IDs from `/v1/models` and from
-    every routing decision in ``SophiaPool``.  Whitespace and empty
-    entries are ignored; comparison is exact-match on the model id
-    string (no glob/wildcard — the operator can re-add a model by
-    removing it from the env var).
+    Whitespace and empty entries are ignored.  Comparison is exact-match
+    on the id string (no glob/wildcard).
     """
     if not raw:
         return frozenset()
     return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
+# Backwards-compat shim: existing callers and tests use the old name.
+def _parse_hidden_models(raw: Optional[str]) -> FrozenSet[str]:
+    return _parse_id_list(raw)
 
 
 @dataclass(frozen=True)
@@ -51,9 +53,8 @@ class SophiaConfig:
     log_level: str
     provider_pool_path: str
     # Model ids that must NEVER appear in `/v1/models` and must NEVER
-    # be picked by ``sophia-auto`` or accepted when a client passes
-    # `model: "<id>"` explicitly.  Sourced from the SOPHIA_HIDDEN_MODELS
-    # env var (comma-separated); set in `docker run -e ...`.
+    # be picked by any routing path.  Sourced from the
+    # `SOPHIA_HIDDEN_MODELS` env var (comma-separated).
     #
     # We can't filter at the agent.yaml layer because ladyol loads
     # the bundled `providers.yaml` first (which has e.g.
@@ -62,6 +63,18 @@ class SophiaConfig:
     # that already exists in the bundled defaults, so we filter at
     # the application boundary instead.
     hidden_models: FrozenSet[str] = field(default_factory=frozenset)
+    # Model ids that `sophia-auto` (the routing pseudo-model) is
+    # allowed to pick from.  When set, the auto-rotation pool is
+    # EXACTLY this set (intersected with the unhidden, registered
+    # pool entries) — `sophia-auto` never lands on a model not in
+    # the allowlist.  When unset, all unhidden models are eligible
+    # and the strategy (e.g. `best_available`) decides among them.
+    #
+    # Operators set this to constrain the default route to a small
+    # set of known-good models while keeping the full set visible
+    # via `/v1/models` for explicit pinning.  Sourced from the
+    # `SOPHIA_AUTO_MODELS` env var (comma-separated).
+    auto_models: FrozenSet[str] = field(default_factory=frozenset)
 
 
 def load_config(path: Optional[str] = None) -> SophiaConfig:
@@ -89,5 +102,6 @@ def load_config(path: Optional[str] = None) -> SophiaConfig:
         port=int(server.get("port", 8765)),
         log_level=str(logging_cfg.get("level", "INFO")).upper(),
         provider_pool_path=provider_pool_path,
-        hidden_models=_parse_hidden_models(os.environ.get("SOPHIA_HIDDEN_MODELS")),
+        hidden_models=_parse_id_list(os.environ.get("SOPHIA_HIDDEN_MODELS")),
+        auto_models=_parse_id_list(os.environ.get("SOPHIA_AUTO_MODELS")),
     )

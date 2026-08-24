@@ -166,3 +166,99 @@ def test_list_models_empty_config_returns_everything():
     out = asyncio.run(pool.list_models())
     ids = {m.id for m in out if m.id != "sophia-auto"}
     assert ids == {"minimax-m2.7", "minimax-m3"}
+
+
+# ── SOPHIA_AUTO_MODELS allowlist ───────────────────────────────────────
+
+
+def test_filtered_entries_auto_with_no_allowlist_returns_all_unhidden():
+    """When `auto_models` is empty, `for_auto=True` is equivalent to
+    `for_auto=False` (no additional constraint)."""
+    from sophia.pool import SophiaPool
+    pool = SophiaPool.__new__(SophiaPool)
+    pool._config = SophiaConfig(
+        host="0", port=0, log_level="INFO", provider_pool_path="",
+        hidden_models=frozenset({"minimax-m2.7"}),
+        auto_models=frozenset(),  # explicit empty
+    )
+    pool._pool = _FakePool([
+        _FakeEntry("minimax-m2.7"),
+        _FakeEntry("minimax-m3"),
+        _FakeEntry("grok-2"),
+    ])
+    auto_only = pool._filtered_entries(for_auto=True)
+    unconstrained = pool._filtered_entries(for_auto=False)
+    assert {e.model.name for e in auto_only} == {e.model.name for e in unconstrained}
+    assert {e.model.name for e in auto_only} == {"minimax-m3", "grok-2"}
+
+
+def test_filtered_entries_auto_allowlist_intersects_pool():
+    """When `auto_models` is set, `for_auto=True` restricts to the
+    intersection of the allowlist and the registered (unhidden) pool."""
+    from sophia.pool import SophiaPool
+    pool = SophiaPool.__new__(SophiaPool)
+    pool._config = SophiaConfig(
+        host="0", port=0, log_level="INFO", provider_pool_path="",
+        auto_models=frozenset({"minimax-m3", "glm-5.2"}),  # allowlist
+    )
+    pool._pool = _FakePool([
+        _FakeEntry("minimax-m2.7"),  # not in allowlist — excluded
+        _FakeEntry("minimax-m3"),    # in allowlist — included
+        _FakeEntry("glm-5.2"),       # in allowlist — included
+        _FakeEntry("glm-4.7"),       # not in allowlist — excluded
+        _FakeEntry("grok-2"),        # not in allowlist — excluded
+    ])
+    auto = pool._filtered_entries(for_auto=True)
+    assert {e.model.name for e in auto} == {"minimax-m3", "glm-5.2"}
+
+
+def test_filtered_entries_auto_allowlist_keeps_explicit_unaffected():
+    """When the caller pins an explicit model (`for_auto=False`),
+    the allowlist is NOT applied — the operator's `/v1/models` list
+    is unaffected and the caller can still pin a model that isn't
+    in the auto-allowlist."""
+    from sophia.pool import SophiaPool
+    pool = SophiaPool.__new__(SophiaPool)
+    pool._config = SophiaConfig(
+        host="0", port=0, log_level="INFO", provider_pool_path="",
+        auto_models=frozenset({"minimax-m3", "glm-5.2"}),
+    )
+    pool._pool = _FakePool([
+        _FakeEntry("minimax-m3"),
+        _FakeEntry("glm-5.2"),
+        _FakeEntry("grok-2"),  # in pool, NOT in allowlist
+    ])
+    unconstrained = pool._filtered_entries(for_auto=False)
+    assert {e.model.name for e in unconstrained} == {"minimax-m3", "glm-5.2", "grok-2"}
+
+
+def test_filtered_entries_auto_allowlist_intersects_with_hidden():
+    """A model in BOTH the hidden set AND the auto-allowlist is
+    dropped (hidden takes precedence — you can't auto-route to
+    something the operator explicitly hid)."""
+    from sophia.pool import SophiaPool
+    pool = SophiaPool.__new__(SophiaPool)
+    pool._config = SophiaConfig(
+        host="0", port=0, log_level="INFO", provider_pool_path="",
+        hidden_models=frozenset({"minimax-m2.7"}),
+        auto_models=frozenset({"minimax-m2.7", "minimax-m3"}),  # m2.7 in both
+    )
+    pool._pool = _FakePool([_FakeEntry("minimax-m2.7"), _FakeEntry("minimax-m3")])
+    auto = pool._filtered_entries(for_auto=True)
+    assert {e.model.name for e in auto} == {"minimax-m3"}
+
+
+# ── env-var-driven config ──────────────────────────────────────────────
+
+
+def test_load_config_picks_up_auto_models_env(monkeypatch):
+    """SOPHIA_AUTO_MODELS env var must populate config.auto_models."""
+    monkeypatch.setenv("SOPHIA_AUTO_MODELS", "minimax-m3, glm-5.2")
+    cfg = load_config()
+    assert cfg.auto_models == frozenset({"minimax-m3", "glm-5.2"})
+
+
+def test_load_config_auto_models_default_empty(monkeypatch):
+    monkeypatch.delenv("SOPHIA_AUTO_MODELS", raising=False)
+    cfg = load_config()
+    assert cfg.auto_models == frozenset()
