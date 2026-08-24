@@ -10,6 +10,7 @@ response is written to the capture store (see :mod:`sophia.captures`).
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import AsyncIterator, Optional
 
@@ -147,6 +148,17 @@ def create_app(config=None) -> FastAPI:
 
         strategy = req.strategy or "random"
         temperature = req.temperature if req.temperature is not None else 0.7
+        # Forward max_tokens from the caller's request.  Sophia used
+        # to drop this on the floor, which forced the upstream to
+        # pick its own default — and that default is small enough
+        # that tool_use responses get truncated to a thinking-block
+        # fragment.  When the caller doesn't specify, default to
+        # 4096 so the upstream has room for both the thinking block
+        # AND a structured tool_call.  Operators can override this
+        # via SOPHIA_DEFAULT_MAX_TOKENS if their model needs more.
+        max_tokens = req.max_tokens if req.max_tokens is not None else int(
+            os.environ.get("SOPHIA_DEFAULT_MAX_TOKENS", "4096")
+        )
         model = (
             None
             if req.model in ("auto", "sophia-auto", "")
@@ -163,6 +175,7 @@ def create_app(config=None) -> FastAPI:
                     async for chunk in pool.stream(
                         prompt=prompt, sprompt=sprompt, temperature=temperature,
                         strategy=strategy, model=model,
+                        max_tokens=max_tokens,
                         tools=req.tools,  # forward caller's tool defs to upstream
                     ):
                         chunks.append(chunk)
@@ -256,6 +269,7 @@ def create_app(config=None) -> FastAPI:
             content, provider_meta = await pool.chat_with_meta(
                 prompt=prompt, sprompt=sprompt, temperature=temperature,
                 strategy=strategy, model=model,
+                max_tokens=max_tokens,
                 tools=req.tools,  # forward caller's tool defs to upstream
             )
         except Exception as e:

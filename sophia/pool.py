@@ -263,6 +263,7 @@ class SophiaPool:
         strategy: str = "random",
         model: Optional[str] = None,
         max_retries: int = 3,
+        max_tokens: Optional[int] = None,
         tools: Optional[list] = None,
     ) -> str:
         """Chat with per-ACCOUNT 429 cooldowns + cross-account rotation.
@@ -335,6 +336,7 @@ class SophiaPool:
                     model=entry.model.name,
                     system=sprompt or "You are a helpful assistant.",
                     temperature=temperature,
+                    max_tokens=max_tokens,
                     tools=tools,
                 )
                 # Stash meta the same way ladyol.chat does, so
@@ -431,6 +433,7 @@ class SophiaPool:
         temperature: float = 0.7,
         strategy: str = "random",
         model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
         tools: Optional[list] = None,
     ) -> tuple[str, dict]:
         """Like ``chat`` but also returns a meta dict so callers can
@@ -455,7 +458,7 @@ class SophiaPool:
         pool = await self._ensure_pool()
         text = await self.chat(
             prompt=prompt, sprompt=sprompt, temperature=temperature,
-            strategy=strategy, model=model, tools=tools,
+            strategy=strategy, model=model, max_tokens=max_tokens, tools=tools,
         )
         meta: dict = {}
         # Try to read whatever the pool stashed about the last call.
@@ -489,6 +492,7 @@ class SophiaPool:
         strategy: str = "random",
         model: Optional[str] = None,
         max_retries: int = 3,
+        max_tokens: Optional[int] = None,
         tools: Optional[list] = None,
     ) -> AsyncIterator[str]:
         """Yield plain text chunks, translating ladyol's event dicts.
@@ -564,6 +568,7 @@ class SophiaPool:
                 async for chunk in client.stream(entry.model.name, messages,
                                                  strategy=strategy,
                                                  temperature=temperature,
+                                                 max_tokens=max_tokens,
                                                  tools=tools):
                     if isinstance(chunk, dict):
                         ctype = chunk.get("type")

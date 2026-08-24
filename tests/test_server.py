@@ -29,15 +29,15 @@ class FakePoolShim:
         self._models = []
     async def list_models(self):
         return self._models
-    async def chat(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None, tools=None):
-        self.chat_calls.append({"prompt": prompt, "sprompt": sprompt, "temperature": temperature, "strategy": strategy, "model": model, "tools": tools})
+    async def chat(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None, max_tokens=None, tools=None):
+        self.chat_calls.append({"prompt": prompt, "sprompt": sprompt, "temperature": temperature, "strategy": strategy, "model": model, "max_tokens": max_tokens, "tools": tools})
         return f"echo[{strategy}]: {prompt}"
-    async def chat_with_meta(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None, tools=None):
-        self.chat_calls.append({"prompt": prompt, "sprompt": sprompt, "temperature": temperature, "strategy": strategy, "model": model, "tools": tools})
+    async def chat_with_meta(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None, max_tokens=None, tools=None):
+        self.chat_calls.append({"prompt": prompt, "sprompt": sprompt, "temperature": temperature, "strategy": strategy, "model": model, "max_tokens": max_tokens, "tools": tools})
         return (f"echo[{strategy}]: {prompt}",
                 {"provider_name": "anthropic_alice",
                  "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
-    async def stream(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None, tools=None):
+    async def stream(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None, max_tokens=None, tools=None):
         async def gen():
             for chunk in ["a", "b", "c"]:
                 yield chunk
