@@ -278,8 +278,14 @@ def create_app(config=None) -> FastAPI:
         # structured OpenAI `tool_calls` array. Pull any leaked
         # `[TOOL_CALL]…[/TOOL_CALL]` blocks into a real `tool_calls`
         # entry so hermes runs the tool loop normally instead of
-        # forwarding the markup to chat.
+        # forwarding the markup to chat.  The streaming path does the
+        # same and additionally flips the final `finish_reason` from
+        # `"stop"` to `"tool_calls"`; the non-streaming path needs the
+        # same flip on `Choice.finish_reason` so hermes' downstream
+        # routing (which keys off finish_reason) treats this as a
+        # tool-call turn rather than a plain reply.
         leaked_tool_calls, cleaned_content = extract_leaked_tool_calls(content or "")
+        non_streaming_finish_reason = "tool_calls" if leaked_tool_calls else "stop"
         resp = ChatCompletionResponse(
             id=completion_id, created=now_ts(),
             # Report the ACTUAL backend model when auto-routing (the
@@ -288,6 +294,7 @@ def create_app(config=None) -> FastAPI:
             model=(provider_meta or {}).get("model") or req.model,
             choices=[Choice(
                 index=0,
+                finish_reason=non_streaming_finish_reason,
                 message=Message(
                     role="assistant",
                     content=cleaned_content or None,
