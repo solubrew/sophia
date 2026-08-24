@@ -137,6 +137,22 @@ All notable changes to Sophia are documented here.
   reasoning. (Some remaining `minimax-m3` quirks around
   reasoning-mode + tool emission are upstream-model behavior,
   not on the sophia side; the wire is now correct.)
+- **Follow-up needed on the hermes side.** With tools being
+  forwarded, the symptom changed from "model emits `[TOOL_CALL]`
+  as text" to "model emits `<think>...</think>` and stops with
+  no tool_call". The hermes core has two knobs that catch this
+  class of bug (`tool_use_enforcement`, `intent_ack_continuation`)
+  but they're gated to the codex_responses api_mode. The arthr
+  profile now sets both knobs explicitly for the LAN routing
+  targets so hermes applies the nudge to minimax-m3 / glm-5.2.
+  See `~/.hermes/profiles/arthr/config.yaml`. **However**: the
+  upstream m3 endpoint is hard-capping response size to ~935
+  bytes per turn (verified at 2026-08-24 13:14 via
+  `docker logs ... | grep resp_bytes`); even with 2 nudges the
+  model can't emit a tool_call. The practical next step is
+  to wait for zai's weekly quota to reset (2026-08-28 04:43
+  EDT) and switch the auto-allowlist to `glm-5.2` only, which
+  does produce real tool_calls through this gateway.
 
 #### ba397bc — server-side model filter via `SOPHIA_HIDDEN_MODELS` env
 - **Why not just `enabled: false` in `agent.yaml`?** ladyol
