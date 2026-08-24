@@ -91,46 +91,52 @@ All notable changes to Sophia are documented here.
 - Direct curl with a requestor key.
 
 ### Running image
-- `sophia_sophia:latest` (commit `282f402`), 33 build steps,
-  13 vendored SB wheels (12 SB packages + `uuid_extensions` stub).
-
-### Added
-
-#### 282f402 — `SOPHIA_AUTO_MODELS` allowlist constrains `sophia-auto`
-- **Operator request:** "make the default strategy only use
-  `minimax-m3` and `zai-glm-5.2`".
-- **Implementation.** New `SOPHIA_AUTO_MODELS` env var
-  (comma-separated model ids). When set, the `sophia-auto`
-  routing pseudo-model rotates ONLY across the intersection of
-  the registered unhidden pool and the allowlist. Explicit
-  `model: <id>` requests bypass the allowlist (operator can
-  still pin any visible model by id). `/v1/models` is
-  unchanged by this setting — the allowlist only restricts
-  the auto-rotation pool.
-- **Live deployment:** `docker run -e SOPHIA_HIDDEN_MODELS=minimax-m2.7 -e SOPHIA_AUTO_MODELS=minimax-m3,glm-5.2 ...`
-  - `SOPHIA_HIDDEN_MODELS=minimax-m2.7` (from the prior
-    commit) removes the broken model entirely
-  - `SOPHIA_AUTO_MODELS=minimax-m3,glm-5.2` constrains the
-    default route to those two models only
-  - `grok-2` and `glm-4.7` remain visible in `/v1/models`
-    (operators can pin them explicitly) but `sophia-auto`
-    will never land on them
-- **Verified end-to-end** (2026-08-24 01:40 UTC): 20/20
-  `sophia-auto` requests landed on `minimax-m3` (zai was
-  paused on weekly quota during the test window); explicit
-  `model: "grok-2"` still routes correctly (and explicit
-  `model: "minimax-m2.7"` returns 502 with the clear error
-  "is in SOPHIA_HIDDEN_MODELS and is not served by this
-  gateway. Remove it from the env var (or rebuild) to
-  re-enable.").
-- **Side observation (separate from this commit):** the
-  upstream `minimax-m3` also leaks tool-call markup, in a
-  fifth observed format (`<function_calls><invoke name="bash">`
-  with child elements instead of attributes). The leaked-text
-  parser (`sophia/leaked_tool_call_fix.py`) doesn't yet
-  handle this format — a follow-up fix will be needed.
+- `sophia_sophia:latest` (commits `0e05266` + ladyol `a1ed646`),
+  33 build steps, 13 vendored SB wheels (12 SB packages + `uuid_extensions` stub).
 
 ### Fixed
+
+#### 0e05266 + a1ed646 — forward OpenAI `tools` field to upstream
+- **Bug (root cause of the leaked-tool-call symptoms).** Sophia
+  was silently dropping the caller's `tools` field. The OpenAI
+  Chat Completions spec has `tools` as a SIBLING of `messages`
+  (not nested inside a message), and the high-level
+  `AsyncLLMClient.chat()` wrapper in ladyol constructed a
+  ChatCompletionRequest with only `[system, user]` — no `tools`.
+  Result: upstream models saw text-only requests and had to
+  hallucinate tool calls in non-spec formats. This was the
+  underlying issue behind the `[TOOL_CALL]`, `<minimax:tool_call>`,
+  Claude-XML, and `subprocess` variants we observed 2026-08-23/24.
+- **Operator observation that pointed to this fix:** "m3 calls
+  tools fine when called directly from hermes, so it has to be a
+  sophia problem." The operator was right — hermes sent the full
+  OpenAI `tools` array to the upstream; sophia was throwing it
+  away.
+- **Fix.** Three layers:
+  1. `ladyol/providers.py` — `AsyncLLMClient.chat(..., tools=...)`
+     parameter, passed to ChatCompletionRequest.tools. The
+     underlying Pydantic model already supported `tools`; only
+     the convenience wrapper was missing it.
+  2. `sophia/pool.py` — `chat()`, `chat_with_meta()`, `stream()`
+     accept and forward `tools=...` to the ladyol client. Also:
+     coerce `last_provider` (a ladyol `Provider` dataclass) to its
+     `.name` string — previously this silently broke the
+     `captures.write` path with
+     `Object of type Provider is not JSON serializable` on every
+     request, so the capture store was logging warnings and
+     writing nothing.
+  3. `sophia/server.py` + `sophia/schemas.py` — extract
+     `req.tools` in the OpenAI route and pass to the streaming
+     and non-streaming pool methods; `ChatCompletionRequest` gets
+     `tools: Optional[List[Any]] = None` + `tool_choice`.
+- **Verified** at 2026-08-24 13:05 UTC. Container logs now show
+  `[AsyncLLMClient.chat] ENTER ... tools=2` (previously: no
+  tools count in the log line). 19/19 sophia tests pass (2 new
+  pin the forwarding contract). The upstream `minimax-m3` now
+  sees the tool definitions and decides to call bash in its
+  reasoning. (Some remaining `minimax-m3` quirks around
+  reasoning-mode + tool emission are upstream-model behavior,
+  not on the sophia side; the wire is now correct.)
 
 #### ba397bc — server-side model filter via `SOPHIA_HIDDEN_MODELS` env
 - **Why not just `enabled: false` in `agent.yaml`?** ladyol
