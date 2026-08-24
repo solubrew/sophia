@@ -91,8 +91,48 @@ All notable changes to Sophia are documented here.
 - Direct curl with a requestor key.
 
 ### Running image
-- `sophia_sophia:latest` (commit `4407527`), 33 build steps,
+- `sophia_sophia:latest` (commit `4e4a9b3`), 33 build steps,
   13 vendored SB wheels (12 SB packages + `uuid_extensions` stub).
+
+### Fixed
+
+#### 4e4a9b3 — recover leaked tool-call markup into real `tool_calls`
+- **Bug.** Upstream models (notably `minimax-m2.7` via the sophia
+  LAN gateway) emit tool-call markup as plain text in the assistant's
+  `content` field instead of using the OpenAI `tool_calls` array.
+  Three observed variants (same endpoint, same model, three
+  consecutive turns):
+  - Block syntax: `[TOOL_CALL] {tool => "x", args => {...}} [/TOOL_CALL]`
+  - Angle-bracket: `<minimax:tool_call><skill_view name="x"/></skill_view></minimax:tool_call>`
+  - Claude-style XML: `<minimax:tool_call><invoke name="bash"><parameter name="command">x</parameter></invoke></minimax:tool_call>`
+- **Symptom.** hermes' display layer wraps the markup in a box,
+  making it *look* like a tool call — but the underlying data is
+  plain content, so the tool loop never runs and the raw markup
+  lands in chat. Reproduced live on 2026-08-23 23:43 with the
+  arthr hermes profile: every Telegram message got 4 duplicate
+  replies, all containing literal `[TOOL_CALL]…[/TOOL_CALL]` text.
+- **Fix.** `sophia/leaked_tool_call_fix.py` (new module, 18 unit
+  tests) parses the leaked markup server-side and synthesizes a
+  real `tool_calls` array entry. The non-streaming path rewrites
+  `choices[0].message`; the streaming path emits `delta.tool_calls`
+  chunks and flips the final `finish_reason` from `"stop"` to
+  `"tool_calls"` (the OpenAI spec value for a turn ending with tool
+  calls pending execution). Structural parser handles all three
+  observed variants without per-variant pattern matching.
+- **Verified end-to-end** on the live arthr hermes CLI session at
+  2026-08-24 00:34: assistant message has `tool_calls` non-null
+  with `finish_reason="tool_calls"`; the actual `skill_view` tool
+  executed and its result (`42,526` chars of skill body) was
+  recorded.  `state.db` message_count went 2 (just text) → 4 (real
+  tool loop with the user prompt, assistant tool call, tool
+  result, final assistant reply).
+- **Why sophia and not hermes.** The hermes core has an analogous
+  guard for the Codex Responses transport
+  (`agent/codex_responses_adapter.py:_TOOL_CALL_LEAK_PATTERN`)
+  but no equivalent for chat-completions. Doing the fix in sophia
+  keeps the leak contained to code we own and avoids forking
+  hermes-agent. Hermes sees a normal OpenAI response and runs the
+  tool loop normally — no client-side change required.
 
 ---
 
