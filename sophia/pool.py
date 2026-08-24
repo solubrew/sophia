@@ -186,7 +186,52 @@ class SophiaPool:
                     )
                     self._pool.providers = self._pool.config.get("providers")
                     self._pool._initialize_pool()
+                    # Apply the operator's hidden_models filter at the
+                    # application boundary.  ladyol's bundled
+                    # `providers.yaml` registers every model with
+                    # `enabled: true` and merges our override on top
+                    # without removing models that already exist in
+                    # the bundled defaults, so the only reliable way
+                    # to hide a model is to filter `_entries` after
+                    # construction.  The filter is applied lazily on
+                    # every read; the underlying `_entries` list is
+                    # never mutated (in case ladyol re-uses it for
+                    # internal logic).
+                    self._log_hidden_filter()
         return self._pool
+
+    def _log_hidden_filter(self) -> None:
+        """One-shot log line documenting which models were hidden at
+        pool init.  Helps the operator see at a glance whether their
+        ``SOPHIA_HIDDEN_MODELS`` env var took effect."""
+        if self._pool is None:
+            return
+        hidden = self._config.hidden_models
+        if not hidden:
+            return
+        all_models = {e.model.name for e in self._pool._entries}
+        filtered = sorted(all_models & hidden)
+        if filtered:
+            logma.info(
+                f"[SophiaPool] hidden_models={sorted(hidden)} — "
+                f"filtered out of _entries: {filtered}"
+            )
+
+    def _filtered_entries(self):
+        """Return ``pool._entries`` with any operator-hidden models
+        removed.  The cached ``@lru_cache`` on ladyol's
+        ``ProviderPool.available`` still operates on the unfiltered
+        list (we can't change ladyol's internals), so we wrap the
+        filter at every reader site that previously called
+        ``pool._entries`` directly.  Returns an empty list if the
+        pool hasn't been constructed yet (caller should re-check after
+        awaiting ``_ensure_pool``)."""
+        if self._pool is None:
+            return []
+        if not self._config.hidden_models:
+            return list(self._pool._entries)
+        hidden = self._config.hidden_models
+        return [e for e in self._pool._entries if e.model.name not in hidden]
 
     async def chat(
         self,
@@ -211,12 +256,22 @@ class SophiaPool:
         last_exc: Optional[Exception] = None
 
         for attempt in range(max_retries + 1):
-            available = [e for e in pool._entries
+            available = [e for e in self._filtered_entries()
                          if id(e) not in excluded
                          and not self.cooldowns.is_paused(_account_of(e))]
             if model:
                 available = [e for e in available if e.model.name == model]
             if not available:
+                # If the caller asked for an explicit model that's in
+                # SOPHIA_HIDDEN_MODELS, raise a clearer error than the
+                # generic "stream exhausted" — helps the operator see
+                # that the config, not the upstream, is the gate.
+                if model and model in self._config.hidden_models:
+                    raise ValueError(
+                        f"model={model!r} is in SOPHIA_HIDDEN_MODELS and is "
+                        f"not served by this gateway. Remove it from the env "
+                        f"var (or rebuild) to re-enable."
+                    )
                 break
             entry = available[0]
             if attempt == 0 and not model:
@@ -264,7 +319,7 @@ class SophiaPool:
         if last_exc is not None:
             raise last_exc
         # No entries were available at all.
-        active = [e for e in pool._entries
+        active = [e for e in self._filtered_entries()
                   if not self.cooldowns.is_paused(_account_of(e))]
         if not active:
             raise RuntimeError(
@@ -346,12 +401,20 @@ class SophiaPool:
 
         for attempt in range(max_retries + 1):
             # Candidate selection, honoring this call's exclusions.
-            available = [e for e in pool._entries
+            available = [e for e in self._filtered_entries()
                          if id(e) not in excluded
                          and not self.cooldowns.is_paused(_account_of(e))]
             if model:
                 available = [e for e in available if e.model.name == model]
             if not available:
+                # Same clear-error as the chat() path: a hidden
+                # model id is a config error, not a network error.
+                if model and model in self._config.hidden_models:
+                    raise ValueError(
+                        f"model={model!r} is in SOPHIA_HIDDEN_MODELS and is "
+                        f"not served by this gateway. Remove it from the env "
+                        f"var (or rebuild) to re-enable."
+                    )
                 break
             entry = available[0]
             if attempt == 0:
@@ -435,8 +498,16 @@ class SophiaPool:
         # actual provider/model/account serves each request (rotation
         # strategy). The concrete models follow for explicit selection.
         out.append(ModelCard(id="sophia-auto", owned_by="sophia"))
+        hidden = self._config.hidden_models
         for provider, models in available.items():
             for m in models:
+                # SOPHIA_HIDDEN_MODELS filter — same set the routing
+                # layer uses.  Operators set this to retire a model
+                # (e.g. `SOPHIA_HIDDEN_MODELS=minimax-m2.7` removes it
+                # from /v1/models AND from the chat/stream rotation
+                # pool).  See SophiaPool._filtered_entries.
+                if m in hidden:
+                    continue
                 out.append(ModelCard(id=m, owned_by=provider))
         return out
 

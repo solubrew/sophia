@@ -50,6 +50,17 @@ ProviderPool:
           costs_per_1k_input: 0.0004
           costs_per_1k_output: 0.0012
 
+    # Note: `enabled: false` in this file does NOT prevent
+    # `minimax-m2.7` from being registered in the pool — ladyol
+    # loads the bundled `providers.yaml` first (which has m2.7
+    # enabled), then merges this override on top. The `enabled`
+    # flag is honored at entry-creation time only when the model
+    # is FIRST seen in the merged config; m2.7 already exists in
+    # the bundled defaults, so the override can't remove it. The
+    # actual hide happens server-side in
+    # `sophia.pool.SophiaPool._ensure_pool` via the `SOPHIA_HIDDEN_MODELS`
+    # env var (see `sophia/pool.py`).
+
     zai:
       enabled: True
       display_name: "zai"
