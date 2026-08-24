@@ -29,15 +29,15 @@ class FakePoolShim:
         self._models = []
     async def list_models(self):
         return self._models
-    async def chat(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None):
-        self.chat_calls.append({"prompt": prompt, "sprompt": sprompt, "temperature": temperature, "strategy": strategy, "model": model})
+    async def chat(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None, tools=None):
+        self.chat_calls.append({"prompt": prompt, "sprompt": sprompt, "temperature": temperature, "strategy": strategy, "model": model, "tools": tools})
         return f"echo[{strategy}]: {prompt}"
-    async def chat_with_meta(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None):
-        self.chat_calls.append({"prompt": prompt, "sprompt": sprompt, "temperature": temperature, "strategy": strategy, "model": model})
+    async def chat_with_meta(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None, tools=None):
+        self.chat_calls.append({"prompt": prompt, "sprompt": sprompt, "temperature": temperature, "strategy": strategy, "model": model, "tools": tools})
         return (f"echo[{strategy}]: {prompt}",
                 {"provider_name": "anthropic_alice",
                  "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
-    async def stream(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None):
+    async def stream(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None, tools=None):
         async def gen():
             for chunk in ["a", "b", "c"]:
                 yield chunk
@@ -152,6 +152,56 @@ async def test_chat_completions_concrete_model_passes_through(client, bearer, fa
     assert r.status_code == 200, r.text
     call = fake_pool.chat_calls[0]
     assert call["model"] == "anthropic/claude-sonnet-4.5"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_forwards_tools_to_pool(client, bearer, fake_pool):
+    """The `tools` field from the OpenAI request body must be forwarded
+    to the upstream pool.  Prior to 2026-08-24 (commit af7e8b2), sophia
+    silently dropped the caller's `tools` field, so the upstream never
+    saw tool definitions and had to hallucinate tool calls in non-spec
+    formats.  This test pins the forwarding contract."""
+    tools = [
+        {"type": "function",
+         "function": {"name": "bash", "description": "run a command",
+                      "parameters": {"type": "object",
+                                     "properties": {"cmd": {"type": "string"}},
+                                     "required": ["cmd"]}}},
+        {"type": "function",
+         "function": {"name": "read", "description": "read a file",
+                      "parameters": {"type": "object",
+                                     "properties": {"path": {"type": "string"}},
+                                     "required": ["path"]}}},
+    ]
+    r = await client.post(
+        "/v1/chat/completions",
+        headers=bearer,
+        json={"model": "minimax-m3",
+              "messages": [{"role": "user", "content": "list /tmp"}],
+              "tools": tools},
+    )
+    assert r.status_code == 200, r.text
+    call = fake_pool.chat_calls[0]
+    assert call["tools"] == tools
+    # And the tools field is the SAME list, not a copy with mutations
+    assert call["tools"][0]["function"]["name"] == "bash"
+    assert call["tools"][1]["function"]["name"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_no_tools_means_none_forwarded(client, bearer, fake_pool):
+    """When the caller omits `tools`, the pool must receive `tools=None`
+    (so the upstream client can distinguish 'no tools requested' from
+    'tools=[]' which is a degenerate spec the upstream might reject)."""
+    r = await client.post(
+        "/v1/chat/completions",
+        headers=bearer,
+        json={"model": "minimax-m3",
+              "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200, r.text
+    call = fake_pool.chat_calls[0]
+    assert call["tools"] is None
 
 
 @pytest.mark.asyncio

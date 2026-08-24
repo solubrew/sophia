@@ -39,6 +39,14 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
     user: Optional[str] = None
+    # OpenAI tool definitions.  Forwarded to the upstream so the model
+    # sees which tools it can call (and what their argument schemas
+    # are).  Prior to this field being added (2026-08-24), sophia
+    # silently dropped the caller's `tools` field, so upstream models
+    # saw text-only requests and hallucinated tool calls in non-spec
+    # formats.  See CHANGES.md af7e8b2.
+    tools: Optional[List[Any]] = None
+    tool_choice: Optional[Any] = None
     # Sophia extension — not part of OpenAI, ignored by stock clients.
     strategy: Optional[str] = None
 

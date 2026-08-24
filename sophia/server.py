@@ -163,6 +163,7 @@ def create_app(config=None) -> FastAPI:
                     async for chunk in pool.stream(
                         prompt=prompt, sprompt=sprompt, temperature=temperature,
                         strategy=strategy, model=model,
+                        tools=req.tools,  # forward caller's tool defs to upstream
                     ):
                         chunks.append(chunk)
                         if not chunk:
@@ -255,6 +256,7 @@ def create_app(config=None) -> FastAPI:
             content, provider_meta = await pool.chat_with_meta(
                 prompt=prompt, sprompt=sprompt, temperature=temperature,
                 strategy=strategy, model=model,
+                tools=req.tools,  # forward caller's tool defs to upstream
             )
         except Exception as e:
             logma.exception(f"[sophia] chat error: {e}")

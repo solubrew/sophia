@@ -263,6 +263,7 @@ class SophiaPool:
         strategy: str = "random",
         model: Optional[str] = None,
         max_retries: int = 3,
+        tools: Optional[list] = None,
     ) -> str:
         """Chat with per-ACCOUNT 429 cooldowns + cross-account rotation.
 
@@ -334,6 +335,7 @@ class SophiaPool:
                     model=entry.model.name,
                     system=sprompt or "You are a helpful assistant.",
                     temperature=temperature,
+                    tools=tools,
                 )
                 # Stash meta the same way ladyol.chat does, so
                 # chat_with_meta's getattr probing still works.
@@ -383,9 +385,17 @@ class SophiaPool:
         temperature: float = 0.7,
         strategy: str = "random",
         model: Optional[str] = None,
+        tools: Optional[list] = None,
     ) -> tuple[str, dict]:
         """Like ``chat`` but also returns a meta dict so callers can
         extract provider_name / usage / cost keys for accounting.
+
+        `tools` is the OpenAI-style tool-definition array forwarded
+        to the upstream.  Prior to this parameter being added (2026-08-24,
+        commit af7e8b2), the upstream never saw the caller's tool
+        definitions — the upstream was getting a text-only request
+        and was hallucinating tool calls in non-spec formats.  See
+        sophia CHANGES.md af7e8b2 for the full trail.
 
         Today ladyol's pool doesn't expose per-response metadata
         uniformly across providers, so we return a best-effort dict
@@ -399,19 +409,30 @@ class SophiaPool:
         pool = await self._ensure_pool()
         text = await self.chat(
             prompt=prompt, sprompt=sprompt, temperature=temperature,
-            strategy=strategy, model=model,
+            strategy=strategy, model=model, tools=tools,
         )
         meta: dict = {}
         # Try to read whatever the pool stashed about the last call.
         # Different ladyol versions expose different attrs — guard each.
+        # IMPORTANT: `last_provider` is a ladyol Provider dataclass
+        # (not JSON-serializable). Coerce to its `name` attr so the
+        # caller's capture path doesn't fail.  See CHANGES.md entry
+        # af7e8b2 for context — this was silently broken until
+        # 2026-08-24, when an operator debug session noticed every
+        # capture-write was failing with
+        # "Object of type Provider is not JSON serializable".
         for attr, key in (
             ("last_provider", "provider_name"),
             ("last_usage", "usage"),
             ("last_model", "model"),
         ):
             v = getattr(pool, attr, None)
-            if v is not None:
-                meta[key] = v
+            if v is None:
+                continue
+            if key == "provider_name" and not isinstance(v, str):
+                # Coerce Provider/dataclass to its display name
+                v = getattr(v, "name", str(v))
+            meta[key] = v
         return text, meta
 
     async def stream(
@@ -422,6 +443,7 @@ class SophiaPool:
         strategy: str = "random",
         model: Optional[str] = None,
         max_retries: int = 3,
+        tools: Optional[list] = None,
     ) -> AsyncIterator[str]:
         """Yield plain text chunks, translating ladyol's event dicts.
 
@@ -494,7 +516,8 @@ class SophiaPool:
                 client = pool._client_for(entry)
                 async for chunk in client.stream(entry.model.name, messages,
                                                  strategy=strategy,
-                                                 temperature=temperature):
+                                                 temperature=temperature,
+                                                 tools=tools):
                     if isinstance(chunk, dict):
                         ctype = chunk.get("type")
                         if ctype == "token":
