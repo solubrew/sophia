@@ -15,8 +15,12 @@ from pydantic import BaseModel, ConfigDict, Field
 class Message(BaseModel):
     model_config = ConfigDict(extra="allow")
     role: str
-    content: str
+    content: Optional[str] = None
     name: Optional[str] = None
+    # OpenAI tool-calls array. Synthesized on the server side when the
+    # upstream model emitted leaked tool-call markup as text — see
+    # sophia.leaked_tool_call_fix for the wire format.
+    tool_calls: Optional[List[Any]] = None
 
 
 class ChatCompletionRequest(BaseModel):

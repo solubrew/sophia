@@ -20,6 +20,7 @@ from kahndor.logma import Logma
 from sophia.captures import CaptureStore
 from sophia.config import load_config
 from sophia.keys import KeyStore
+from sophia.leaked_tool_call_fix import extract_leaked_tool_calls
 from sophia.pool import SophiaPool, new_completion_id, now_ts
 from sophia.schemas import (
     ChatCompletionRequest,
@@ -157,6 +158,7 @@ def create_app(config=None) -> FastAPI:
         if req.stream:
             async def event_source():
                 chunks: list[str] = []
+                leaked_tool_calls_emitted: list[dict] = []
                 try:
                     async for chunk in pool.stream(
                         prompt=prompt, sprompt=sprompt, temperature=temperature,
@@ -165,14 +167,36 @@ def create_app(config=None) -> FastAPI:
                         chunks.append(chunk)
                         if not chunk:
                             continue  # skip empty deltas
-                        payload = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": now_ts(),
-                            "model": req.model,
-                            "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(payload)}\n\n".encode("utf-8")
+                        # Some upstreams (notably minimax-m2.7) emit
+                        # tool-call markup as plain text. Strip leaked
+                        # blocks from this chunk's content and emit
+                        # synthesized `tool_calls` deltas so hermes runs
+                        # the tool loop normally — same recovery as the
+                        # non-streaming path.
+                        chunk_tcs, chunk_cleaned = extract_leaked_tool_calls(chunk)
+                        if chunk_tcs:
+                            leaked_tool_calls_emitted.extend(chunk_tcs)
+                            tc_payload = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": now_ts(),
+                                "model": req.model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"tool_calls": chunk_tcs},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            yield f"data: {json.dumps(tc_payload)}\n\n".encode("utf-8")
+                        if chunk_cleaned:
+                            payload = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": now_ts(),
+                                "model": req.model,
+                                "choices": [{"index": 0, "delta": {"content": chunk_cleaned}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(payload)}\n\n".encode("utf-8")
                     # OpenAI streaming contract: emit a final chunk carrying
                     # the actual finish_reason ("stop"/"length"/"tool_calls")
                     # with an empty delta before the [DONE] sentinel. Without
@@ -180,12 +204,17 @@ def create_app(config=None) -> FastAPI:
                     # SDK, Open WebUI) cannot distinguish a natural stop from
                     # a truncated stream and either re-prompt the model 4× or
                     # silently drop the turn.
+                    #
+                    # If any leaked tool_calls were extracted during the
+                    # stream, the spec value is "tool_calls" (not "stop") so
+                    # the client knows to execute them before replying.
+                    final_finish_reason = "tool_calls" if leaked_tool_calls_emitted else "stop"
                     stop_payload = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": now_ts(),
                         "model": req.model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": final_finish_reason}],
                     }
                     yield f"data: {json.dumps(stop_payload)}\n\n".encode("utf-8")
                     yield b"data: [DONE]\n\n"
@@ -244,13 +273,27 @@ def create_app(config=None) -> FastAPI:
                 provider_meta=provider_meta, in_usd=in_usd, out_usd=out_usd,
                 total_usd=total_usd)
 
+        # Some upstreams (notably minimax-m2.7 on the LAN gateway) emit
+        # tool-call markup as plain TEXT in `content` instead of using the
+        # structured OpenAI `tool_calls` array. Pull any leaked
+        # `[TOOL_CALL]…[/TOOL_CALL]` blocks into a real `tool_calls`
+        # entry so hermes runs the tool loop normally instead of
+        # forwarding the markup to chat.
+        leaked_tool_calls, cleaned_content = extract_leaked_tool_calls(content or "")
         resp = ChatCompletionResponse(
             id=completion_id, created=now_ts(),
             # Report the ACTUAL backend model when auto-routing (the
             # operator wants to see which provider/model/account served
             # the request); fall back to the requested id otherwise.
             model=(provider_meta or {}).get("model") or req.model,
-            choices=[Choice(index=0, message=Message(role="assistant", content=content or ""))],
+            choices=[Choice(
+                index=0,
+                message=Message(
+                    role="assistant",
+                    content=cleaned_content or None,
+                    tool_calls=leaked_tool_calls or None,
+                ),
+            )],
             usage=Usage(prompt_tokens=pt, completion_tokens=ct, total_tokens=pt + ct),
         )
         captured_path = None
