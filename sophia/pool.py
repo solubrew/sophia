@@ -364,6 +364,17 @@ class SophiaPool:
                 # from any tool-using model is much bigger; a 935-byte
                 # cap means real responses land well under 200 chars
                 # only when the model is truncated by the cap.
+                #
+                # **Also**: persist a short (60s) cooldown on the
+                # account so the next call from hermes (e.g. the
+                # intent-ack continuation nudge) skips it too.
+                # Without this, the broken-model detection fires
+                # once per call, but hermes makes 2-4 calls per turn
+                # and each one re-iterates the full pool — producing
+                # 6-12 "stream exhausted" errors per turn.  With the
+                # cooldown, the second and subsequent calls in the
+                # same window skip the broken account and hit a
+                # single clean 502 instead.
                 if (
                     model is None
                     and tools
@@ -371,13 +382,15 @@ class SophiaPool:
                 ):
                     excluded.add(id(entry))
                     acct = _account_of(entry)
+                    self.cooldowns.pause(acct, datetime.now(timezone.utc) + timedelta(seconds=60))
                     logma.warning(
                         f"[SophiaPool.chat] attempt {attempt + 1}: "
                         f"{acct}/{entry.model.name} returned "
                         f"{len(text or '')} chars with no tool_call; "
                         f"rotating to another model (the caller supplied "
                         f"{len(tools)} tool defs but this model "
-                        f"appears to be stuck in reasoning-only mode)"
+                        f"appears to be stuck in reasoning-only mode); "
+                        f"pausing {acct} for 60s to avoid retry-spam"
                     )
                     continue
                 return text
@@ -593,13 +606,21 @@ class SophiaPool:
                 and total_yielded < 200
             ):
                 excluded.add(id(entry))
+                acct = _account_of(entry)
+                # Persist a 60s cooldown on the broken account so
+                # the next call from hermes (e.g. an intent-ack
+                # continuation nudge) skips it too.  Without this,
+                # each hermes retry re-iterates the full pool and
+                # produces 6-12 "stream exhausted" errors per turn.
+                self.cooldowns.pause(acct, datetime.now(timezone.utc) + timedelta(seconds=60))
                 logma.warning(
                     f"[SophiaPool.stream] attempt {attempt + 1}: "
-                    f"{_account_of(entry)}/{entry.model.name} returned "
+                    f"{acct}/{entry.model.name} returned "
                     f"{total_yielded} chars with no tool_call; "
                     f"rotating to another model (caller supplied "
                     f"{len(tools)} tool defs but this model appears "
-                    f"stuck in reasoning-only mode)"
+                    f"stuck in reasoning-only mode); "
+                    f"pausing {acct} for 60s to avoid retry-spam"
                 )
                 continue
 
