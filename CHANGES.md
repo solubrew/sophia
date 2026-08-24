@@ -91,48 +91,89 @@ All notable changes to Sophia are documented here.
 - Direct curl with a requestor key.
 
 ### Running image
-- `sophia_sophia:latest` (commit `4e4a9b3`), 33 build steps,
+- `sophia_sophia:latest` (commit `282f402`), 33 build steps,
   13 vendored SB wheels (12 SB packages + `uuid_extensions` stub).
+
+### Added
+
+#### 282f402 — `SOPHIA_AUTO_MODELS` allowlist constrains `sophia-auto`
+- **Operator request:** "make the default strategy only use
+  `minimax-m3` and `zai-glm-5.2`".
+- **Implementation.** New `SOPHIA_AUTO_MODELS` env var
+  (comma-separated model ids). When set, the `sophia-auto`
+  routing pseudo-model rotates ONLY across the intersection of
+  the registered unhidden pool and the allowlist. Explicit
+  `model: <id>` requests bypass the allowlist (operator can
+  still pin any visible model by id). `/v1/models` is
+  unchanged by this setting — the allowlist only restricts
+  the auto-rotation pool.
+- **Live deployment:** `docker run -e SOPHIA_HIDDEN_MODELS=minimax-m2.7 -e SOPHIA_AUTO_MODELS=minimax-m3,glm-5.2 ...`
+  - `SOPHIA_HIDDEN_MODELS=minimax-m2.7` (from the prior
+    commit) removes the broken model entirely
+  - `SOPHIA_AUTO_MODELS=minimax-m3,glm-5.2` constrains the
+    default route to those two models only
+  - `grok-2` and `glm-4.7` remain visible in `/v1/models`
+    (operators can pin them explicitly) but `sophia-auto`
+    will never land on them
+- **Verified end-to-end** (2026-08-24 01:40 UTC): 20/20
+  `sophia-auto` requests landed on `minimax-m3` (zai was
+  paused on weekly quota during the test window); explicit
+  `model: "grok-2"` still routes correctly (and explicit
+  `model: "minimax-m2.7"` returns 502 with the clear error
+  "is in SOPHIA_HIDDEN_MODELS and is not served by this
+  gateway. Remove it from the env var (or rebuild) to
+  re-enable.").
+- **Side observation (separate from this commit):** the
+  upstream `minimax-m3` also leaks tool-call markup, in a
+  fifth observed format (`<function_calls><invoke name="bash">`
+  with child elements instead of attributes). The leaked-text
+  parser (`sophia/leaked_tool_call_fix.py`) doesn't yet
+  handle this format — a follow-up fix will be needed.
 
 ### Fixed
 
+#### ba397bc — server-side model filter via `SOPHIA_HIDDEN_MODELS` env
+- **Why not just `enabled: false` in `agent.yaml`?** ladyol
+  loads the bundled `providers.yaml` first (which has
+  `minimax-m2.7: enabled: true`) and only THEN merges the
+  user override; the `enabled: false` flag doesn't remove
+  a model that already exists in the bundled defaults.
+- **Fix.** Server-side filter via `SOPHIA_HIDDEN_MODELS` env
+  var (comma-separated model ids). Applied at four points so
+  a hidden model is removed from every operator-visible surface:
+  `/v1/models`, `SophiaPool._filtered_entries()` (used by
+  `chat()`/`stream()` for rotation), and a clear `ValueError`
+  if a client explicitly requests a hidden model id.
+
+#### af7e8b2 — flip `finish_reason` to `tool_calls` in non-streaming path
+- The earlier fix (`4e4a9b3`) flipped `finish_reason` from
+  `"stop"` to `"tool_calls"` on the streaming final chunk, but
+  missed the non-streaming response builder. Without this
+  flip, hermes' downstream tool-loop routing sees
+  `finish_reason="stop"` with a non-null `tool_calls` array
+  and (per the OpenAI spec) treats the turn as already
+  complete — so the synthesized `tool_calls` never get
+  executed.
+
 #### 4e4a9b3 — recover leaked tool-call markup into real `tool_calls`
-- **Bug.** Upstream models (notably `minimax-m2.7` via the sophia
-  LAN gateway) emit tool-call markup as plain text in the assistant's
-  `content` field instead of using the OpenAI `tool_calls` array.
+- **Bug.** Upstream models (notably `minimax-m2.7` via the
+  sophia LAN gateway) emit tool-call markup as plain text
+  in the assistant's `content` field instead of using the
+  OpenAI `tool_calls` array.
   Three observed variants (same endpoint, same model, three
   consecutive turns):
   - Block syntax: `[TOOL_CALL] {tool => "x", args => {...}} [/TOOL_CALL]`
   - Angle-bracket: `<minimax:tool_call><skill_view name="x"/></skill_view></minimax:tool_call>`
   - Claude-style XML: `<minimax:tool_call><invoke name="bash"><parameter name="command">x</parameter></invoke></minimax:tool_call>`
-- **Symptom.** hermes' display layer wraps the markup in a box,
-  making it *look* like a tool call — but the underlying data is
-  plain content, so the tool loop never runs and the raw markup
-  lands in chat. Reproduced live on 2026-08-23 23:43 with the
-  arthr hermes profile: every Telegram message got 4 duplicate
-  replies, all containing literal `[TOOL_CALL]…[/TOOL_CALL]` text.
-- **Fix.** `sophia/leaked_tool_call_fix.py` (new module, 18 unit
-  tests) parses the leaked markup server-side and synthesizes a
-  real `tool_calls` array entry. The non-streaming path rewrites
-  `choices[0].message`; the streaming path emits `delta.tool_calls`
-  chunks and flips the final `finish_reason` from `"stop"` to
-  `"tool_calls"` (the OpenAI spec value for a turn ending with tool
-  calls pending execution). Structural parser handles all three
-  observed variants without per-variant pattern matching.
-- **Verified end-to-end** on the live arthr hermes CLI session at
-  2026-08-24 00:34: assistant message has `tool_calls` non-null
-  with `finish_reason="tool_calls"`; the actual `skill_view` tool
-  executed and its result (`42,526` chars of skill body) was
-  recorded.  `state.db` message_count went 2 (just text) → 4 (real
-  tool loop with the user prompt, assistant tool call, tool
-  result, final assistant reply).
-- **Why sophia and not hermes.** The hermes core has an analogous
-  guard for the Codex Responses transport
-  (`agent/codex_responses_adapter.py:_TOOL_CALL_LEAK_PATTERN`)
-  but no equivalent for chat-completions. Doing the fix in sophia
-  keeps the leak contained to code we own and avoids forking
-  hermes-agent. Hermes sees a normal OpenAI response and runs the
-  tool loop normally — no client-side change required.
+- **Symptom.** hermes' display layer wraps the markup in a
+  box, making it *look* like a tool call — but the underlying
+  data is plain content, so the tool loop never runs and the
+  raw markup lands in chat.
+- **Fix.** `sophia/leaked_tool_call_fix.py` (new module,
+  18 unit tests) parses the leaked markup server-side and
+  synthesizes a real `tool_calls` array entry. Structural
+  parser handles all three observed variants without
+  per-variant pattern matching.
 
 ---
 
