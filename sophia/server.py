@@ -173,6 +173,21 @@ def create_app(config=None) -> FastAPI:
                             "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
                         }
                         yield f"data: {json.dumps(payload)}\n\n".encode("utf-8")
+                    # OpenAI streaming contract: emit a final chunk carrying
+                    # the actual finish_reason ("stop"/"length"/"tool_calls")
+                    # with an empty delta before the [DONE] sentinel. Without
+                    # this, spec-conforming clients (Hermes, the OpenAI Python
+                    # SDK, Open WebUI) cannot distinguish a natural stop from
+                    # a truncated stream and either re-prompt the model 4× or
+                    # silently drop the turn.
+                    stop_payload = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": now_ts(),
+                        "model": req.model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    yield f"data: {json.dumps(stop_payload)}\n\n".encode("utf-8")
                     yield b"data: [DONE]\n\n"
                     elapsed_ms = int((time.monotonic() - t0) * 1000)
                     full = "".join(chunks)
