@@ -1,39 +1,35 @@
 # Sophia TODOs
 
-> **Session 2026-08-27:** tool-call wire-format fixed end-to-end
-> (T-NEW-119) — `ladyol@aeefc8c`, `sophia@c6e8c86`, `senbai@5a4fd1f`.
-> Hermes now drives a multi-turn tool loop correctly through sophia
-> to every upstream that emits structured `tool_calls` (and the
-> leaked-markup recovery for `minimax-m2.7`-style prose leaks still
-> runs as belt-and-suspenders). Audit lifted to 98.01% in the
-> previous session. Item list below last reviewed 2026-08-27.
+> **Session 2026-08-27 (evening):** Maintenance docs brought current.
+> Tool-call wire-format fixed (T-NEW-119), vault recovery flow is
+> idempotent (cluster/seed-keys.sh runs on every restart), Docker
+> Compose v2 installed (v2.32.4 at `~/.local/bin/docker-compose-v2`)
+> with stable network aliases so inter-service discovery is
+> compose-version-agnostic. Audit lifted to 98.01%; live state:
+> sophia-sophia-1 healthy, hermes-arthr running, open-webui wired.
+>
+> **Session 2026-08-27 (earlier):** End-to-end T-NEW-119 fix landed.
+> `ladyol@aeefc8c`, `sophia@c6e8c86`, `senbai@5a4fd1f`.
 
 ## Recently completed (moved to CHANGES.md)
 
-The following items from the previous TODOs.md are DONE as of 2026-08-22:
-
-- ✅ **Per-provider rotation via ladyol strategies**
-  (`round_robin_weighted`, `cheapest`, `least_used`, etc.)
-- ✅ **Per-account 429 cooldowns aligned to provider reset windows**
-  (1am/6am/11am/4pm/8pm EDT) — sibling accounts keep serving
-  when one 429s
-- ✅ **Capture-to-disk for forensics** — opt-in via
-  `manage_keys set-payload`, JSON files capped at
-  `SOPHIA_CAPTURE_MAX_BYTES`
-- ✅ **Per-account named connections** — `cluster/agent/agent_accts.yaml`
-  maps each account to its PyKeyStore key
-- ✅ **sophia-auto pseudo-model** — `/v1/models` prepends it so
-  clients can pick "backend decides" instead of a concrete id
-- ✅ **OpenAI SSE streaming translation** — ladyol's event-dict
-  stream translated to OpenAI `chat.completion.chunk` text frames,
-  with empty-delta suppression and per-request usage capture
-- ✅ **system-message injection** — `_to_messages` always injects a
-  leading `system` message so ladyol's sequence validator doesn't
-  reject client requests that omit one
-- ✅ **Wire-up to operator's host system-wide vault** — `cluster/seed-keys.sh`
-  merges only LLM keys from `~/.local/share/pycurity/` into the
-  container vault, then backfills the auto-generated master passphrase
-  back to the source vault as `sophia_cluster_master_passphrase`
+- ✅ **Tool-call wire-format fix** (T-NEW-119) — full messages history
+  + structured `tool_calls` + `tool_call_id` forwarded in both
+  directions; hermes multi-turn tool loop works end-to-end.
+- ✅ **Idempotent vault recovery flow** — three-mode entrypoint
+  (cold / warm / recovered) + `cluster/seed-keys.sh` runs on every
+  restart with automatic back-write of the cluster master
+  passphrase to the host vault.
+- ✅ **Docker Compose v2 upgrade** — `cluster/docker-compose-v2`
+  wrapper resolves to `/home/solubrew/.local/bin/docker-compose-v2`
+  (v2.32.4); the dead v1 wrapper `cluster/docker-compose` can be
+  deleted.
+- ✅ **Stable network aliases** — `networks: default: aliases:` on
+  both services so open-webui's hardcoded `sophia_sophia_1:8765`
+  still works under v2's `sophia-sophia-1` container naming.
+- ✅ **Audit lifted to 98.01%** — added LICENSE, CLI.md, CI_CD.md,
+  mkdocs.yml, .github/workflows/tests.yml; ruff clean across all
+  sources; 6 new entrypoint unit tests bring suite to 85 passing.
 
 ## New Features (still open)
 
@@ -46,49 +42,93 @@ The following items from the previous TODOs.md are DONE as of 2026-08-22:
   available. Closest existing lever: schedule a cron that calls
   `manage_secrets set <account>` to rotate keys at the window
   boundaries; Sophia does pick up new keys on restart today.
-- **Hermes compatibility doc kept current** — see
-  `docs/HERMES_SETUP.md` (last reviewed 2026-08-23 after the SSE
-  finish_reason fix and the arthr profile wire-up)
+- **Backup cron for the named volume** — `cluster/README.md` §Backup
+  / restore documents the procedure; needs a cron entry on `.67`
+  that runs the backup daily to a separate host volume. The
+  sophia_data volume is the only stateful thing in the cluster;
+  without a backup, a `down -v` (accidental or otherwise) wipes
+  requestor keys + usage history irrecoverably.
 
-## Setup / vendor infrastructure
+## Operator workflow (current)
 
-- **Pre-vendored SB-stack wheels under `sb-dist/`** — DONE. The
-  Dockerfile consumes them; script in §3 of `docs/DEPLOY.md`
-  reproduces them from local sources on the dev host. 12 wheels
-  total (11 SB pkgs + uuid_extensions). See CHANGES.md for the
-  historic context (S1+S2 from ShieldFace handoff).
+```bash
+cd ~/.hermes/projects/sophia
+
+# 1. Pull latest
+git pull origin gamma
+
+# 2. Add new LLM account (rare — for new provider or new account):
+#    - Edit cluster/agent/agent_accts.yaml
+#    - Put key in host vault: python3 -m sophia.cmds.manage_secrets set <name>
+#    - See docs/DEPLOY.md §Step 5 for the full per-provider recipe
+
+# 3. Rebuild image (only if sophia/ladyol code changed)
+./scripts/build-sophia.sh --image sophia-sophia:latest
+
+# 4. Re-seed (idempotent — safe to run on every restart)
+./cluster/seed-keys.sh \
+    ~/.local/share/pycurity/secure_store.db \
+    '<host-vault-passphrase>'
+
+# 5. Restart sophia
+./cluster/docker-compose-v2 \
+    -f docker-compose.cluster.yml \
+    --project-name sophia up -d --force-recreate sophia
+
+# 6. Verify
+docker logs sophia-sophia-1 2>&1 | grep -E "VAULT_STATE|MERGED_COUNT"
+curl -sS http://127.0.0.1:8765/healthz | python3 -m json.tool
+```
+
+Step 4 (seed-keys.sh) is safe to run on every operation; it
+back-writes any passphrase divergence between host tracker and
+container, and restarts the container with the merged keys.
 
 ## Failure modes / edge cases (lessons-learned)
 
-- **v1 docker-compose bug** — `ContainerConfig` KeyError on
-  `up -d --force-recreate` when the container was created by raw
-  `docker run`. Workaround: use raw `docker run` for open-webui
-  (with `--add-host=host.docker.internal:host-gateway` for ollama
-  fallback). Delete `cluster/docker-compose` once host gets compose
-  v2 plugin.
+- **v1 docker-compose is end-of-life on this host** — v1.29.2
+  crashes against Docker Engine 29+ with `KeyError: 'ContainerConfig'`.
+  Use `cluster/docker-compose-v2` (the wrapper). See
+  `cluster/README.md` §Compose: v1 vs v2 for the install path.
 
 - **Source vault bind-mount perms** — the source vault dir is mode
   700 + files mode 600 (operator's security default). The merge
   entrypoint runs as `sophia` user (uid 1001) inside the container,
   so it gets `PermissionError` unless seed-keys.sh chmods the dir
-  to 755 + the files to 444 first. Currently handled by
-  seed-keys.sh's preamble + trap-restored perms.
+  to 755 + the files to 444 first. Handled by seed-keys.sh's
+  preamble + trap-restored perms.
 
 - **Sophia DB collision in `sophia/_data/`** — `SophiaConfig`
   defaults to `sophia/_data/sophia.db` if `SOPHIA_DB` isn't set;
   the cluster sets `SOPHIA_DB=/var/lib/sophia/sophia.db`. Don't
   accidentally commit the default-path DB into git. `.gitignore`
-  now excludes `sophia/_data/sophia.db`.
+  excludes `sophia/_data/sophia.db`.
 
-## Operator workflow
+- **Vault passphrase divergence (Aug 27 incident)** — when an
+  external tool (e.g. `kalshi-alpha` API key update) re-encrypts
+  the host vault, the previously-stored
+  `sophia_cluster_master_passphrase` ciphertext becomes
+  undecryptable. The container's actual passphrase (from
+  `/var/lib/sophia/pycurity/.master_passphrase`) is unaffected, but
+  the host tracker is stale. Recovery: back-write the LOCAL
+  passphrase to the host vault via the recipe in
+  `docs/HERMES_SETUP.md` §11 "Vault passphrase diverged".
 
-1. Pull `gamma`: `git pull origin gamma`
-2. Add new LLM account: edit `cluster/agent/agent.yaml` (provider
-   block) + `cluster/agent/agent_accts.yaml` (account row); put the
-   key in the system-wide vault:
-   `python -m sophia.cmds.manage_secrets set <account_name>`
-3. Rebuild image: `./cluster/docker-compose -f docker-compose.cluster.yml build --no-cache sophia`
-4. Re-seed: `./cluster/seed-keys.sh /home/solubrew/.local/share/pycurity/secure_store.db '<passphrase>'`
-5. Issue / re-issue requestor keys via `manage_keys create` (hex
-   transport so the raw secret never touches terminal display)
-6. Restart open-webui with the new requestor key in its env
+- **Open-webui DNS after a compose upgrade** — fixed by
+  `networks: default: aliases:` blocks on both services. If you
+  rebuild the compose file from scratch and forget the aliases,
+  open-webui will start failing with
+  `Cannot connect to host sophia_sophia_1:8765 [DNS server returned
+  general failure]`. The aliases block must include both
+  `sophia` AND `sophia_sophia_1`.
+
+## Known limits
+
+- **SQLite only** (postgres port is future work; `schema_versions`
+  table is in place for it).
+- **No TLS** — LAN-internal; don't expose :8765 past the LAN
+  without a proxy.
+- **No Sophia admin UI** — `manage_keys` over `docker exec`.
+- **WEBUI_AUTH=false** on Open WebUI — flip before real users.
+- **Streaming retry caveat** — a failure AFTER partial text was
+  streamed surfaces to the client (can't cleanly retry mid-stream).

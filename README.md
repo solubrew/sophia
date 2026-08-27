@@ -101,7 +101,7 @@ both are present.
 Watch tool calls in flight:
 
 ```bash
-docker logs -f sophia_sophia_1 2>&1 | grep -E "tool_call|finish_reason|cooldown"
+docker logs -f sophia-sophia-1 2>&1 | grep -E "tool_call|finish_reason|cooldown"
 ```
 
 ## Per-account rate-limit handling
@@ -119,7 +119,7 @@ account returns HTTP 429:
 
 Watch it:
 ```bash
-docker logs -f sophia_sophia_1 2>&1 | grep -E "cooldown|rotating|account"
+docker logs -f sophia-sophia-1 2>&1 | grep -E "cooldown|rotating|account"
 ```
 
 ## Configuration
@@ -141,15 +141,39 @@ CLI flags (`--host`, `--port`, `--log-level`, `--config`) override.
 
 ## Vault layout
 
-- Host system-wide: `~/.local/share/pycurity/secure_store.db` — 22
-  keys incl. the 5 LLM ones (owner: solubrew; mode 600).
+- Host system-wide: `~/.local/share/pycurity/secure_store.db` — 23
+  entries incl. the LLM keys and `sophia_cluster_master_passphrase`
+  (owner: solubrew; mode 600).
 - Container local: `/var/lib/sophia/pycurity/vault.db` — only the
   keys passed by `SOPHIA_MERGE_ALLOWLIST` (set by seed-keys.sh from
   `agent_accts.yaml`).
 - `cluster/seed-keys.sh` keeps both sides in sync on every run: it
-  copies the LLM keys from system-wide → container, and writes the
-  container's auto-generated master passphrase BACK to the system-wide
-  vault as `sophia_cluster_master_passphrase`.
+  reads `sophia_cluster_master_passphrase` from the system-wide vault
+  and injects it into the container as
+  `SOPHIA_CLUSTER_MASTER_PASSPHRASE`, then merges the allowlisted LLM
+  keys. The entrypoint does idempotent recovery on every boot (cold
+  / warm / recovered modes; see `cluster/README.md` §Restart
+  procedures).
+
+## Operating the container
+
+The container name is `sophia-sophia-1` under Docker Compose v2, but
+**stable network aliases** (`sophia`, `sophia_sophia_1`) on the
+`sophia_default` network mean inter-service discovery is identical
+regardless of compose version. For all operational commands
+(`docker logs`, `docker exec`), use the v2 name:
+
+```bash
+docker ps --filter "name=sophia-sophia-1"
+docker logs sophia-sophia-1
+docker exec -it sophia-sophia-1 python -m sophia.cmds.manage_keys list
+```
+
+The `cluster/docker-compose-v2` wrapper handles all
+`up` / `down` / `restart` / `logs` invocations. See
+`cluster/README.md` §Operations & Maintenance for the full restart
+playbook (warm / cold / recovery) and `docs/HERMES_SETUP.md` §11 for
+the troubleshooting + escalation paths.
 
 ## Requestor keys
 
@@ -177,7 +201,7 @@ files pruned first.
 ```bash
 cd /home/solubrew/.hermes/projects/sophia
 /home/solubrew/ENVs/shieldface/bin/python3 -m pytest tests/ -q
-# 79 passed (single pre-existing test_e2e_live isolation failure
+# 85 passed (single pre-existing test_e2e_live isolation failure
 # is unrelated to T-NEW-119 — it surfaces when the full suite
 # runs because test_server's monkeypatched pool leaks state into
 # the e2e live test).

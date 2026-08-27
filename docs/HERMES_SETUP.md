@@ -63,7 +63,7 @@ strategy; per-account via Sophia's cooldown registry. When one
 account returns 429 it's paused until the next reset window
 (01:00 / 06:00 / 11:00 / 16:00 / 20:00 EDT); other accounts — including
 siblings on the same provider — keep serving. Watch it:
-`docker logs -f sophia_sophia_1 2>&1 | grep -E "cooldown|rotating|account"`.
+`docker logs -f sophia-sophia-1 2>&1 | grep -E "cooldown|rotating|account"`.
 
 ---
 
@@ -92,31 +92,31 @@ second tenant signs up — today's default is single-tenant trust.
 ```bash
 # In the sophia container:
 # Default — chat-only requestor key for Hermes
-docker compose exec sophia python -m sophia.cmds.manage_keys create hermes-cli
+docker exec -it sophia-sophia-1 python -m sophia.cmds.manage_keys create hermes-cli
 # created hermes-cli  prefix=sk-sophi  id=1  role=requestor
 
 # Admin key for the operator
-docker compose exec sophia python -m sophia.cmds.manage_keys create solubrew-admin \
+docker exec -it sophia-sophia-1 python -m sophia.cmds.manage_keys create solubrew-admin \
     --role admin
 # created solubrew-admin  prefix=sk-sophi  id=2  role=admin
 
 # Collection key for a dashboard (read-only)
-docker compose exec sophia python -m sophia.cmds.manage_keys create grafana-bot \
+docker exec -it sophia-sophia-1 python -m sophia.cmds.manage_keys create grafana-bot \
     --role collection
 # created grafana-bot  prefix=sk-sophi  id=3  role=collection
 
 # Promote an existing requestor to admin without rotating the key:
-docker compose exec sophia python -m sophia.cmds.manage_keys set-role grafana-bot admin
+docker exec -it sophia-sophia-1 python -m sophia.cmds.manage_keys set-role grafana-bot admin
 
 # Opt-in to prompt+completion capture for this requestor (sizes the
 # SOPHIA_CAPTURES_DIR by default to 1 GiB, oldest-first pruning):
-docker compose exec sophia python -m sophia.cmds.manage_keys set-payload hermes-cli on
+docker exec -it sophia-sophia-1 python -m sophia.cmds.manage_keys set-payload hermes-cli on
 
 # Other subcommands:
-docker compose exec sophia python -m sophia.cmds.manage_keys list
-docker compose exec sophia python -m sophia.cmds.manage_keys show hermes-cli
-docker compose exec sophia python -m sophia.cmds.manage_keys disable hermes-cli
-docker compose exec sophia python -m sophia.cmds.manage_keys delete old-tenant
+docker exec -it sophia-sophia-1 python -m sophia.cmds.manage_keys list
+docker exec -it sophia-sophia-1 python -m sophia.cmds.manage_keys show hermes-cli
+docker exec -it sophia-sophia-1 python -m sophia.cmds.manage_keys disable hermes-cli
+docker exec -it sophia-sophia-1 python -m sophia.cmds.manage_keys delete old-tenant
 ```
 
 The raw key is shown **once** at creation. We store only the SHA-256
@@ -525,4 +525,120 @@ against `gamma`.
 | Chat returns `429 Too Many Requests` | An account's quota is spent — expected behaviour, Sophia rotates to a sibling account | `docker logs ... | grep cooldown` — paused accounts auto-resume at the next window |
 | `[Errno -2]` *during* a 429 — first attempt rotated but then ALL accounts paused | The first request hit a 429 and Sophia didn't have a non-paused sibling | Wait until the next reset window or add another account for that provider |
 | Hermes sends 4 duplicate replies to one Telegram message | Pre-`4e4a9b3` build of Sophia; SSE stream lacks `finish_reason: stop` on the final chunk AND the `tools` field is dropped. The fix in `0e05266` adds tools-forwarding; the fix in `4e4a9b3` adds `finish_reason: tool_calls` + leaked-text recovery as belt-and-suspenders for any future model that also leaks. T-NEW-119 (2026-08-27) additionally forwards the full messages history + structured tool_calls from the upstream — earlier fixes alone were insufficient for hermes' multi-turn tool loop. | Rebuild Sophia (`./scripts/build-sophia.sh` then `docker run` per `cluster/README.md`). See `openai-sse-finish-reason-misreport` skill for the original leak reproduction, and `CHANGES.md [Unreleased] — 2026-08-27 tool-call wire-format fix` for the layered root-cause trail. |
-| `/healthz` says `providers: 0, pool not initialized` + logs show `EOFError` at `getpass` | PyKeyStore's cached key (`master.key.temp`) is missing, expired, or doesn't match the vault. The entrypoint now has an **idempotent recovery path** (T-NEW-119 followup, 2026-08-27) that handles this without operator intervention. | Recovery: just re-run `cluster/seed-keys.sh <host_vault_db> '<host_vault_passphrase>'`. The script reads `sophia_cluster_master_passphrase` from the host vault, injects it into the sophia container as `SOPHIA_CLUSTER_MASTER_PASSPHRASE`, and the entrypoint's mode-3 recovery unlocks the existing vault and writes fresh `temp.key` + `.master_passphrase`. No `docker compose down -v` needed. Verify the recovery took with `docker logs sophia_sophia_1 2>&1 | grep -E 'VAULT_STATE='`. If `VAULT_STATE=recovered` appears, recovery succeeded. If it stays at the warm-start warning, the host vault's passphrase doesn't match the container's vault — that means the vault was re-encrypted by another tool (e.g., a non-sophia `pykey.set()` call) and `master.key.temp` is now stale. Wipe the named volume + re-init. |
+| `/healthz` says `providers: 0, pool not initialized` + logs show `EOFError` at `getpass` | PyKeyStore's cached key (`master.key.temp`) is missing, expired, or doesn't match the vault. The entrypoint now has an **idempotent recovery path** (T-NEW-119 followup, 2026-08-27) that handles this without operator intervention. | Recovery: just re-run `cluster/seed-keys.sh <host_vault_db> '<host_vault_passphrase>'`. The script reads `sophia_cluster_master_passphrase` from the host vault, injects it into the sophia container as `SOPHIA_CLUSTER_MASTER_PASSPHRASE`, and the entrypoint's mode-3 recovery unlocks the existing vault and writes fresh `temp.key` + `.master_passphrase`. No `docker compose down -v` needed. Verify the recovery took with `docker logs sophia-sophia-1 2>&1 | grep -E 'VAULT_STATE='`. If `VAULT_STATE=recovered` appears, recovery succeeded. If it stays at the warm-start warning, the host vault's passphrase doesn't match the container's vault — that means the vault was re-encrypted by another tool (e.g., a non-sophia `pykey.set()` call) and `master.key.temp` is now stale. Wipe the named volume + re-init. |
+
+---
+
+## 11. Restart + maintenance playbook
+
+This section consolidates the restart/maintenance flows that have
+emerged from the 2026-08-27 incident (vault passphrase divergence
+between host vault and container vault after an external re-encryption)
+and the subsequent fixes (T-NEW-119 entrypoint + cluster/seed-keys.sh
+idempotent recovery + Docker Compose v2 + stable network aliases).
+
+### When to use which restart mode
+
+The entrypoint emits a `VAULT_STATE=` line at boot. Match it to a
+restart mode:
+
+| Log token | Boot mode | Action |
+|---|---|---|
+| `VAULT_STATE=warm` | Routine restart — `temp.key` was valid | Nothing. Vault auto-unlocked. |
+| `VAULT_STATE=cold` | Fresh start (named volume empty OR volume was wiped) | **Capture the passphrase immediately:** `docker logs sophia-sophia-1 2>&1 \| grep CLUSTER_MASTER_PASSPHRASE` → back-write to host vault under `sophia_cluster_master_passphrase` |
+| `VAULT_STATE=recovered` | Recovery — entrypoint used `SOPHIA_CLUSTER_MASTER_PASSPHRASE` to re-unlock the existing vault | Nothing. Should be followed by a successful warm boot next time (because seed-keys.sh back-wrote the fresh passphrase to the host vault) |
+| No `VAULT_STATE=` but exit code 2 | Recovery attempted but env var was missing | Run `cluster/seed-keys.sh <host_vault_db> '<host_vault_passphrase>'` |
+| No `VAULT_STATE=` but exit code 5 | Recovery attempted but env passphrase didn't unlock the vault | Stale host tracker — see "Vault passphrase diverged" below |
+
+### Vault passphrase diverged (the rare / bad case)
+
+If `seed-keys.sh` succeeds (pre-flight + entrypoint mode 3) but the
+vault still won't unlock, the host vault's `sophia_cluster_master_passphrase`
+has diverged from the actual encryption passphrase. This happens when
+another tool re-encrypted the host vault (e.g. `kalshi-alpha` updated
+its API key at 02:15 on 2026-08-27 — the host vault's
+`sophia_cluster_master_passphrase` ciphertext is now undecryptable
+under the new encryption key).
+
+Recovery:
+
+```bash
+# 1. Read the actual passphrase from the container's local file:
+LOCAL_PP=$(docker exec sophia-sophia-1 cat /var/lib/sophia/pycurity/.master_passphrase)
+
+# 2. Read the host vault's current encryption passphrase (whatever
+#    unlocked it when you ran `getpass` interactively):
+HOST_PP=...   # type the passphrase you typed when opening the host vault
+
+# 3. Back-write the LOCAL passphrase into the host vault:
+python3 -c "
+from pycurity.pykey import PyKeyStore
+import os
+os.environ['PYCURITY_DB_PATH'] = '/home/solubrew/.local/share/pycurity/secure_store.db'
+os.environ['PYCURITY_SALT_PATH'] = '/home/solubrew/.local/share/pycurity/secure_store.salt'
+ks = PyKeyStore(passphrase='$HOST_PP')
+ks.set('sophia_cluster_master_passphrase',
+       {'api_key': '$LOCAL_PP', 'name': 'sophia_cluster_master_passphrase'},
+       comment='Synced from container on 2026-08-27')
+"
+
+# 4. Re-run seed-keys.sh to verify the cycle is healthy:
+cluster/seed-keys.sh /home/solubrew/.local/share/pycurity/secure_store.db "$HOST_PP"
+```
+
+### Routine restarts
+
+```bash
+# Restart just sophia (warm path, vault auto-unlocks)
+/home/solubrew/.hermes/projects/sophia/cluster/docker-compose-v2 \
+    -f /home/solubrew/.hermes/projects/sophia/docker-compose.cluster.yml \
+    --project-name sophia up -d --force-recreate sophia
+
+# Restart sophia AND open-webui (config changes)
+/home/solubrew/.hermes/projects/sophia/cluster/docker-compose-v2 \
+    -f /home/solubrew/.hermes/projects/sophia/docker-compose.cluster.yml \
+    --project-name sophia up -d --force-recreate
+
+# Restart hermes-arthr (systemd user service, NOT a container)
+systemctl --user restart hermes-gateway-arthr
+
+# Tail the logs of each in parallel
+docker logs -f sophia-sophia-1
+journalctl --user -u hermes-gateway-arthr -f
+```
+
+### Container-vs-host name resolution
+
+The Docker compose v1 → v2 upgrade changed container names
+(`sophia_sophia_1` → `sophia-sophia-1`). Both names resolve inside
+the `sophia_default` Docker network because of the explicit
+`networks: default: aliases:` blocks in `docker-compose.cluster.yml`.
+Stable inter-service names:
+
+| Service | Stable DNS names (resolve inside `sophia_default`) |
+|---|---|
+| sophia | `sophia`, `sophia_sophia_1`, `sophia-sophia-1` |
+| open-webui | `open-webui`, `open_webui_1`, `sophia-open-webui-1` |
+
+From the **host** (not inside Docker), use `sophia-sophia-1` (the
+actual v2 container name) — `docker ps` shows both for backward
+compatibility.
+
+### What lives where
+
+| Path | Owned by | Survives `down` | Survives `down -v` |
+|---|---|---|---|
+| `sophia_data:/var/lib/sophia/` | named docker volume | ✅ | ❌ (wiped) |
+| `host ~/.local/share/pycurity/` | host filesystem | ✅ | ✅ (not in volume) |
+| Built image `sophia-sophia:latest` | docker image cache | ✅ | ✅ (until `docker image rm`) |
+| `cluster/.env`, `cluster/agent/agent_accts.yaml` | bind mount from project dir | ✅ | ✅ |
+
+**Backups** of the named volume should be taken on a cron — see
+`cluster/README.md` §Backup / restore.
+
+### When to escalate (call the operator out of band)
+
+1. `seed-keys.sh` keeps printing `Decryption failed. Wrong passphrase provided.` across multiple runs with the host passphrase you know is correct.
+2. `MERGED_COUNT=0` after a `seed-keys.sh` run that succeeded the pre-flight (means the allowlist didn't match any host vault keys — usually a typo in `agent_accts.yaml`).
+3. `/healthz` returns `{"status":"degraded"}` for >2 minutes (some upstream is broken; rotation didn't save us — investigate upstream provider status).
+4. hermes-arthr is restarting faster than every 30s (gateway boot crash; tail `journalctl --user -u hermes-gateway-arthr -n 200 -f`).

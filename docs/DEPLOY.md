@@ -54,7 +54,7 @@ open can populate Sophia's container vault without re-typing.
 
 ```bash
 apt update && apt upgrade -y
-apt install -y docker.io docker-compose-v2 ufw
+apt install -y docker.io ufw
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp    # SSH
@@ -62,6 +62,30 @@ ufw allow 8765/tcp  # Sophia (LAN only — adjust if behind Caddy)
 ufw enable
 systemctl enable --now docker
 ```
+
+> **Docker Compose v2 is required** — v1.29 (the default in jammy
+> repos) crashes against Docker Engine 29+ with
+> `KeyError: 'ContainerConfig'`. Two install paths:
+>
+> ```bash
+> # Preferred (apt, native plugin): adds 'docker compose' subcommand
+> apt install -y docker-compose-v2
+> ```
+>
+> ```bash
+> # Alternative (binary download, no sudo, no apt repo): saves to
+> # /home/<user>/.local/bin/docker-compose-v2 (the location the
+> # cluster/docker-compose-v2 wrapper searches first)
+> mkdir -p ~/.local/bin
+> curl -sSL -o ~/.local/bin/docker-compose-v2 \
+>     https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-x86_64
+> chmod +x ~/.local/bin/docker-compose-v2
+> ~/.local/bin/docker-compose-v2 version
+> ```
+>
+> The cluster scripts invoke docker compose via
+> `cluster/docker-compose-v2` (a wrapper that resolves to whichever
+> binary is installed). One source of truth regardless of install path.
 
 ## Step 2 — Clone + configure
 
@@ -198,7 +222,7 @@ Add a new LLM account later:
 
 ```bash
 # 1. Put the API key in the host system-wide vault (one-time):
-docker compose -f docker-compose.cluster.yml exec -T sophia \
+./cluster/docker-compose-v2 -f docker-compose.cluster.yml --project-name sophia exec -T sophia \
     python -m sophia.cmds.manage_secrets set anthropic_api_key
 # paste sk-ant-...
 
@@ -219,13 +243,13 @@ wire-facing auth used by every consumer (Open WebUI, SenBai, the
 **Issue a chat-only key (the recommended path):**
 
 ```bash
-docker exec -it sophia_sophia_1 \
+docker exec -it sophia-sophia-1 \
   python -m sophia.cmds.manage_keys create openwebui
 # Prints a confirmation block. The RAW key is shown once at
 # creation; copy it from the output to the consumer's .env.
 # manage_keys display truncates the secret (sk-sop...XXXX) — extract
 # the full 53-char value with:
-HEX=$(docker exec -T sophia_sophia_1 sh -c '
+HEX=$(docker exec -T sophia-sophia-1 sh -c '
   python3 - <<PYEOF
 import sys; sys.path.insert(0, "/app")
 from pathlib import Path
@@ -250,15 +274,15 @@ chmod 600 /path/to/consumer/.env
 
 ```bash
 # Admin key (operator)
-docker exec -it sophia_sophia_1 \
+docker exec -it sophia-sophia-1 \
   python -m sophia.cmds.manage_keys create solubrew-admin --role admin
 
 # Collection key (Grafana scraper)
-docker exec -it sophia_sophia_1 \
+docker exec -it sophia-sophia-1 \
   python -m sophia.cmds.manage_keys create grafana-bot --role collection
 
 # Opt in to prompt+completion capture (capped at SOPHIA_CAPTURE_MAX_BYTES)
-docker exec -it sophia_sophia_1 \
+docker exec -it sophia-sophia-1 \
   python -m sophia.cmds.manage_keys set-payload hermes-cli on
 ```
 
@@ -278,11 +302,21 @@ hard cut-over) disable the old one: `manage_keys disable <name>`.
 ## Step 7 — Restart + verify
 
 ```bash
-docker compose -f docker-compose.cluster.yml restart sophia open-webui
-docker compose -f docker-compose.cluster.yml logs -f sophia
+./cluster/docker-compose-v2 -f docker-compose.cluster.yml --project-name sophia up -d --force-recreate sophia
+./cluster/docker-compose-v2 -f docker-compose.cluster.yml --project-name sophia logs -f sophia
 curl -fsS http://localhost:8765/healthz
 # {"status":"ok","providers":N,"models":M}
+
+# Verify the entrypoint came up cleanly
+docker logs sophia-sophia-1 2>&1 | grep -E "VAULT_STATE|MERGED_COUNT"
+# → VAULT_STATE=warm, MERGED_COUNT=N  (warm boot, N keys merged)
+# → VAULT_STATE=recovered            (recovery mode — entrypoint used SOPHIA_CLUSTER_MASTER_PASSPHRASE)
+# → VAULT_STATE=cold + CLUSTER_MASTER_PASSPHRASE=...  (fresh init, capture passphrase + back-write)
 ```
+
+For comprehensive restart procedures (warm / cold / recovery / open-webui / hermes-arthr),
+image rebuild + deploy, rollback, backup/restore — see
+`cluster/README.md` §Operations & Maintenance.
 
 Open WebUI is at `http://<sophia-host>:3000`. Pick `sophia-auto` for
 backend-driven rotation, or any concrete model id for explicit
@@ -322,7 +356,7 @@ docker compose --profile tls up -d caddy
   2. Re-run `seed-keys.sh` — it copies only the keys in the
      `SOPHIA_MERGE_ALLOWLIST` allowlist (rebuilt from
      `agent_accts.yaml` each time).
-  3. Restart `sophia_sophia_1` so the entrypoint re-reads the vault.
+  3. Restart `sophia-sophia-1` so the entrypoint re-reads the vault.
 
 ## CLI reference
 
@@ -353,10 +387,13 @@ vars stay in plain `.env` files.
 |---|---|---|
 | Build fails: `COPY sb-dist/*.whl` empty | `sb-dist/` not vendored; first build needs the 13 wheels | Run `scripts/build-sophia.sh --no-build`, then rebuild |
 | Container exits: `PermissionError: '/host-pycurity/secure_store.db'` | `seed-keys.sh` chmod step didn't take effect (rare; happens if source vault dir is root-owned) | Check `stat -c '%a' ~/.local/share/pycurity` — should be 700 with files 600 |
-| Container exits: `vault.db exists but temp.key missing` | Entrypoint checks `temp.key` but PyKeyStore's cache is named `master.key.temp` (filename mismatch), OR the vault volume was written by an older entrypoint, OR `master.key.temp` expired after 4h | **Refresh the cached key from the stored passphrase.** The container's LOCAL passphrase (NOT the cluster master) lives in `/var/lib/sophia/pycurity/.master_passphrase` (44 bytes — `secrets.token_urlsafe(32)` from first boot). Spawn a helper container that opens the vault with that passphrase; PyKeyStore then writes `master.key.temp`. Then rename it: `docker run --rm -v sophia_sophia_data:/var/lib/sophia --user 0:0 alpine:latest sh -c 'mv /var/lib/sophia/pycurity/master.key.temp /var/lib/sophia/pycurity/temp.key && chmod 600 /var/lib/sophia/pycurity/temp.key'`. Restart sophia. **Don't wipe the volume** unless the vault itself is corrupt — `down -v` destroys all requestor keys too. Full procedure in `openai-sse-finish-reason-misreport` skill §"Pitfalls" |
-| `/healthz` says `providers: 0, pool not initialized` + logs show `EOFError` at `getpass` | Same root cause as the `temp.key` row above — PyKeyStore's cached key expired after 4h and the vault falls back to a passphrase prompt, which EOFs in a non-TTY container | Same fix as above: refresh `temp.key` from `.master_passphrase` (the entrypoint stores the locally-generated passphrase there at first boot), then restart. **Root fix pending**: the entrypoint should refresh `temp.key` from `.master_passphrase` on every boot instead of erroring out |
+| Container exits: `vault.db exists but temp.key missing` | The named volume persisted across restarts but PyKeyStore's auto-unlock cache (`master.key.temp`) is missing or expired | **Run `cluster/seed-keys.sh`** — it reads `sophia_cluster_master_passphrase` from the host vault and injects it as `SOPHIA_CLUSTER_MASTER_PASSPHRASE`; the entrypoint's mode-3 recovery unlocks the vault and writes fresh `temp.key`. See `cluster/README.md` §Recovery restart. **Don't wipe the volume** unless the vault itself is corrupt. |
+| `/healthz` says `providers: 0, pool not initialized` + logs show `EOFError` at `getpass` | Same root cause — PyKeyStore's auto-unlock cache expired or doesn't match the vault's encryption, falls back to a passphrase prompt, which EOFs in a non-TTY container | Same fix: run `cluster/seed-keys.sh`. The entrypoint now does idempotent recovery (T-NEW-119 followup, 2026-08-27); this should not recur after the back-write step writes the fresh passphrase to the host vault |
+| `KeyError: 'ContainerConfig'` from `docker-compose` | Using v1.29 against Docker Engine 29+ | Use `./cluster/docker-compose-v2` (the wrapper) — see cluster/README.md §Compose: v1 vs v2 |
+| Sophia and open-webui can't find each other after a compose upgrade | The container name changed between v1 (`sophia_sophia_1`) and v2 (`sophia-sophia-1`) | Already fixed by `networks: default: aliases:` blocks in docker-compose.cluster.yml. The stable DNS names (`sophia`, `sophia_sophia_1`, `open-webui`, `open_webui_1`) all resolve |
 | Hermes sends 4 duplicate replies to one Telegram message | Pre-`4407527` Sophia build — SSE stream emitted every chunk with `finish_reason: null` and terminated with only `[DONE]`. Hermes classified the response as a partial-stream-stub and ran 4 continuation rounds | Rebuild Sophia so the gateway emits a final chunk with `finish_reason: "stop"` before `[DONE]`. Verified in `sophia/server.py:160-191` (commit `4407527`). See `openai-sse-finish-reason-misreport` skill |
-| Sophia picks the same upstream account every turn | Hermes isn't injecting the `strategy` body-field; sophia defaults to `random` which looks random over a 1-account pool but isn't rotation-aware | Add `custom_providers:` block to hermes `config.yaml` (see `docs/HERMES_SETUP.md` §6). Verify with `docker logs sophia_sophia_1 | grep "ProviderPool.select"` — you should see `strategy=best_available` per turn |
+| Tool calls execute once then the conversation dies | Pre-T-NEW-119 Sophia. Inbound `messages[]` was flattened to `[system, user]` before reaching upstream, so multi-turn tool loops lost prior turns | Rebuild with current gamma. Fix lands in `ladyol@aeefc8c`, `sophia@c6e8c86`, `senbai@5a4fd1f`. See CHANGES.md §T-NEW-119 |
+| Sophia picks the same upstream account every turn | Hermes isn't injecting the `strategy` body-field; sophia defaults to `random` which looks random over a 1-account pool but isn't rotation-aware | Add `custom_providers:` block to hermes `config.yaml` (see `docs/HERMES_SETUP.md` §6). Verify with `docker logs sophia-sophia-1 | grep "ProviderPool.select"` — you should see `strategy=best_available` per turn |
 | `/healthz` says `pool unreachable (ModuleNotFoundError: No module named 'uuid_extensions')` | Image built without the uuid_extensions stub wheel (squirl imports it; not on PyPI) | Run `scripts/build-sophia.sh` (it vendors the stub from an existing venv) and rebuild the image |
 | `PermissionError: Invalid passphrase` in source-vault pre-flight | Wrong passphrase to `seed-keys.sh` | Re-run with the correct passphrase; the source vault perms are restored even on failure |
 | `/healthz` returns `providers: 0` (and no EOFError) | Accts.yaml allowlist is empty or doesn't match PyKeyStore keys | `cat cluster/agent/agent_accts.yaml` — `name:` fields must match keys in the source vault |
