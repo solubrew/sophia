@@ -42,7 +42,7 @@ ladyol's bundled `providers.yaml`):
 | `cluster/seed-keys.sh` | one-shot: wipe vault, merge LLM keys from the system-wide vault, backfill cluster passphrase |
 | `cluster/entrypoint.py` | container entrypoint: vault init, filtered merge, exec uvicorn |
 | `cluster/inject-merge-vars.py` | temp-YAML helper (v1-compose env injection) |
-| `cluster/docker-compose` | v1.29 wrapper patching a docker-py bug; delete when host gets compose v2 |
+| `cluster/docker-compose-v2` | Wrapper around the operator-installed Compose v2 binary (no daemon dependency) |
 | `Dockerfile` | image build; ships `/etc/sophia/agent/` config |
 
 ## Key rotation / rate-limit behavior (live)

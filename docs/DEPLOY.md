@@ -132,7 +132,7 @@ re-run the script.
 ## Step 4 — Build the image
 
 ```bash
-./cluster/docker-compose -f docker-compose.cluster.yml build --no-cache sophia
+./cluster/docker-compose-v2 -f docker-compose.cluster.yml build --no-cache sophia
 ```
 
 The image (`sophia_sophia:latest`) ships:

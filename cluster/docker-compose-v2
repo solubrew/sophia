@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Wrapper around the operator-installed Docker Compose v2 binary.
+#
+# The host's /usr/bin/docker-compose is v1.29.2 (from the Ubuntu jammy
+# repos), which crashes against Docker Engine 29+ with
+# `KeyError: 'ContainerConfig'` during container recreate. v2 is the
+# supported path forward and uses the same compose YAML syntax.
+#
+# If you've installed v2 elsewhere, override COMPOSE_V2_BIN below or
+# in cluster/.env.
+#
+# INSTALL:
+#   mkdir -p ~/.local/bin
+#   curl -sSL -o ~/.local/bin/docker-compose-v2 \
+#     https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-x86_64
+#   chmod +x ~/.local/bin/docker-compose-v2
+#
+# We symlink rather than call the operator's binary directly so the
+# compose files are agnostic to where you installed v2.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# Search order: operator env override, repo-pinned path, common user-local bin
+COMPOSE_V2_BIN="${COMPOSE_V2_BIN:-${HERE}/../.local/bin/docker-compose-v2}"
+for cand in \
+    "$COMPOSE_V2_BIN" \
+    "/home/solubrew/.local/bin/docker-compose-v2" \
+    "/usr/local/bin/docker-compose-v2" \
+    "/usr/libexec/docker/cli-plugins/docker-compose"; do
+    if [ -x "$cand" ]; then
+        exec "$cand" "$@"
+    fi
+done
+echo "ERROR: docker-compose v2 not found." >&2
+echo "Install it (see the header comment of this file) and retry." >&2
+exit 1

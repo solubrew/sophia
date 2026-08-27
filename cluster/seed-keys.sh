@@ -217,13 +217,13 @@ SRC_MOUNT_DIR="$SRC_DIR"
     "/host-pycurity/secure_store.db" "$SRC_PASS" "$ALLOWLIST_CSV" "$CLUSTER_MASTER_FROM_HOST"
 
 echo "=== bringing up sophia container ==="
-./cluster/docker-compose -f "$TMP_YAML" up -d --force-recreate sophia
+./cluster/docker-compose-v2 -f "$TMP_YAML" --project-name sophia up -d --force-recreate sophia
 
 # Wait for the container to settle (entrypoint finished OR crashed).
 echo "=== waiting for sophia container to settle (max 60s) ==="
 for i in $(seq 1 30); do
-  cstate=$(docker inspect -f '{{.State.Status}}' sophia_sophia_1 2>/dev/null)
-  cuptime=$(docker inspect -f '{{.State.StartedAt}}' sophia_sophia_1 2>/dev/null)
+  cstate=$(docker inspect -f '{{.State.Status}}' sophia_sophia 2>/dev/null)
+  cuptime=$(docker inspect -f '{{.State.StartedAt}}' sophia_sophia 2>/dev/null)
   if [ "$cstate" = "running" ]; then
     if [ -n "$cuptime" ] && [ "$(date -d "$cuptime" +%s 2>/dev/null)" -lt "$(($(date +%s) - 5))" ]; then
       echo "  sophia has been running for 5s+ (entrypoint settled)"
@@ -237,10 +237,10 @@ for i in $(seq 1 30); do
 done
 sleep 5
 
-state=$(docker inspect -f '{{.State.Status}}' sophia_sophia_1 2>/dev/null)
+state=$(docker inspect -f '{{.State.Status}}' sophia_sophia 2>/dev/null)
 if [ "$state" = "restarting" ] || [ "$state" = "exited" ]; then
   echo "ERROR: sophia is in state=$state. Last 30 log lines:"
-  ./cluster/docker-compose -f docker-compose.cluster.yml logs --tail=30 sophia
+  ./cluster/docker-compose-v2 -f docker-compose.cluster.yml --project-name sophia logs --tail=30 sophia
   exit 3
 fi
 
@@ -248,7 +248,7 @@ fi
 # to detect (a) what mode the container came up in (cold/warm/recovered)
 # and (b) how many keys were merged from the host vault.
 echo "=== entrypoint diagnostics ==="
-ENTRYPOINT_LOG=$(./cluster/docker-compose -f docker-compose.cluster.yml logs --no-color sophia 2>&1)
+ENTRYPOINT_LOG=$(./cluster/docker-compose-v2 -f docker-compose.cluster.yml --project-name sophia logs --no-color sophia 2>&1)
 VAULT_STATE=$(echo "$ENTRYPOINT_LOG" | grep -oP 'VAULT_STATE=\K\S+' | head -1)
 MERGED_COUNT=$(echo "$ENTRYPOINT_LOG" | grep -oP 'MERGED_COUNT=\K\S+' | head -1)
 echo "  VAULT_STATE=${VAULT_STATE:-unknown}"
@@ -258,7 +258,7 @@ echo "  MERGED_COUNT=${MERGED_COUNT:-0}"
 # container — this is the source of truth. If the host tracker
 # disagrees with what the container actually uses, the container's
 # value wins and we back-write it.
-ACTUAL_PASSPHRASE=$(docker exec sophia_sophia_1 cat /var/lib/sophia/pycurity/.master_passphrase 2>/dev/null)
+ACTUAL_PASSPHRASE=$(docker exec sophia_sophia cat /var/lib/sophia/pycurity/.master_passphrase 2>/dev/null)
 if [ -z "$ACTUAL_PASSPHRASE" ]; then
   echo "ERROR: could not read .master_passphrase from container"
   exit 4
@@ -301,4 +301,4 @@ echo "=== /healthz ==="
 curl -s -m 5 http://192.168.1.67:8765/healthz; echo
 echo
 echo "=== status ==="
-docker ps --filter "name=sophia_sophia_1" --format "  {{.Status}} | {{.Image}}"
+docker ps --filter "name=sophia_sophia" --format "  {{.Status}} | {{.Image}}"

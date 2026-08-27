@@ -29,16 +29,22 @@
 #   - secrets via PyKeyStore, NOT env vars (the web container reads
 #     vault.db at startup; never put provider API keys in .env)
 #
-# Run:    ./cluster/docker-compose -f docker-compose.cluster.yml up -d --build
-# Stop:   ./cluster/docker-compose -f docker-compose.cluster.yml down
-# Wipe:   ./cluster/docker-compose -f docker-compose.cluster.yml down -v
+# Run:    ./cluster/docker-compose-v2 -f docker-compose.cluster.yml up -d --build
+# Stop:   ./cluster/docker-compose-v2 -f docker-compose.cluster.yml down
 #
-# NB: the host's `docker-compose` CLI is v1.29 (legacy). Use
-# `./cluster/docker-compose` (our local wrapper) — it shims the
-# dropped `ssl_version` kwarg so v1 still works against modern dockerd.
-# When the docker-compose-plugin v2 lands, the shim can go away and
-# this file gains `version: "3.8"` + top-level `name:` + restored
-# `depends_on: condition:` clauses.
+# We use docker-compose-v2 (a wrapper around the operator-installed
+# Compose v2 binary at /home/solubrew/.local/bin/docker-compose-v2)
+# because the host's /usr/bin/docker-compose is v1.29.2, which crashes
+# against Docker Engine 29+ with `KeyError: 'ContainerConfig'`. The
+# cluster/docker-compose wrapper for v1 (which monkey-patched a docker-py
+# bug) is now dead code and can be deleted if nothing else references it.
+# Wipe:   ./cluster/docker-compose-v2 -f docker-compose.cluster.yml down -v
+#
+# NB: Docker Compose v2 (v2.32.4+) is installed at
+# /home/solubrew/.local/bin/docker-compose-v2. The cluster wrapper
+# cluster/docker-compose-v2 just resolves to that binary, so the
+# compose YAML stays portable across hosts where v2 might live in
+# a different location.
 
 services:
   sophia:
@@ -112,7 +118,15 @@ services:
       # SOPHIA_CLUSTER_MASTER_PASSPHRASE on every restart so the
       # entrypoint can re-unlock an existing vault whose temp.key
       # has expired without operator intervention.
-      - ${PYCURITY_HOST_DIR:-${HOME}/.local/share/pycurity}:/host-pycurity:ro
+      #
+      # NB: We hardcode /home/solubrew/.local/share/pycurity/ here
+      # instead of using ${HOME} because v1 docker-compose (which
+      # is what this cluster runs) does NOT expand environment
+      # variables inside bind-mount source paths. PYCURITY_HOST_DIR
+      # is still honoured as a literal override for non-default
+      # operator layouts — set it in cluster/.env or pass via the
+      # shell:  PYCURITY_HOST_DIR=/path/to/vault docker-compose up.
+      - ${PYCURITY_HOST_DIR:-/home/solubrew/.local/share/pycurity}:/host-pycurity:ro
     ports:
       - "8765:8765"   # bound to 0.0.0.0 — accessible from the LAN.
                       # The container still listens on its loopback

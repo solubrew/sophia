@@ -28,7 +28,7 @@ their dev host and the GitVein mirror at
 6. **Deploy** — operator runs `cluster/seed-keys.sh
    ~/.local/share/pycurity/secure_store.db '<passphrase>'` to merge LLM
    keys into the container vault, then
-   `cluster/docker-compose -f docker-compose.cluster.yml up -d --build`.
+   `cluster/docker-compose-v2 -f docker-compose.cluster.yml up -d --build`.
 
 ## Local validation
 
@@ -76,7 +76,7 @@ The end-to-end flow is documented in `docs/DEPLOY.md` and the
 #     `cluster/agent/agent_accts.yaml` into the container vault.
 #   - Restarts `sophia_sophia_1` so it picks up the new vault.
 
-./cluster/docker-compose -f docker-compose.cluster.yml up -d --build
+./cluster/docker-compose-v2 -f docker-compose.cluster.yml up -d --build
 ```
 
 ## Vault boot-recovery
