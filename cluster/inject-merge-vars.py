@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Helper: make a temp copy of docker-compose.cluster.yml with the
-sophia container's SOPHIA_MERGE_* env vars injected, so the seed-keys
-flow can pass vars into the container despite v1 docker-compose's
-limitations:
+sophia container's SOPHIA_MERGE_* + SOPHIA_CLUSTER_MASTER_PASSPHRASE
+env vars injected, so the seed-keys flow can pass vars into the
+container despite v1 docker-compose's limitations:
 
   1) v1 doesn't auto-load .env
   2) v1 doesn't inherit the parent shell's env
@@ -12,21 +12,27 @@ limitations:
 
 The shell wrapper (cluster/seed-keys.sh) does the heredoc-free
 spawn of this script: `./inject-merge-vars.py <src_yaml> <dst_yaml>
-<vault_path> <passphrase>`.
+<vault_path> <passphrase> [<allowlist_csv>]`.
+
+We always inject SOPHIA_CLUSTER_MASTER_PASSPHRASE on every restart
+(idempotent recovery — see entrypoint.py mode 3). The shell
+wrapper reads the passphrase from the host vault and passes it
+in.
 """
 import sys
 
 
 def main():
-    if len(sys.argv) not in (5, 6):
+    if len(sys.argv) not in (5, 6, 7):
         print(
             "usage: inject-merge-vars.py <src_yaml> <dst_yaml> <vault> "
-            "<pass> [<allowlist_csv>]",
+            "<pass> [<allowlist_csv>] [<cluster_master_passphrase>]",
             file=sys.stderr,
         )
         sys.exit(64)
     src_yaml, dst_yaml, vault, passphrase = sys.argv[1:5]
-    allowlist = sys.argv[5] if len(sys.argv) == 6 else ""
+    allowlist = sys.argv[5] if len(sys.argv) >= 6 else ""
+    cluster_master = sys.argv[6] if len(sys.argv) == 7 else ""
 
     with open(src_yaml) as f:
         text = f.read()
@@ -43,10 +49,10 @@ def main():
         placeholder, "${SOPHIA_REQUESTOR_KEY}"
     )
 
-    # Inject SOPHIA_MERGE_* into the sophia service's environment,
-    # right after the PORT: "8765" line. The first occurrence of
-    # PORT in the file is on the sophia service (sophia is defined
-    # first in the YAML).
+    # Inject SOPHIA_MERGE_* + SOPHIA_CLUSTER_MASTER_PASSPHRASE into the
+    # sophia service's environment, right after the PORT: "8765"
+    # line. The first occurrence of PORT in the file is on the
+    # sophia service (sophia is defined first in the YAML).
     merge_vars = (
         f'      SOPHIA_MERGE_FROM_PYCURITY_PATH: "{vault}"\n'
         f'      SOPHIA_MERGE_PASSPHRASE: "{passphrase}"\n'
@@ -57,6 +63,14 @@ def main():
         # and double-quotes so the YAML stays valid.
         escaped = allowlist.replace("\\", "\\\\").replace('"', '\\"')
         merge_vars += f'      SOPHIA_MERGE_ALLOWLIST: "{escaped}"\n'
+    if cluster_master:
+        # Cluster master passphrase is always injected when known
+        # (idempotent recovery — see entrypoint.py mode 3). We quote
+        # it the same way as MERGE_PASSPHRASE; both are urlsafe-base64
+        # values so the only thing that needs escaping is the
+        # backslash + double-quote pair.
+        cm_escaped = cluster_master.replace("\\", "\\\\").replace('"', '\\"')
+        merge_vars += f'      SOPHIA_CLUSTER_MASTER_PASSPHRASE: "{cm_escaped}"\n'
     new_text = new_text.replace(
         '      PORT: "8765"',
         '      PORT: "8765"\n' + merge_vars,

@@ -83,6 +83,74 @@ All notable changes to Sophia are documented here.
 - `sophia/server.py:130-410` — `/v1/chat/completions` forwards structured messages + tool_calls.
 - `sophia/schemas.py:15-32` — `Message.tool_call_id` field.
 
+## [Unreleased] — 2026-08-27 (idempotent vault recovery flow)
+
+### Changed
+
+- **`cluster/entrypoint.py` rewritten with three explicit boot modes**
+  (T-NEW-119 followup, 2026-08-27):
+    1. **Cold start** (no `vault.db`) — generate a random
+       urlsafe-base64 passphrase, write it to `.master_passphrase`
+       AND `temp.key`, print `CLUSTER_MASTER_PASSPHRASE=<value>` to
+       stderr so the operator can back-write to the host vault.
+    2. **Warm start** (`vault.db + temp.key` present) — done; emit
+       `VAULT_STATE=warm` for log greppability.
+    3. **Recovery** (`vault.db` present, `temp.key` missing) —
+       unlock with `SOPHIA_CLUSTER_MASTER_PASSPHRASE` env var, write
+       fresh `temp.key`, sync `.master_passphrase` so subsequent
+       warm starts don't need the env var. Emit
+       `VAULT_STATE=recovered` on success.
+    - If env var is missing in mode 3, fail loud with a clear
+      pointer at `cluster/seed-keys.sh` (the new idempotent
+      workflow) + the destructive fallback — instead of the old
+      silent `sys.exit(2)`.
+    - If env var is supplied but doesn't match the vault's
+      encryption, exit code 5 (distinct from the no-env code 2 so
+      operators can distinguish "never seeded" from "seed is
+      stale") with a clear "wipe the volume" instruction.
+
+- **`cluster/seed-keys.sh` is now idempotent + non-destructive.**
+  It runs on every cluster restart (not just first boot), reads
+  `sophia_cluster_master_passphrase` from the host vault, and
+  injects it as `SOPHIA_CLUSTER_MASTER_PASSPHRASE` via the existing
+  `inject-merge-vars.py`. The script then waits for the container
+  to settle, reads its actual `.master_passphrase`, and syncs
+  any divergence back to the host vault. This makes the cluster
+  bring-up the same workflow regardless of whether the named
+  volume is empty (cold), has a working vault (warm), or has a
+  vault whose `temp.key` is missing/stale (recovery).
+
+- **`docker-compose.cluster.yml` now bakes in the host vault bind
+  mount** at `${PYCURITY_HOST_DIR:-${HOME}/.local/share/pycurity}:/host-pycurity:ro`
+  so `seed-keys.sh` no longer needs to inject it dynamically. One
+  source of truth (the compose file) instead of two.
+
+- **`cluster/inject-merge-vars.py` accepts an optional
+  cluster-master passphrase argument** and writes it as a
+  `SOPHIA_CLUSTER_MASTER_PASSPHRASE` env var on the sophia
+  container. Empty / unset values produce no env var (cold start
+  case, where the entrypoint itself generates a fresh passphrase).
+
+### Added
+
+- **`tests/test_entrypoint.py`** — 6 unit tests covering all three
+  boot modes (warm / cold / recovery-with-env / recovery-without-env /
+  recovery-with-wrong-passphrase) plus the diagnostic-token
+  contract that operators rely on for log scraping
+  (`VAULT_STATE=cold|warm|recovered`,
+  `CLUSTER_MASTER_PASSPHRASE=…`, `MERGED_COUNT=N`). All 6 pass;
+  full sophia test suite is now 85 passed (up from 79 with this
+  commit).
+
+### Reference
+
+- `cluster/entrypoint.py:_ensure_vault` — three-mode dispatch
+- `cluster/entrypoint.py:_write_passphrase_files` — atomic
+  `.master_passphrase` + `temp.key` write
+- `cluster/seed-keys.sh` — idempotent recovery orchestration
+- `cluster/inject-merge-vars.py:50-75` — passphrase env injection
+- `tests/test_entrypoint.py:6` — full test contract
+
 ## [Unreleased] — 2026-08-27 (audit lift 79% → 98%)
 
 ### Added

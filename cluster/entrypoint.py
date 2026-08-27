@@ -6,10 +6,41 @@ ladyol.providers.ProviderPool, which immediately instantiates
 pycurity.pykey.PyKeyStore(). PyKeyStore prompts for a master
 passphrase via getpass, which raises EOFError in a non-TTY container.
 
-To avoid the prompt, this entrypoint pre-initializes the vault at
-container start, then merges in any system-wide PyKeyStore vault
-specified via SOPHIA_MERGE_FROM_PYCURITY_PATH + SOPHIA_MERGE_PASSPHRASE.
+This entrypoint guarantees PyKeyStore can open the local vault before
+exec'ing uvicorn. It handles three boot modes:
+
+  1. **Cold start** (no vault.db) — generate a fresh random
+     passphrase, write it to .master_passphrase + temp.key. Print the
+     passphrase to stderr (one-shot, marked with a parseable token)
+     so the operator can capture it on first boot and back-write to
+     the host vault via ``cluster/seed-keys.sh``.
+
+  2. **Warm start** (vault.db + temp.key present) — vault is already
+     auto-unlockable. Done.
+
+  3. **Recovery** (vault.db present, temp.key missing) — operator
+     passes the cluster master passphrase via
+     ``SOPHIA_CLUSTER_MASTER_PASSPHRASE`` (typically injected by
+     ``cluster/seed-keys.sh``). We open the vault, write a fresh
+     temp.key, and update .master_passphrase so subsequent warm
+     starts work without the env var. This is the idempotent
+     recovery path — no ``docker compose down -v`` needed.
+
+After the vault is open we run the optional ``_merge_from_system_wide``
+step which copies keys from a host PyKeyStore vault into the container
+vault (first-boot seeding). The merge step is idempotent — running
+it on every restart is fine.
+
+Diagnostic tokens emitted to stderr (use ``docker logs sophia_sophia_1
+2>&1 | grep``):
+
+  * ``VAULT_STATE=cold`` | ``warm`` | ``recovered`` — which branch ran
+  * ``CLUSTER_MASTER_PASSPHRASE=<value>`` — printed once on cold
+    start so the operator can back-write to the host vault
+  * ``MERGED_COUNT=<N>`` — number of keys pulled from the host vault
 """
+from __future__ import annotations
+
 import os
 import secrets
 import sys
@@ -32,6 +63,7 @@ TEMP_KEY = VAULT_DIR / "temp.key"
 PASSPHRASE_FILE = VAULT_DIR / ".master_passphrase"
 ACCTS_YAML = Path("/etc/sophia/agent/agent_accts.yaml")
 
+# Env vars consumed by this entrypoint.
 MERGE_FROM_ENV = "SOPHIA_MERGE_FROM_PYCURITY_PATH"
 MERGE_PASS_ENV = "SOPHIA_MERGE_PASSPHRASE"
 # Comma-separated list of vault service names to include in the merge.
@@ -41,47 +73,173 @@ MERGE_PASS_ENV = "SOPHIA_MERGE_PASSPHRASE"
 # The seed-keys.sh script populates this from the LLM account list in
 # cluster/agent_accts so only LLM provider keys land here.
 MERGE_ALLOWLIST_ENV = "SOPHIA_MERGE_ALLOWLIST"
+# Idempotent recovery passphrase. Set by cluster/seed-keys.sh on
+# every cluster restart so the entrypoint can re-unlock an existing
+# vault whose temp.key has expired (or been wiped). The cluster
+# seed-keys.sh reads this value from the host vault's
+# ``sophia_cluster_master_passphrase`` entry — see that script for
+# the back-write direction.
+CLUSTER_MASTER_ENV = "SOPHIA_CLUSTER_MASTER_PASSPHRASE"
+
+# Diagnostic tokens (stable strings the operator greps for). Kept
+# short so they fit on one log line and are easy to filter.
+_DIAG_VAULT_STATE = "VAULT_STATE="          # value: cold|warm|recovered
+_DIAG_PASSPHRASE = "CLUSTER_MASTER_PASSPHRASE="   # value: <passphrase>
+_DIAG_MERGED = "MERGED_COUNT="            # value: <int>
+
+
+def _log_diag(token: str, value: str) -> None:
+    """Emit a stable ``KEY=VALUE`` diagnostic on its own stderr line.
+
+    The operator greps for these tokens in ``docker logs`` output.
+    Keys are stable across releases; values are intentionally NOT
+    quoted (whitespace in values would break parsing — passphrases are
+    urlsafe-base64 so they're whitespace-free).
+    """
+    sys.stderr.write(f"{token}{value}\n")
+
+
+def _write_passphrase_files(passphrase: str) -> None:
+    """Persist the passphrase to .master_passphrase AND temp.key.
+
+    PyKeyStore opens temp.key on every non-first-boot constructor call
+    to skip the getpass() prompt. Persisting both files means a
+    container restart in the warm path (no env vars set) still
+    unlocks cleanly. We write the same passphrase bytes to both files
+    (mode 600) so they stay in sync.
+    """
+    VAULT_DIR.mkdir(parents=True, exist_ok=True)
+    PASSPHRASE_FILE.write_text(passphrase + "\n")
+    PASSPHRASE_FILE.chmod(0o600)
+    TEMP_KEY.write_text(passphrase)
+    TEMP_KEY.chmod(0o600)
 
 
 def _ensure_vault() -> None:
-    VAULT_DIR.mkdir(parents=True, exist_ok=True)
-    if VAULT_DB.exists() and TEMP_KEY.exists():
-        sys.stderr.write("Vault ready (cached temp-key present)\n")
-        return
-    if VAULT_DB.exists() and not TEMP_KEY.exists():
-        sys.stderr.write(
-            "ERROR: vault.db exists at /var/lib/sophia/pycurity but the "
-            "temp.key is missing. Either restore the temp.key file "
-            "(e.g. from a backup of sophia_data), or wipe the named "
-            "volume: docker compose -f docker-compose.cluster.yml down -v\n"
-        )
-        sys.exit(2)
+    """Open the local vault or fail loudly with a clear error.
 
-    passphrase = secrets.token_urlsafe(32)
-    PASSPHRASE_FILE.write_text(passphrase + "\n")
-    PASSPHRASE_FILE.chmod(0o600)
-    # Use direct os.environ[] assignment (not setdefault) so we
-    # override any empty / stale value the container inherited
-    # (otherwise PyKeyStore's default-fallback uses the home dir
-    # and creates a second vault there).
+    Three boot modes (see module docstring):
+      1. cold      — vault.db missing → generate passphrase
+      2. warm      — vault.db + temp.key present → done
+      3. recovered — vault.db present, temp.key missing, env passphrase set
+                     → unlock with env passphrase and write fresh temp.key
+    """
+    VAULT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Set PYCURITY_* env vars up-front so PyKeyStore uses the right
+    # vault regardless of whether the entrypoint flow reaches the
+    # first-boot init below. We use direct os.environ[] (not
+    # setdefault) so we override any empty / stale value the
+    # container inherited (otherwise PyKeyStore's default-fallback
+    # uses the home dir and creates a second vault there).
     os.environ["PYCURITY_DB_PATH"] = str(VAULT_DB)
     os.environ["PYCURITY_SALT_PATH"] = str(SALT_BIN)
-    sys.stderr.write("First boot - initialising PyKeyStore vault\n")
-    try:
-        from pycurity.pykey import PyKeyStore
-        ks = PyKeyStore(passphrase=passphrase)
-        ks.list()
-    except Exception as exc:
-        sys.stderr.write(f"ERROR: vault init failed: {exc}\n")
-        sys.exit(3)
-    sys.stderr.write("Vault initialised at /var/lib/sophia/pycurity\n")
+
+    # ── Mode 2: warm start ─────────────────────────────────────────
+    if VAULT_DB.exists() and TEMP_KEY.exists():
+        sys.stderr.write("Vault ready (cached temp-key present)\n")
+        _log_diag(_DIAG_VAULT_STATE, "warm")
+        return
+
+    # ── Mode 1: cold start ─────────────────────────────────────────
+    if not VAULT_DB.exists():
+        passphrase = secrets.token_urlsafe(32)
+        _write_passphrase_files(passphrase)
+        sys.stderr.write("First boot - initialising PyKeyStore vault\n")
+        try:
+            from pycurity.pykey import PyKeyStore
+            ks = PyKeyStore(passphrase=passphrase)
+            ks.list()  # forces the vault header + key table to be written
+        except Exception as exc:
+            sys.stderr.write(f"ERROR: vault init failed: {exc}\n")
+            sys.exit(3)
+        sys.stderr.write(
+            "Vault initialised at /var/lib/sophia/pycurity\n"
+            "  BACK-WRITE THIS PASSPHRASE TO YOUR HOST VAULT under\n"
+            "  service name 'sophia_cluster_master_passphrase' so the\n"
+            "  next container restart can auto-recover.\n"
+        )
+        # Print the passphrase on its own line with a parseable
+        # token. The operator greps for this and copies it into the
+        # host PyKeyStore via `python -m pycurity.cli set ...`. After
+        # the first successful cluster/seed-keys.sh run, this
+        # branch won't fire again — subsequent boots come up warm.
+        _log_diag(_DIAG_VAULT_STATE, "cold")
+        _log_diag(_DIAG_PASSPHRASE, passphrase)
+        return
+
+    # ── Mode 3: recovery (vault.db present, temp.key missing) ────
+    # Two sub-modes:
+    #   3a. operator passed SOPHIA_CLUSTER_MASTER_PASSPHRASE — unlock
+    #       with it and write fresh temp.key (.master_passphrase is
+    #       also updated so subsequent warm boots don't need the env
+    #       var).
+    #   3b. env var missing — vault is unreachable. Fail with a clear
+    #       pointer at the recovery path (run cluster/seed-keys.sh or
+    #       pass the env var manually).
+    if VAULT_DB.exists() and not TEMP_KEY.exists():
+        recovery_pass = os.environ.get(CLUSTER_MASTER_ENV, "").strip()
+        if not recovery_pass:
+            sys.stderr.write(
+                "ERROR: vault.db exists at /var/lib/sophia/pycurity but the\n"
+                "temp.key is missing AND SOPHIA_CLUSTER_MASTER_PASSPHRASE\n"
+                "is not set. Recovery options:\n"
+                "  1. Run cluster/seed-keys.sh on the host (it reads\n"
+                "     'sophia_cluster_master_passphrase' from the host vault\n"
+                "     and passes it via the SOPHIA_CLUSTER_MASTER_PASSPHRASE\n"
+                "     env var on this container).\n"
+                "  2. Pass the cluster master passphrase directly:\n"
+                "     docker run -e SOPHIA_CLUSTER_MASTER_PASSPHRASE=<value> ...\n"
+                "  3. (DESTRUCTIVE) Wipe the named volume:\n"
+                "     docker compose -f docker-compose.cluster.yml down -v\n"
+                "     — this drops any requestor keys / usage history.\n"
+            )
+            sys.exit(2)
+        # 3a: try to unlock with the recovery passphrase.
+        try:
+            from pycurity.pykey import PyKeyStore
+            ks = PyKeyStore(passphrase=recovery_pass)
+            ks.list()
+        except Exception as exc:
+            sys.stderr.write(
+                f"ERROR: vault unlock failed with the supplied passphrase: {exc}\n"
+                "  The passphrase in SOPHIA_CLUSTER_MASTER_PASSPHRASE does not\n"
+                "  match the vault's encryption. Verify the host vault still\n"
+                "  holds the right value under 'sophia_cluster_master_passphrase',\n"
+                "  or wipe the named volume.\n"
+            )
+            sys.exit(5)
+        # Unlock worked — write fresh temp.key + sync .master_passphrase
+        # so future warm starts don't need the env var.
+        _write_passphrase_files(recovery_pass)
+        sys.stderr.write(
+            "Vault recovered via SOPHIA_CLUSTER_MASTER_PASSPHRASE; wrote fresh "
+            "temp.key and synced .master_passphrase.\n"
+        )
+        _log_diag(_DIAG_VAULT_STATE, "recovered")
+        return
+
+    # Unreachable — the four branches above cover all combos.
+    sys.stderr.write(f"ERROR: vault state unrecognised ({VAULT_DIR})\n")
+    sys.exit(2)
 
 
 def _merge_from_system_wide() -> None:
-    # DEBUG: log the entire relevant env so we can see what's reaching
-    # the entrypoint from compose.
-    sys.stderr.write(f"[entrypoint] _merge_from_system_wide: env_has_merge_path={'SOPHIA_MERGE_FROM_PYCURITY_PATH' in os.environ}\n")
-    sys.stderr.write(f"[entrypoint] _merge_from_system_wide: env_has_merge_pass={'SOPHIA_MERGE_PASSPHRASE' in os.environ}\n")
+    """Copy LLM provider keys from the host vault into the container vault.
+
+    Idempotent — running on every restart is fine; PyKeyStore.set()
+    overwrites by name. The merge env vars are popped before the
+    subprocess (uvicorn) is exec'd below so the source passphrase
+    never leaks into the long-lived process environment.
+    """
+    sys.stderr.write(
+        f"[entrypoint] _merge_from_system_wide: env_has_merge_path="
+        f"{MERGE_FROM_ENV in os.environ}\n"
+    )
+    sys.stderr.write(
+        f"[entrypoint] _merge_from_system_wide: env_has_merge_pass="
+        f"{MERGE_PASS_ENV in os.environ}\n"
+    )
     src_path = os.environ.pop(MERGE_FROM_ENV, "").strip()
     src_pass = os.environ.pop(MERGE_PASS_ENV, "").strip()
     allowlist = os.environ.pop(MERGE_ALLOWLIST_ENV, "").strip()
@@ -90,14 +248,20 @@ def _merge_from_system_wide() -> None:
         if allowlist
         else None
     )
-    sys.stderr.write(f"[entrypoint] _merge_from_system_wide: src_path={src_path!r} src_pass_set={bool(src_pass)} allowlist={len(allowlist_names) if allowlist_names else 'all'}\n")
+    sys.stderr.write(
+        f"[entrypoint] _merge_from_system_wide: src_path={src_path!r} "
+        f"src_pass_set={bool(src_pass)} "
+        f"allowlist={len(allowlist_names) if allowlist_names else 'all'}\n"
+    )
     if not src_path:
+        _log_diag(_DIAG_MERGED, "0")
         return
     if not src_pass:
         sys.stderr.write(
             f"WARN: {MERGE_FROM_ENV}={src_path!r} set but "
             f"{MERGE_PASS_ENV} is empty - skipping system-wide merge.\n"
         )
+        _log_diag(_DIAG_MERGED, "0")
         return
 
     src = Path(src_path)
@@ -106,6 +270,7 @@ def _merge_from_system_wide() -> None:
             f"ERROR: {MERGE_FROM_ENV}={src_path!r} does not exist - "
             "skipping merge.\n"
         )
+        _log_diag(_DIAG_MERGED, "0")
         return
 
     src_dir = src.parent
@@ -139,10 +304,13 @@ def _merge_from_system_wide() -> None:
                 )
                 count += 1
             sys.stderr.write(f"Merged {count} keys from {src}\n")
+            _log_diag(_DIAG_MERGED, str(count))
         except Exception as exc:
             sys.stderr.write(f"ERROR: merge failed: {exc}\n")
             sys.exit(4)
     finally:
+        # Zero the passphrase string in this scope so a coredump
+        # wouldn't leak it. Best-effort.
         try:
             src_pass = " " * len(src_pass)
         except Exception:
@@ -162,14 +330,9 @@ if __name__ == "__main__":
     _ensure_vault()
     _merge_from_system_wide()
     _ensure_accts_file()
-    # Ensure the PYCURITY_* env vars are explicitly set in the
-    # process environment BEFORE we exec uvicorn. PyKeyStore's
-    # constructor reads these to decide which vault to open;
-    # if they're missing, it defaults to ~/.local/share/pycurity/
-    # which is a different (empty) vault that confuses the rest
-    # of the pipeline. The _ensure_vault() call above already
-    # set them, but we re-set explicitly here for safety + as
-    # documentation of the dependency.
+    # Re-set PYCURITY_* explicitly BEFORE we exec uvicorn — PyKeyStore's
+    # constructor reads these on every chat request to decide which
+    # vault to open, and the in-process env must be locked in.
     os.environ["PYCURITY_DB_PATH"] = str(VAULT_DB)
     os.environ["PYCURITY_SALT_PATH"] = str(SALT_BIN)
     sys.stderr.write(

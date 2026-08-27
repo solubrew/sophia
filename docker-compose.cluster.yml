@@ -97,6 +97,22 @@ services:
       # COPY them in. Read-only is fine — the container never writes
       # back to the host checkout.
       - ./sb-dist:/opt/sophia/sb-dist:ro
+      # Bind-mount the host PyKeyStore vault directory at
+      # /host-pycurity (read-only) so the container's entrypoint
+      # can read the source vault during the merge step. The host
+      # vault is typically at ~/.local/share/pycurity/ (operator's
+      # default). Operators on a non-default host vault layout can
+      # override this bind with a custom compose file (see
+      # docs/DEPLOY.md "Custom host vault layout"). If this bind
+      # doesn't exist on a given host (e.g., the operator doesn't
+      # run a host-wide PyKeyStore), the entrypoint's merge step
+      # gracefully no-ops and the container starts in cold mode.
+      # T-NEW-119 followup: this bind is the foundation of the
+      # idempotent recovery flow — seed-keys.sh always passes
+      # SOPHIA_CLUSTER_MASTER_PASSPHRASE on every restart so the
+      # entrypoint can re-unlock an existing vault whose temp.key
+      # has expired without operator intervention.
+      - ${PYCURITY_HOST_DIR:-${HOME}/.local/share/pycurity}:/host-pycurity:ro
     ports:
       - "8765:8765"   # bound to 0.0.0.0 — accessible from the LAN.
                       # The container still listens on its loopback
