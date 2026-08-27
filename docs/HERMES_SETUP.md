@@ -188,6 +188,23 @@ The LAN-side cluster on `.67` is the running reality today. From
   `sophia/server.py:160-191`; the
   `openai-sse-finish-reason-misreport` skill documents the
   reproduction and resolution.
+- **Tool-call wire format (T-NEW-119, 2026-08-27)**: the gateway
+  now preserves the **full messages history** (system + user +
+  assistant-with-tool_calls + tool-with-tool_call_id) and surfaces
+  structured `delta.tool_calls[]` SSE deltas verbatim from the
+  upstream. Prior to this fix, every inbound messages array was
+  flattened to a 2-message `[system, user]` pair before reaching
+  the upstream — multi-turn runs that produced tool_calls + tool
+  results had the assistant's tool decision and the tool result
+  silently dropped. The root cause for the 2026-08-24 bug
+  investigation (`hermes→sophia→m3` path emits empty tool_calls
+  but m3 works fine for direct hermes calls) was upstream of
+  sophia: `ladyol.AsyncLLMClient.chat()` returned only `content`
+  and `AsyncLLMClient.stream()` only yielded `token` / `usage`
+  events — structured `tool_calls` were discarded before sophia
+  ever saw them. T-NEW-119 fixes both layers. Companion commits
+  land in `ladyol@aeefc8c` and `senbai@5a4fd1f`. See `CHANGES.md`
+  for the full trail.
 - **Migration to Postgres**: every Sophia-internal table lives in
   one SQLite file (`sophia.db`); the `schema_versions` table is in
   place for the migration. The next step is a thin `backend` module
@@ -502,9 +519,10 @@ against `gamma`.
 | `400 messages must not be empty` | Hermes sent an empty completion (rare) | Restart Hermes; usually a transient prompt-cache invalidation |
 | `400 invalid message sequence for ProviderPool.stream: leading role must be 'system', got 'user'` | Client sent no system message — ladyol requires one as the first item | Fixed in Sophia: `_to_messages` injects `"You are a helpful assistant."` automatically. If you see this, you're hitting an older image; rebuild with `--no-cache` |
 | Sophia picks the same account every time | `strategy: random` is OK but the pool is small, OR Hermes is not injecting the strategy body-field | Add the `custom_providers:` block from §6 so Hermes injects `strategy: best_available` on every request. Verify with `sophia` logs: you should see `[ProviderPool.select] strategy=best_available` per turn |
+| Tool calls execute once and then the conversation dies — the model "forgets" the tool result | Pre-T-NEW-119 build of Sophia; inbound `messages[]` was flattened to a 2-message `[system, user]` pair before reaching the upstream. Multi-turn runs that produced `tool_calls` + `tool` results had every prior turn (assistant tool decision, tool result) silently dropped before the upstream saw them. | Rebuild Sophia (image build hash from `docker inspect sophia_sophia_1 --format '{{.Image}}'` should contain the T-NEW-119 commit; rebuild via `./scripts/build-sophia.sh` then `./cluster/docker-compose -f docker-compose.cluster.yml up -d --build`). The fix lands in `ladyol@aeefc8c` (preserve structured tool_calls + accept `messages`), `sophia@c6e8c86` (forward the full messages array + surface tool_calls), and `senbai@5a4fd1f` (tuple-unpack the new `provider_pool.chat()` return shape). See `CHANGES.md [Unreleased] — 2026-08-27 tool-call wire-format fix`. |
 | `/v1/models` returns 0 models | `agent_accts.yaml` allowlist is empty OR names don't match PyKeyStore keys | `cat cluster/agent/agent_accts.yaml` — `name:` fields must exactly match keys in source vault; check `seed-keys.sh` "Merged N keys" output |
 | Chat returns `[Errno -2] Name or service not known` | `agent.yaml` has a wrong base_url | Compare against `ladyol/_data_/providers.yaml` in the running image; the four live URLs are in cluster/README.md |
 | Chat returns `429 Too Many Requests` | An account's quota is spent — expected behaviour, Sophia rotates to a sibling account | `docker logs ... | grep cooldown` — paused accounts auto-resume at the next window |
 | `[Errno -2]` *during* a 429 — first attempt rotated but then ALL accounts paused | The first request hit a 429 and Sophia didn't have a non-paused sibling | Wait until the next reset window or add another account for that provider |
-| Hermes sends 4 duplicate replies to one Telegram message | Pre-`4e4a9b3` build of Sophia; SSE stream lacks `finish_reason: stop` on the final chunk AND the `tools` field is dropped. The fix in `0e05266` adds tools-forwarding; the fix in `4e4a9b3` adds `finish_reason: tool_calls` + leaked-text recovery as belt-and-suspenders for any future model that also leaks | Rebuild Sophia (`./scripts/build-sophia.sh` then `docker run` per `cluster/README.md`). See `openai-sse-finish-reason-misreport` skill for the original leak reproduction |
+| Hermes sends 4 duplicate replies to one Telegram message | Pre-`4e4a9b3` build of Sophia; SSE stream lacks `finish_reason: stop` on the final chunk AND the `tools` field is dropped. The fix in `0e05266` adds tools-forwarding; the fix in `4e4a9b3` adds `finish_reason: tool_calls` + leaked-text recovery as belt-and-suspenders for any future model that also leaks. T-NEW-119 (2026-08-27) additionally forwards the full messages history + structured tool_calls from the upstream — earlier fixes alone were insufficient for hermes' multi-turn tool loop. | Rebuild Sophia (`./scripts/build-sophia.sh` then `docker run` per `cluster/README.md`). See `openai-sse-finish-reason-misreport` skill for the original leak reproduction, and `CHANGES.md [Unreleased] — 2026-08-27 tool-call wire-format fix` for the layered root-cause trail. |
 | `/healthz` says `providers: 0, pool not initialized` + logs show `EOFError` at `getpass` | PyKeyStore's cached key (`master.key.temp`) **expired after 4h** (mtime check in `_load_temp_key`); the entrypoint refuses to recover without it | Recovery: pull cluster master passphrase from main PyKeyStore (`sophia_cluster_master_passphrase`), read container's local passphrase from `/var/lib/sophia/pycurity/.master_passphrase`, spawn a helper container with the sophia volume mounted and run `python3 -c "from pycurity.pykey import PyKeyStore; ks = PyKeyStore(passphrase='<local-pass>'); print(len(ks.list()))"`. PyKeyStore writes `master.key.temp`; rename it to `temp.key` to match the entrypoint's expected name. Restart the sophia container. Full procedure in the `openai-sse-finish-reason-misreport` skill §"Pitfalls" |

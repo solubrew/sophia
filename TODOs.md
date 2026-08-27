@@ -1,12 +1,12 @@
 # Sophia TODOs
 
-> **Session 2026-08-23 (end of day):** arthr hermes profile is now a
-> live consumer (alongside SenBai + Open WebUI). SSE streaming is
-> spec-compliant (commit `4407527`). Vault recovery procedure
-> documented in DEPLOY.md and the `openai-sse-finish-reason-misreport`
-> skill. Item list below last reviewed 2026-08-23; zai weekly quota
-> exhausted until 2026-08-28 04:43:25 — gateway rotates through
-> minimax × 3 + xai via `best_available` until then.
+> **Session 2026-08-27:** tool-call wire-format fixed end-to-end
+> (T-NEW-119) — `ladyol@aeefc8c`, `sophia@c6e8c86`, `senbai@5a4fd1f`.
+> Hermes now drives a multi-turn tool loop correctly through sophia
+> to every upstream that emits structured `tool_calls` (and the
+> leaked-markup recovery for `minimax-m2.7`-style prose leaks still
+> runs as belt-and-suspenders). Audit lifted to 98.01% in the
+> previous session. Item list below last reviewed 2026-08-27.
 
 ## Recently completed (moved to CHANGES.md)
 

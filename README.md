@@ -37,7 +37,7 @@ All three rotate through the same 17-entry upstream pool; rotation is governed e
 |---|---|---|---|
 | GET  | `/healthz`              | none | liveness; reports provider + model counts |
 | GET  | `/v1/models`            | requestor+ | OpenAI-compatible; prepends `sophia-auto` |
-| POST | `/v1/chat/completions` | requestor+ | OpenAI Chat Completions; SSE streaming supported |
+| POST | `/v1/chat/completions` | requestor+ | OpenAI Chat Completions; full messages history + structured tool_calls + SSE streaming |
 | GET  | `/v1/usage/summary`    | collection / admin | aggregated usage; 403 for requestor role |
 | GET  | `/v1/usage/by-requestor` | collection / admin | per-key totals |
 | GET  | `/v1/captures/...`     | collection / admin | read stored prompt/response payloads |
@@ -59,6 +59,50 @@ The `model` body field accepts either:
 - A concrete model name (`"minimax-m2.7"`, `"glm-5.2"`, `"grok-2"`,
   …) — explicit selection; still rotates across accounts offering
   that model when one 429s.
+
+## Tool calls
+
+`/v1/chat/completions` is OpenAI Chat Completions-compatible on the
+wire — it accepts and forwards the **full messages history**
+(system + user + assistant-with-tool_calls + tool-with-tool_call_id)
+verbatim, and surfaces structured `tool_calls` deltas on both
+streaming and non-streaming paths.
+
+Behaviour summary (see `CHANGES.md [Unreleased] — 2026-08-27
+tool-call wire-format fix` for the full T-NEW-119 trail):
+
+- **Inbound** `messages[]` is threaded as-is to ladyol's
+  `ProviderPool.chat()`. Prior multi-turn runs that produced
+  tool_calls, then tool results, then a follow-up user turn were
+  collapsed to just the latest user turn — the assistant's
+  tool_call decision and the tool result vanished before the
+  upstream ever saw them.
+- **Inbound** `tools[]` is forwarded to the upstream so the model
+  sees the available tool surface.
+- **Inbound** `tool_call_id` on `tool`-role messages is preserved
+  for correlation.
+- **Outbound** (non-streaming): the response's `choices[0].message`
+  carries `content` plus `tool_calls[]` (when the upstream emitted
+  any). `finish_reason` is `"tool_calls"` when tool_calls are
+  present, otherwise `"stop"`.
+- **Outbound** (streaming): the SSE stream emits
+  `chat.completion.chunk` deltas with `delta.tool_calls[]` exactly
+  as the upstream produced them, plus the standard final chunk
+  with `finish_reason` set before `[DONE]`.
+
+Leaked-tool-call recovery (the `extract_leaked_tool_calls` helper
+that parses `[TOOL_CALL]…[/TOOL_CALL]` blocks out of `content` text)
+still runs as a belt-and-suspenders for upstreams that emit tool
+calls as prose instead of structured wire format (notably the
+local `minimax-m2.7` LAN gateway). Structured upstream tool_calls
+take priority over leaked markup on the non-streaming path when
+both are present.
+
+Watch tool calls in flight:
+
+```bash
+docker logs -f sophia_sophia_1 2>&1 | grep -E "tool_call|finish_reason|cooldown"
+```
 
 ## Per-account rate-limit handling
 
@@ -133,5 +177,8 @@ files pruned first.
 ```bash
 cd /home/solubrew/.hermes/projects/sophia
 /home/solubrew/ENVs/shieldface/bin/python3 -m pytest tests/ -q
-# 40 passed
+# 79 passed (single pre-existing test_e2e_live isolation failure
+# is unrelated to T-NEW-119 — it surfaces when the full suite
+# runs because test_server's monkeypatched pool leaks state into
+# the e2e live test).
 ```
