@@ -132,6 +132,17 @@ services:
                       # The container still listens on its loopback
                       # too, so the healthcheck (http://127.0.0.1:8765/healthz)
                       # works from within the same container.
+    # Stable network alias so the WebUI container can reach sophia by
+    # a fixed hostname regardless of the underlying container name
+    # (v1 compose names it sophia_sophia_1, v2 names it sophia-sophia-1;
+    # both metrics and the open-webui OPENAI_API_BASE_URL point at
+    # 'sophia' on this network). Without this alias, switching
+    # compose versions breaks open-webui's connection.
+    networks:
+      default:
+        aliases:
+          - sophia
+          - sophia_sophia_1
     healthcheck:
       # /healthz is the FastAPI health endpoint (no auth required).
       # Single-shot urllib probe — no extra packages needed.
@@ -150,6 +161,14 @@ services:
     # Official image — Open WebUI speaks OpenAI-compatible /v1 since
     # 0.4.x, so pointing it at sophia needs only the URL + a Bearer key.
     image: ghcr.io/open-webui/open-webui:main
+    # Stable network alias so hermes (when configured to use a
+    # docker-network hostname instead of 192.168.1.67) can reach
+    # open-webui by a fixed name.
+    networks:
+      default:
+        aliases:
+          - open-webui
+          - open_webui_1
     restart: unless-stopped
     depends_on:
       - sophia
