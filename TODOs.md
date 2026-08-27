@@ -1,5 +1,21 @@
 # Sophia TODOs
 
+# TODOs
+- implement open router
+curl https://openrouter.ai/api/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{
+  "model": "openai/gpt-4o",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the meaning of life?"
+    }
+  ]
+}'
+
+
 > **Session 2026-08-27 (evening):** Maintenance docs brought current.
 > Tool-call wire-format fixed (T-NEW-119), vault recovery flow is
 > idempotent (cluster/seed-keys.sh runs on every restart), Docker
