@@ -2,6 +2,87 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-08-27 (tool-call wire-format fix — hermes→sophia→upstream)
+
+### Fixed
+
+- **`/v1/chat/completions` now forwards the full OpenAI conversation
+  history to the upstream** (T-NEW-119). Previously, every incoming
+  `messages` array was flattened to a 2-message ``[system, user]``
+  pair via `_to_messages(prompt, sprompt)` before the upstream saw
+  it. This silently dropped:
+    * prior `assistant` turns with their `tool_calls` array,
+    * `tool` role messages and their `tool_call_id` correlation ids,
+    * any conversation state beyond the latest user turn.
+
+  For a hermes multi-turn run (user → assistant-tool-call →
+  tool-result → user), the upstream only ever saw the *last* user
+  turn — which is why the model kept re-deciding to call the same
+  tool, hallucinated, or refused to continue. The fix preserves each
+  message's role, content, `tool_calls`, and `tool_call_id` verbatim,
+  and threads the full list through `SophiaPool.chat()` /
+  `SophiaPool.stream()` / `sophia.pool._to_messages()`.
+
+- **Structured upstream tool_calls now reach hermes** (T-NEW-119).
+  Prior to this fix, when the upstream emitted a proper OpenAI
+  `delta.tool_calls` array (the spec format), ladyol's
+  `AsyncLLMClient.stream()` discarded the deltas (only yielded
+  `type=="token"` and `type=="usage"` events), and
+  `AsyncLLMClient.chat()` discarded the response's
+  `choices[0].message.tool_calls` field entirely. Sophia's
+  `extract_leaked_tool_calls` helper only recovered markup when the
+  model leaked tool calls as plain text inside `content` — the
+  observed minimax-m2.7 pattern. For models that emit structured
+  tool calls, every byte was thrown away before sophia could see
+  it. This was the root cause for the 2026-08-24 bug investigation
+  (`hermes→sophia→m3` path emits empty tool_calls but m3 works
+  fine for direct hermes calls). Now:
+    * `AsyncLLMClient.chat()` returns `(content, tool_calls, usage)`
+      — the third field on the tuple.
+    * `AsyncLLMClient.stream()` yields
+      `{"type": "tool_call", "tool_calls": [<OpenAI streaming delta>]}`
+      events when the SSE carries `delta.tool_calls`.
+    * `SophiaPool.chat_with_meta()` surfaces the aggregated
+      `tool_calls` in its meta dict.
+    * `SophiaPool.stream()` forwards them as OpenAI SSE deltas
+      (`{"delta": {"tool_calls": [...]}, "finish_reason": null}`).
+    * `sophia.server.chat_completions` attaches them to the
+      response message and flips `finish_reason` to `"tool_calls"`
+      so hermes' tool loop runs them.
+
+- **`Message` schema now has a `tool_call_id` field** (T-NEW-119).
+  OpenAI's `tool` role messages carry `tool_call_id` to correlate
+  a tool result back to the originating assistant `tool_call`.
+  Prior to this fix the field was silently dropped — hermes'
+  correlation with prior tool calls broke the moment the schema
+  parsed the inbound JSON.
+
+- **Non-streaming `chat_completions` now prefers structured
+  upstream tool_calls over leaked markup recovery** (T-NEW-119).
+  When both are present (rare — only happens with upstreams that
+  mix wire formats), the structured upstream call wins. Previously
+  the leaked markup path could overwrite a clean structured call.
+
+### Tests
+
+- 79/80 sophia tests pass after the fix. The single failure
+  (`test_e2e_live::test_live_chat_completions`) is the pre-existing
+  test-isolation bug surfaced earlier this session; not
+  introduced by this commit.
+- 67/76 ladyol tests pass (21 skipped — same baseline as
+  before this commit; no regressions).
+
+### Reference
+
+- `ladyol/providers.py:389-491` — `AsyncLLMClient.chat` return shape.
+- `ladyol/providers.py:542-672` — `AsyncLLMClient.stream` event types.
+- `ladyol/providers.py:985-1216` — `ProviderPool.chat` accepts `messages` + `tools`.
+- `sophia/pool.py:258-487` — `SophiaPool.chat` accepts `messages`.
+- `sophia/pool.py:495-580` — `SophiaPool.chat_with_meta` returns tool_calls.
+- `sophia/pool.py:582-758` — `SophiaPool.stream` yields tool_call dict events.
+- `sophia/server.py:130-410` — `/v1/chat/completions` forwards structured messages + tool_calls.
+- `sophia/schemas.py:15-32` — `Message.tool_call_id` field.
+
 ## [Unreleased] — 2026-08-27 (audit lift 79% → 98%)
 
 ### Added

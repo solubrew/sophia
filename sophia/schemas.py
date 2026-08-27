@@ -17,9 +17,17 @@ class Message(BaseModel):
     role: str
     content: Optional[str] = None
     name: Optional[str] = None
+    # T-NEW-119 (2026-08-27): ``tool_call_id`` is on the ``tool`` role
+    # message per the OpenAI Chat Completions spec — the upstream
+    # uses it to correlate tool results back to the originating
+    # assistant tool_call. Without this field the schema silently
+    # dropped tool messages (the role made it through as
+    # ``"tool"`` but the correlation id vanished).
+    tool_call_id: Optional[str] = None
     # OpenAI tool-calls array. Synthesized on the server side when the
     # upstream model emitted leaked tool-call markup as text — see
-    # sophia.leaked_tool_call_fix for the wire format.
+    # sophia.leaked_tool_call_fix for the wire format. Also present on
+    # assistant turns where the model produced structured tool calls.
     tool_calls: Optional[List[Any]] = None
 
 

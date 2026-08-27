@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -139,11 +139,24 @@ def create_app(config=None) -> FastAPI:
         if not req.messages:
             raise HTTPException(status_code=400, detail="messages must not be empty")
 
-        system_parts = [m.content for m in req.messages if m.role == "system"]
-        user_parts = [m.content for m in req.messages if m.role != "system"]
-        sprompt = "\n".join(system_parts).strip()
-        prompt = "\n".join(user_parts).strip()
-        if not prompt:
+        # T-NEW-119 (2026-08-27): forward the FULL OpenAI-style
+        # conversation history instead of flattening to a 2-message
+        # ``(system, user)`` pair. Each role is preserved verbatim:
+        # ``system``, ``user``, ``assistant`` (with optional
+        # ``tool_calls``), ``tool`` (with ``tool_call_id``). The
+        # legacy ``prompt``/``sprompt`` shortcut is still available
+        # via the ``prompt`` field of ``ChatCompletionRequest``
+        # (when set) — hermes sets the structured messages array.
+        # We still derive a fallback ``prompt`` / ``sprompt`` pair
+        # for callers that send only flat content (the legacy
+        # client shape) so the capture path + cost-accounting rows
+        # keep working.
+        legacy_user_parts = [m.content for m in req.messages if m.role != "system" and m.content]
+        sprompt = "\n".join(
+            m.content for m in req.messages if m.role == "system" and m.content
+        ).strip()
+        prompt = "\n".join(legacy_user_parts).strip()
+        if not prompt and not any(m.role != "system" for m in req.messages):
             raise HTTPException(status_code=400, detail="no user message in messages")
 
         strategy = req.strategy or "random"
@@ -167,49 +180,99 @@ def create_app(config=None) -> FastAPI:
         completion_id = new_completion_id()
         t0 = time.monotonic()
 
+        # Build the messages list that gets forwarded to the upstream.
+        # We render each ``Message`` into a dict that preserves the
+        # role, content, tool_calls, and tool_call_id fields — the
+        # upstream validates this against the OpenAI schema.
+        forward_messages: List[Dict[str, Any]] = []
+        for m in req.messages:
+            msg_dict: Dict[str, Any] = {"role": m.role}
+            if m.content is not None:
+                msg_dict["content"] = m.content
+            if m.tool_calls:
+                # Re-emit the structured tool_calls array so the
+                # upstream sees the assistant's prior tool decisions
+                # when computing the next turn.
+                msg_dict["tool_calls"] = list(m.tool_calls)
+            if m.name:
+                msg_dict["name"] = m.name
+            # ``tool_call_id`` is on the ``tool`` role message per the
+            # OpenAI spec — surfacing it on the schema lets us
+            # forward the correlation id back to the upstream.
+            if m.tool_call_id:
+                msg_dict["tool_call_id"] = m.tool_call_id
+            forward_messages.append(msg_dict)
+
         if req.stream:
             async def event_source():
                 chunks: list[str] = []
                 leaked_tool_calls_emitted: list[dict] = []
+                # T-NEW-119 (2026-08-27): aggregated structured
+                # tool_call deltas emitted by the upstream as part of
+                # the OpenAI SSE event flow. The ``final_finish_reason``
+                # below flips to ``"tool_calls"`` when this is non-empty
+                # so hermes drives its tool loop.
+                structured_tool_calls_emitted: list[dict] = []
                 try:
                     async for chunk in pool.stream(
-                        prompt=prompt, sprompt=sprompt, temperature=temperature,
+                        messages=forward_messages,
+                        sprompt=sprompt,
+                        temperature=temperature,
                         strategy=strategy, model=model,
                         max_tokens=max_tokens,
                         tools=req.tools,  # forward caller's tool defs to upstream
                     ):
-                        chunks.append(chunk)
-                        if not chunk:
-                            continue  # skip empty deltas
-                        # Some upstreams (notably minimax-m2.7) emit
-                        # tool-call markup as plain text. Strip leaked
-                        # blocks from this chunk's content and emit
-                        # synthesized `tool_calls` deltas so hermes runs
-                        # the tool loop normally — same recovery as the
-                        # non-streaming path.
-                        chunk_tcs, chunk_cleaned = extract_leaked_tool_calls(chunk)
-                        if chunk_tcs:
-                            leaked_tool_calls_emitted.extend(chunk_tcs)
-                            tc_payload = {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": now_ts(),
-                                "model": req.model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"tool_calls": chunk_tcs},
-                                    "finish_reason": None,
-                                }],
-                            }
-                            yield f"data: {json.dumps(tc_payload)}\n\n".encode("utf-8")
-                        if chunk_cleaned:
+                        if isinstance(chunk, str):
+                            chunks.append(chunk)
+                            if not chunk:
+                                continue  # skip empty deltas
+                            # Some upstreams (notably minimax-m2.7) emit
+                            # tool-call markup as plain text. Strip leaked
+                            # blocks from this chunk's content and emit
+                            # synthesized `tool_calls` deltas so hermes runs
+                            # the tool loop normally — same recovery as the
+                            # non-streaming path.
+                            chunk_tcs, chunk_cleaned = extract_leaked_tool_calls(chunk)
+                            if chunk_tcs:
+                                leaked_tool_calls_emitted.extend(chunk_tcs)
+                                tc_payload = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": now_ts(),
+                                    "model": req.model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"tool_calls": chunk_tcs},
+                                        "finish_reason": None,
+                                    }],
+                                }
+                                yield f"data: {json.dumps(tc_payload)}\n\n".encode("utf-8")
+                            if chunk_cleaned:
+                                payload = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": now_ts(),
+                                    "model": req.model,
+                                    "choices": [{"index": 0, "delta": {"content": chunk_cleaned}, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(payload)}\n\n".encode("utf-8")
+                        elif isinstance(chunk, dict):
+                            # T-NEW-119 (2026-08-27): upstream emitted
+                            # a structured tool_call delta. Forward it
+                            # verbatim as an OpenAI SSE chunk so hermes
+                            # picks up the call and runs the tool loop.
                             payload = {
                                 "id": completion_id,
                                 "object": "chat.completion.chunk",
                                 "created": now_ts(),
                                 "model": req.model,
-                                "choices": [{"index": 0, "delta": {"content": chunk_cleaned}, "finish_reason": None}],
+                                "choices": [dict(chunk)],
                             }
+                            # Aggregate so we can flip the final
+                            # finish_reason to "tool_calls" below.
+                            for tc in (chunk.get("delta", {}).get("tool_calls") or []):
+                                if isinstance(tc, dict):
+                                    structured_tool_calls_emitted.append(tc)
                             yield f"data: {json.dumps(payload)}\n\n".encode("utf-8")
                     # OpenAI streaming contract: emit a final chunk carrying
                     # the actual finish_reason ("stop"/"length"/"tool_calls")
@@ -219,10 +282,13 @@ def create_app(config=None) -> FastAPI:
                     # a truncated stream and either re-prompt the model 4× or
                     # silently drop the turn.
                     #
-                    # If any leaked tool_calls were extracted during the
-                    # stream, the spec value is "tool_calls" (not "stop") so
-                    # the client knows to execute them before replying.
-                    final_finish_reason = "tool_calls" if leaked_tool_calls_emitted else "stop"
+                    # If any tool_calls (structured OR leaked) were emitted,
+                    # the spec value is "tool_calls" (not "stop") so the
+                    # client knows to execute them before replying.
+                    has_tool_calls = bool(
+                        structured_tool_calls_emitted or leaked_tool_calls_emitted
+                    )
+                    final_finish_reason = "tool_calls" if has_tool_calls else "stop"
                     stop_payload = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -267,7 +333,9 @@ def create_app(config=None) -> FastAPI:
         # Non-streaming
         try:
             content, provider_meta = await pool.chat_with_meta(
-                prompt=prompt, sprompt=sprompt, temperature=temperature,
+                messages=forward_messages,
+                sprompt=sprompt,
+                temperature=temperature,
                 strategy=strategy, model=model,
                 max_tokens=max_tokens,
                 tools=req.tools,  # forward caller's tool defs to upstream
@@ -289,6 +357,12 @@ def create_app(config=None) -> FastAPI:
                 provider_meta=provider_meta, in_usd=in_usd, out_usd=out_usd,
                 total_usd=total_usd)
 
+        # T-NEW-119 (2026-08-27): the upstream may have emitted
+        # structured tool_calls in addition to (or instead of)
+        # content. Surface both — structured calls take priority
+        # over leaked markup recovery (the upstream's wire format
+        # is the source of truth).
+        structured_tool_calls = (provider_meta or {}).get("tool_calls") or []
         # Some upstreams (notably minimax-m2.7 on the LAN gateway) emit
         # tool-call markup as plain TEXT in `content` instead of using the
         # structured OpenAI `tool_calls` array. Pull any leaked
@@ -301,7 +375,9 @@ def create_app(config=None) -> FastAPI:
         # routing (which keys off finish_reason) treats this as a
         # tool-call turn rather than a plain reply.
         leaked_tool_calls, cleaned_content = extract_leaked_tool_calls(content or "")
-        non_streaming_finish_reason = "tool_calls" if leaked_tool_calls else "stop"
+        # Prefer structured upstream tool_calls when both are present.
+        tool_calls = structured_tool_calls or leaked_tool_calls
+        non_streaming_finish_reason = "tool_calls" if tool_calls else "stop"
         resp = ChatCompletionResponse(
             id=completion_id, created=now_ts(),
             # Report the ACTUAL backend model when auto-routing (the
@@ -314,7 +390,7 @@ def create_app(config=None) -> FastAPI:
                 message=Message(
                     role="assistant",
                     content=cleaned_content or None,
-                    tool_calls=leaked_tool_calls or None,
+                    tool_calls=tool_calls or None,
                 ),
             )],
             usage=Usage(prompt_tokens=pt, completion_tokens=ct, total_tokens=pt + ct),

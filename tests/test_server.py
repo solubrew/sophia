@@ -30,15 +30,37 @@ class FakePoolShim:
         self._models = []
     async def list_models(self):
         return self._models
-    async def chat(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None, max_tokens=None, tools=None):
-        self.chat_calls.append({"prompt": prompt, "sprompt": sprompt, "temperature": temperature, "strategy": strategy, "model": model, "max_tokens": max_tokens, "tools": tools})
-        return f"echo[{strategy}]: {prompt}"
-    async def chat_with_meta(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None, max_tokens=None, tools=None):
-        self.chat_calls.append({"prompt": prompt, "sprompt": sprompt, "temperature": temperature, "strategy": strategy, "model": model, "max_tokens": max_tokens, "tools": tools})
-        return (f"echo[{strategy}]: {prompt}",
+    async def chat(self, prompt=None, sprompt="", messages=None, temperature=0.7, strategy="random", model=None, max_tokens=None, tools=None):
+        # T-NEW-119 (2026-08-27): SophiaPool.chat now accepts either
+        # (prompt, sprompt) or a structured messages list. Record both
+        # so the test asserts against the full payload hermes sent.
+        # Derive a text echo from the last user message when the
+        # caller sent a structured messages list — matches the
+        # legacy shape so downstream assertions on the response
+        # body keep working.
+        echo_source = prompt
+        if echo_source is None and messages:
+            for m in reversed(messages):
+                if isinstance(m, dict) and m.get("role") == "user":
+                    echo_source = m.get("content") or ""
+                    break
+        self.chat_calls.append({"prompt": prompt, "sprompt": sprompt, "messages": messages, "temperature": temperature, "strategy": strategy, "model": model, "max_tokens": max_tokens, "tools": tools})
+        return f"echo[{strategy}]: {echo_source or ''}"
+    async def chat_with_meta(self, prompt=None, sprompt="", messages=None, temperature=0.7, strategy="random", model=None, max_tokens=None, tools=None):
+        self.chat_calls.append({"prompt": prompt, "sprompt": sprompt, "messages": messages, "temperature": temperature, "strategy": strategy, "model": model, "max_tokens": max_tokens, "tools": tools})
+        # T-NEW-119: also surface ``tool_calls`` in the meta dict so
+        # callers can attach them to the OpenAI response.
+        echo_source = prompt
+        if echo_source is None and messages:
+            for m in reversed(messages):
+                if isinstance(m, dict) and m.get("role") == "user":
+                    echo_source = m.get("content") or ""
+                    break
+        return (f"echo[{strategy}]: {echo_source or ''}",
                 {"provider_name": "anthropic_alice",
-                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
-    async def stream(self, prompt, sprompt="", temperature=0.7, strategy="random", model=None, max_tokens=None, tools=None):
+                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                 "tool_calls": []})
+    async def stream(self, prompt=None, sprompt="", messages=None, temperature=0.7, strategy="random", model=None, max_tokens=None, tools=None):
         async def gen():
             for chunk in ["a", "b", "c"]:
                 yield chunk

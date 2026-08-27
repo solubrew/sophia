@@ -11,7 +11,7 @@ import asyncio
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Dict, List, Optional, Any, Union
 
 from kahndor.logma import Logma
 
@@ -257,8 +257,9 @@ class SophiaPool:
 
     async def chat(
         self,
-        prompt: str,
+        prompt: Optional[str] = None,
         sprompt: str = "",
+        messages: Optional[list] = None,
         temperature: float = 0.7,
         strategy: str = "random",
         model: Optional[str] = None,
@@ -274,10 +275,35 @@ class SophiaPool:
         including other accounts on the SAME provider. Selection honors
         cooldowns; explicit (non-auto) model requests still rotate
         across accounts offering that model. Mirrors stream()'s retry.
+
+        **T-NEW-119 (2026-08-27) — input shape.** Now accepts either
+        ``(prompt, sprompt)`` (legacy — builds a 2-message
+        ``[system, user]`` conversation) OR a full ``messages`` list.
+        When ``messages`` is supplied, it is forwarded verbatim to
+        ladyol's ``AsyncLLMClient.stream`` (the non-streaming chat
+        path is implemented on top of the streaming client inside
+        ``ProviderPool.chat``). The legacy prompt/sprompt pair is
+        preserved for callers that still use it — see
+        ``sophia.server.chat_completions`` for the new ``messages``-
+        driven path that hermes uses.
+
+        Returns the model text only; tool_calls are surfaced through
+        ``chat_with_meta`` (which now also returns them) or by inspecting
+        the pool's ``last_stream_tool_calls`` attribute after a
+        ``stream()`` call.
         """
         pool = await self._ensure_pool()
         excluded: set = set()
         last_exc: Optional[Exception] = None
+        # Resolve the effective messages list once. The default is the
+        # legacy prompt/sprompt pair, but ``messages`` (when supplied)
+        # is forwarded verbatim so the upstream sees the full
+        # conversation history (tool messages, assistant tool_call
+        # turns, prior user/assistant pairs).
+        if messages is None:
+            effective_messages: list = _to_messages(prompt or "", sprompt)
+        else:
+            effective_messages = messages
 
         for attempt in range(max_retries + 1):
             # When `model` is None the caller used `sophia-auto` and
@@ -331,24 +357,65 @@ class SophiaPool:
 
             try:
                 client = pool._client_for(entry)
-                text = await client.chat(
-                    prompt=prompt,
-                    model=entry.model.name,
-                    system=sprompt or "You are a helpful assistant.",
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                )
-                # Stash meta the same way ladyol.chat does, so
-                # chat_with_meta's getattr probing still works.
-                # (setattr keeps static checkers quiet; the attrs are
-                # dynamic stash points ladyol versions may or may not
-                # define.)
-                try:
+                # T-NEW-119 (2026-08-27): when the caller supplied a
+                # messages list (the new hermes-driven path), route
+                # through the streaming client so we can collect the
+                # upstream's `tool_calls` deltas. The legacy
+                # prompt/sprompt path still uses the simpler
+                # `client.chat()` shape.
+                if messages is not None:
+                    tool_calls: List[Dict[str, Any]] = []
+                    text_pieces: List[str] = []
+                    async for event in client.stream(
+                        entry.model.name,
+                        effective_messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                    ):
+                        etype = event.get("type")
+                        if etype == "token":
+                            text_pieces.append(str(event.get("content") or ""))
+                        elif etype == "tool_call":
+                            for tc in (event.get("tool_calls") or []):
+                                if isinstance(tc, dict):
+                                    tool_calls.append(tc)
+                    text = "".join(text_pieces)
+                    # Persist the aggregated tool_calls on the pool so
+                    # chat_with_meta (and any future callers) can read
+                    # them without re-walking the stream.
+                    setattr(pool, "last_tool_calls", tool_calls)
                     setattr(pool, "last_provider", entry.provider)
                     setattr(pool, "last_model", entry.model.name)
-                except Exception:
-                    pass
+                else:
+                    # Legacy path — `client.chat` returns the new
+                    # (content, tool_calls, usage) tuple; preserve
+                    # backwards-compatible behaviour (text return) but
+                    # also stash the tool_calls for chat_with_meta.
+                    chat_result = await client.chat(
+                        prompt=prompt or "",
+                        model=entry.model.name,
+                        system=sprompt or "You are a helpful assistant.",
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                    )
+                    if isinstance(chat_result, tuple) and len(chat_result) == 3:
+                        text, tool_calls, _usage = chat_result
+                    else:
+                        # Old-shape fallback (defensive — should not
+                        # trigger on a clean deploy but keeps callers
+                        # safe if a stale ladyol is in the venv).
+                        text = chat_result
+                        tool_calls = []
+                    setattr(pool, "last_tool_calls", tool_calls)
+                    # Stash meta the same way ladyol.chat does, so
+                    # chat_with_meta's getattr probing still works.
+                    try:
+                        setattr(pool, "last_provider", entry.provider)
+                        setattr(pool, "last_model", entry.model.name)
+                    except Exception:
+                        pass
                 # Broken-model detection: when the caller supplied tool
                 # definitions but the upstream returned a tiny
                 # thinking-block fragment with no tool_call, the model
@@ -377,9 +444,15 @@ class SophiaPool:
                 # cooldown, the second and subsequent calls in the
                 # same window skip the broken account and hit a
                 # single clean 502 instead.
+                #
+                # T-NEW-119: also skip rotation when the model emitted
+                # a structured tool_call (the upstream gave us an
+                # actionable response — broken-model detection only
+                # applies to the "thought but didn't act" case).
                 if (
                     model is None
                     and tools
+                    and not tool_calls
                     and (not text or len(text.strip()) < 200)
                 ):
                     excluded.add(id(entry))
@@ -428,8 +501,9 @@ class SophiaPool:
 
     async def chat_with_meta(
         self,
-        prompt: str,
+        prompt: Optional[str] = None,
         sprompt: str = "",
+        messages: Optional[list] = None,
         temperature: float = 0.7,
         strategy: str = "random",
         model: Optional[str] = None,
@@ -437,27 +511,25 @@ class SophiaPool:
         tools: Optional[list] = None,
     ) -> tuple[str, dict]:
         """Like ``chat`` but also returns a meta dict so callers can
-        extract provider_name / usage / cost keys for accounting.
+        extract provider_name / usage / cost / tool_calls keys for
+        accounting and response assembly.
 
-        `tools` is the OpenAI-style tool-definition array forwarded
-        to the upstream.  Prior to this parameter being added (2026-08-24,
-        commit af7e8b2), the upstream never saw the caller's tool
-        definitions — the upstream was getting a text-only request
-        and was hallucinating tool calls in non-spec formats.  See
-        sophia CHANGES.md af7e8b2 for the full trail.
+        ``messages`` — T-NEW-119 — when supplied, is the full
+        conversation history that gets forwarded to the upstream.
+        ``prompt`` / ``sprompt`` are the legacy 2-message shortcut.
 
-        Today ladyol's pool doesn't expose per-response metadata
-        uniformly across providers, so we return a best-effort dict
-        populated from what the pool DOES expose after a chat call:
-        ``provider_name`` from the last-picked provider object, plus
-        ``usage`` when the upstream surfaced it.
-
+        The returned meta dict includes:
+          - ``provider_name`` (from the last-picked provider object)
+          - ``model`` (the actual model id that served the request)
+          - ``usage`` (when the upstream surfaced it)
+          - ``tool_calls`` (OpenAI-shape list, [] when none)
         When meta is empty the server falls back to word-count token
         estimates (see server._token_counts).
         """
         pool = await self._ensure_pool()
         text = await self.chat(
-            prompt=prompt, sprompt=sprompt, temperature=temperature,
+            prompt=prompt, sprompt=sprompt, messages=messages,
+            temperature=temperature,
             strategy=strategy, model=model, max_tokens=max_tokens, tools=tools,
         )
         meta: dict = {}
@@ -474,6 +546,10 @@ class SophiaPool:
             ("last_provider", "provider_name"),
             ("last_usage", "usage"),
             ("last_model", "model"),
+            # T-NEW-119 (2026-08-27): also surface the aggregated
+            # tool_calls so callers (the OpenAI Chat Completions
+            # response builder) can attach them to the assistant turn.
+            ("last_tool_calls", "tool_calls"),
         ):
             v = getattr(pool, attr, None)
             if v is None:
@@ -482,25 +558,37 @@ class SophiaPool:
                 # Coerce Provider/dataclass to its display name
                 v = getattr(v, "name", str(v))
             meta[key] = v
+        # Normalise tool_calls to [] (not None) when the model emitted
+        # none — keeps the response builder branch simple.
+        meta.setdefault("tool_calls", [])
         return text, meta
 
     async def stream(
         self,
-        prompt: str,
+        prompt: Optional[str] = None,
         sprompt: str = "",
+        messages: Optional[list] = None,
         temperature: float = 0.7,
         strategy: str = "random",
         model: Optional[str] = None,
         max_retries: int = 3,
         max_tokens: Optional[int] = None,
         tools: Optional[list] = None,
-    ) -> AsyncIterator[str]:
-        """Yield plain text chunks, translating ladyol's event dicts.
+    ) -> AsyncIterator[Union[str, dict]]:
+        """Yield mixed events (str text + dict OpenAI SSE deltas) from
+        the upstream. The shape mirrors what hermes expects:
 
-        ladyol's low-level client stream yields dicts with a ``type``
-        key: ``token`` (content), ``usage`` (tokens mapping), ``done``.
-        We surface the token text as str chunks and stash the last
-        usage payload on ``self.last_stream_usage`` for accounting.
+        * ``str`` chunks for prose content.
+        * ``dict`` chunks with shape
+          ``{"delta": {"tool_calls": [<OpenAI streaming tool-call
+          delta>], "content": <str-or-None>}, "finish_reason":
+          <str-or-None>}`` so the OpenAI SSE response builder can
+          forward them verbatim to hermes.
+
+        ``messages`` (T-NEW-119, 2026-08-27) — when supplied, is the
+        full conversation history forwarded to ladyol's streaming
+        client. Without it, the legacy 2-message
+        ``(prompt, sprompt)`` shortcut is used.
 
         Rotation on failure: ladyol's ProviderPool.stream picks ONE
         entry and never retries (chat() rotates via _failed_entries;
@@ -515,8 +603,17 @@ class SophiaPool:
         """
         pool = await self._ensure_pool()
         self.last_stream_usage = {}
+        self.last_stream_tool_calls: List[Dict[str, Any]] = []
         excluded: set = set()
-        messages = _to_messages(prompt, sprompt)
+        # Resolve the effective messages list — default to the legacy
+        # ``[system, user]`` pair; when ``messages`` is supplied,
+        # forward verbatim so the upstream sees the full conversation
+        # (tool messages with tool_call_id, prior assistant tool_call
+        # turns, etc.).
+        if messages is None:
+            effective_messages: list = _to_messages(prompt or "", sprompt)
+        else:
+            effective_messages = messages
         last_exc: Optional[Exception] = None
 
         for attempt in range(max_retries + 1):
@@ -565,7 +662,7 @@ class SophiaPool:
             total_yielded: int = 0  # broken-model detection
             try:
                 client = pool._client_for(entry)
-                async for chunk in client.stream(entry.model.name, messages,
+                async for chunk in client.stream(entry.model.name, effective_messages,
                                                  strategy=strategy,
                                                  temperature=temperature,
                                                  max_tokens=max_tokens,
@@ -580,6 +677,23 @@ class SophiaPool:
                                 yield text
                         elif ctype == "usage":
                             self.last_stream_usage = dict(chunk.get("tokens") or {})
+                        elif ctype == "tool_call":
+                            # T-NEW-119 (2026-08-27): forward the upstream's
+                            # structured tool_call deltas as a dict event
+                            # shaped like an OpenAI Chat Completions SSE
+                            # chunk (without the ``id``/``object``/``model``
+                            # envelope — the SSE response builder adds
+                            # those). The downstream /v1/chat/completions
+                            # SSE consumer forwards this verbatim to hermes
+                            # so its tool loop can drive the call.
+                            delta_calls = chunk.get("tool_calls") or []
+                            self.last_stream_tool_calls.extend(
+                                tc for tc in delta_calls if isinstance(tc, dict)
+                            )
+                            yield {
+                                "delta": {"tool_calls": delta_calls},
+                                "finish_reason": None,
+                            }
                     elif isinstance(chunk, str) and chunk:
                         emitted = True
                         total_yielded += len(chunk)
@@ -603,11 +717,17 @@ class SophiaPool:
             # the response is broken.  The check happens AFTER the
             # stream finishes so the caller doesn't see an
             # aborted-then-recovered stream.
+            #
+            # T-NEW-119 (2026-08-27): skip when the upstream emitted a
+            # structured tool_call (the model gave us an actionable
+            # response — broken-model detection only applies to the
+            # "thought but didn't act" case).
             if (
                 err is None
                 and emitted
                 and model is None
                 and tools
+                and not self.last_stream_tool_calls
                 and total_yielded < 200
             ):
                 excluded.add(id(entry))
