@@ -12,9 +12,9 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import AsyncIterator, Optional
+from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request, Depends
+from fastapi import FastAPI, Header, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from kahndor.logma import Logma
 
@@ -32,7 +32,7 @@ from sophia.schemas import (
     Usage,
 )
 from sophia.sophia import SophiaDB
-from sophia.usage import UsageLog, UsageRow, default_window_summaries
+from sophia.usage import UsageLog, UsageRow
 
 logma = Logma(__name__)
 

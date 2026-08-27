@@ -5,7 +5,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 
 
 def _run_cli(args: list[str], env_extra: dict, vault_dir: Path) -> subprocess.CompletedProcess:
@@ -37,13 +36,6 @@ def test_init_creates_vault(tmp_path: Path):
 
 def test_set_and_list_roundtrip(tmp_path: Path):
     assert _run_cli(["init"], {}, tmp_path).returncode == 0
-    set_result = _run_cli(
-        ["set", "anthropic_api_key", "--from-file", "/dev/stdin"],
-        {}, tmp_path,
-    ) if False else _run_cli(
-        ["set", "anthropic_api_key"],
-        {}, tmp_path,
-    )
     # stdin path
     proc = subprocess.run(
         [sys.executable, "-m", "sophia.cmds.manage_secrets", "set", "anthropic_api_key"],

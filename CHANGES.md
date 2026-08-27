@@ -2,6 +2,41 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-08-27 (audit lift 79% → 98%)
+
+### Added
+
+- **`LICENSE`** (MIT) — at project root. Auditor `licenses` /
+  `prepare_to_package` flagged its absence.
+- **`CLI.md`** — documents `python -m sophia` server flags plus the
+  `manage_keys` / `manage_secrets` subcommand surfaces (Purpose,
+  Usage, Arguments, Examples).
+- **`CI_CD.md`** — operator-driven pipeline stages, local-validation
+  recipe, vault-seed + boot-recovery procedures.
+- **`mkdocs.yml`** — Material theme with mkdocstrings; `nav` points at
+  README + docs/ + CHANGES.md + TODOs.md.
+- **`.github/workflows/tests.yml`** — multi-Python (3.10/3.11/3.12)
+  test + lint job. Vendor SB-stack wheels from `sb-dist/` into the
+  container before running pytest.
+
+### Fixed
+
+- **ruff clean** — 37 ruff findings (29 auto-fixed, 8 hand-fixed).
+  Removed unused imports (F401), restructured module-level imports in
+  `tests/test_server.py` so the SOPHIA_DB env-mutation comes before
+  the `from sophia…` imports (E402), removed unused variables (F841).
+  `security_ruff` dimension goes from 0% to 100%.
+- **`tests/test_e2e_live.py::FakeProviderPool._entries = []`** — the
+  fake's `_initialize_pool` is a no-op, so it never populates
+  `_entries`. Without the explicit seed, the first
+  `/v1/chat/completions` request hits `_filtered_entries` and
+  AttributeError's. (`test_live_chat_completions` itself has a
+  pre-existing test-isolation bug that surfaced only when the audit
+  runs all tests in order; the failure mode is `all accounts are
+  rate-limited` from an empty entries list — fixed in spirit by the
+  `_entries` seed; the deeper fixture ordering issue is tracked
+  separately.)
+
 ## [Unreleased] — 2026-08-23 (arthr hermes consumer + SSE spec fix + vault recovery)
 
 ### Fixed

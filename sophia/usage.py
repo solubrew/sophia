@@ -11,10 +11,9 @@ Lives in the shared ``sophia.db`` (see :mod:`sophia.sophia`).
 
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Optional
+from typing import Optional
 
 from sophia.sophia import SophiaDB
 

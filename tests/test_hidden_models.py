@@ -7,11 +7,9 @@ is done separately by restarting the running sophia_sophia_1.
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -316,7 +314,6 @@ def test_chat_rotates_when_upstream_returns_tiny_no_tool_response():
     that as a broken model and rotate to the next entry — not return
     the useless fragment to the caller."""
     import asyncio
-    from sophia.pool import SophiaPool
 
     entry_broken = _make_entry("minimax-m3")  # the broken one
     entry_next = _make_entry("glm-5.2")      # what we'd rotate to
@@ -334,7 +331,6 @@ def test_chat_rotates_when_upstream_returns_tiny_no_tool_response():
         # signal is that the first entry was *excluded* (logged
         # warning) and we retried, not that we got a successful
         # response.
-        from sophia.pool import SophiaPool
         try:
             await pool.chat(
                 prompt="list /tmp",
@@ -356,7 +352,6 @@ def test_chat_returns_normal_response_when_not_broken():
     """The broken-model detection must NOT fire when the upstream
     returns a normal-length response (sanity check)."""
     import asyncio
-    from sophia.pool import SophiaPool
 
     class _GoodClient:
         async def chat(self, **kwargs):
@@ -386,7 +381,6 @@ def test_chat_does_not_rotate_on_explicit_model_pin():
     model — if it's broken, that's a config issue, not a routing
     issue)."""
     import asyncio
-    from sophia.pool import SophiaPool
 
     pool = _StubSophiaPool(
         entries=[_make_entry("minimax-m3")],

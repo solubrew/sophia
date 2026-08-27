@@ -39,7 +39,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 
 DEFAULT_CAPTURE_DIR = Path(__file__).parent / "_data_" / "captures"

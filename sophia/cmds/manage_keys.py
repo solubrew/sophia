@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime, timezone
 
 from sophia.sophia import SophiaDB
 from sophia.keys import KeyStore

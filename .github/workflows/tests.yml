@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+    branches: [gamma, delta]
+  pull_request:
+    branches: [gamma]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip hatchling pytest pytest-asyncio
+          # SB-stack runtime deps (kanhor, subtrix, pycurity, ladyol) are
+          # NOT on PyPI — see scripts/build-sophia.sh + docs/DEPLOY.md
+          # for the wheel-vendoring path. Locally we install from the
+          # vendored sb-dist/ directory.
+          python -m pip install --no-deps --no-index \
+              --find-links ./sb-dist \
+              $(ls ./sb-dist/*.whl | tr '\n' ' ')
+      - name: Lint
+        run: |
+          python -m pip install ruff
+          ruff check sophia/ tests/
+      - name: Run tests
+        run: pytest tests/ -q

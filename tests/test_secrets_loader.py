@@ -4,7 +4,6 @@
 We use a tmpdir vault so tests don't touch the real PyKeyStore instance.
 """
 import os
-import stat
 from pathlib import Path
 
 import pytest

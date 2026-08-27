@@ -11,7 +11,7 @@ import asyncio
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator, Optional
 
 from kahndor.logma import Logma
 

@@ -40,6 +40,17 @@ def live_server(monkeypatch):
             self.config = _FakeConfig()
             self.providers = self.config.get("providers")
             self.chat_calls = []
+            # sophia.pool._filtered_entries reads `_entries` from the
+            # underlying ProviderPool. The real pool populates this in
+            # `_initialize_pool()`, but the fake skips initialisation,
+            # so we seed `_entries` with an empty list to avoid
+            # AttributeError. The e2e tests below skip themselves when
+            # no model is registered (the test was originally passing
+            # only because test_server.py leaked a patched
+            # `sophia.server.SophiaPool` into the module state; that
+            # leak was a separate test isolation bug now fixed by
+            # routing e2e through its own live_server fixture).
+            self._entries = []
 
         def _initialize_pool(self):
             pass

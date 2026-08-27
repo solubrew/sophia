@@ -13,10 +13,7 @@ missing secrets raise ``ValueError`` at startup.
 """
 from __future__ import annotations
 
-import importlib.util as _ilu
 import os
-from os.path import abspath as _abspath, dirname as _dirname, join as _join
-from typing import Optional
 
 
 def _allow_env_fallback() -> bool:

@@ -6,9 +6,6 @@ needs a TTY). The SophiaDB is isolated per test via a temp SOPHIA_DB env so
 key lookups don't leak between tests.
 """
 import os
-from pathlib import Path
-import pytest
-from httpx import ASGITransport, AsyncClient
 
 # Set SOPHIA_DB BEFORE importing sophia so default_db_path() picks it up.
 TEST_DB = "/tmp/sophia_test_suite_default.db"
@@ -16,10 +13,14 @@ if os.path.exists(TEST_DB):
     os.unlink(TEST_DB)
 os.environ["SOPHIA_DB"] = TEST_DB
 
-from sophia.server import create_app
-from sophia.sophia import SophiaDB
-from sophia.keys import KeyStore
-from sophia.usage import UsageLog
+from pathlib import Path  # noqa: E402
+
+import pytest  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+
+from sophia.server import create_app  # noqa: E402
+from sophia.sophia import SophiaDB  # noqa: E402
+from sophia.keys import KeyStore  # noqa: E402
 
 
 class FakePoolShim:
@@ -250,7 +251,6 @@ async def test_captures_list_authenticated(client, admin_key):
 
 @pytest.fixture
 async def admin_key(_isolated_db):
-    _, keys, _ = (None, None, None)
     # Reuse the existing app.state.keys via create_app() and add an admin.
     import importlib
     import sophia.server as srv
@@ -317,9 +317,8 @@ async def test_admin_can_read_usage_and_chat(client, admin_key):
 async def test_invalid_role_at_creation():
     """Role validation in KeyStore.create — protects against typos in
     the CLI that would silently downgrade privileges."""
-    from sophia.keys import KeyStore
-    from sophia.sophia import SophiaDB
-    import tempfile, os
+    import tempfile
+    import os
     db_file = Path(tempfile.mkstemp(suffix=".db")[1])
     os.environ["SOPHIA_DB"] = str(db_file)
     db = SophiaDB()
