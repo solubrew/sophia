@@ -66,10 +66,40 @@ class _ProviderCooldowns:
     """
 
     def __init__(self, db=None) -> None:
-        # If a real db is provided, attach to it. Otherwise build a
-        # default SophiaDB so legacy test code that constructs
-        # ``_ProviderCooldowns()`` with no args still works.
-        self._impl = CooldownStore(db if db is not None else SophiaDB())
+        # T-NEW-221 followup (2026-08-29): the original no-arg fallback
+        # built ``SophiaDB()`` — the DEFAULT persistent sophia.db. Tests
+        # constructing ``_ProviderCooldowns()`` directly then leaked
+        # pause rows into that shared file across tests AND across
+        # pytest invocations, which made later 429-rotation tests and
+        # the live e2e suite see stale "all accounts paused" state.
+        # The no-arg path is test-only now, so give each instance an
+        # ephemeral temp-file DB. (In-memory won't work: CooldownStore
+        # opens a fresh connection per call, so a :memory: DB would be
+        # empty every time.) Production always passes a real ``db``.
+        self._tmp_db_path: Optional[str] = None
+        if db is None:
+            import os as _os
+            import tempfile
+            from pathlib import Path as _Path
+
+            fd, path = tempfile.mkstemp(
+                prefix="sophia_cooldowns_shim_", suffix=".db"
+            )
+            _os.close(fd)
+            _os.unlink(path)  # SophiaDB wants to create it fresh
+            db = SophiaDB(_Path(path))
+            self._tmp_db_path = path
+        self._impl = CooldownStore(db)
+
+    def __del__(self) -> None:  # best-effort temp cleanup
+        tmp = getattr(self, "_tmp_db_path", None)
+        if tmp:
+            import os as _os
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    _os.unlink(tmp + suffix)
+                except OSError:
+                    pass
 
     def pause(self, account: str, until_utc) -> None:
         self._impl.pause(account, until_utc)
@@ -102,6 +132,61 @@ class _ProviderCooldowns:
             ).fetchall()
         return {r[0]: float(r[1]) for r in rows}
 
+    def earliest_unpause_utc(self) -> Optional[datetime]:
+        """Return the soonest UTC timestamp any paused account reactivates.
+
+        Used by server.py to populate the ``Retry-After`` header on a
+        429 response — the value is the seconds-until the NEXT account
+        in the pool comes back, not the last one. Returns ``None`` when
+        nothing is paused (which would mean the rotation gave up for
+        some other reason — see ``PoolQuotaExhausted``).
+        """
+        if not self._paused_until:
+            return None
+        return datetime.fromtimestamp(min(self._paused_until.values()), tz=timezone.utc)
+
+
+class PoolQuotaExhausted(Exception):
+    """Raised when every eligible account on the allowlist is paused.
+
+    Distinct from generic ``RuntimeError`` so the HTTP layer can map
+    it to a real 429 (with ``Retry-After``) instead of a generic 502.
+    Carries structured detail for the response body and the
+    ``Retry-After`` header.
+
+    Attributes:
+        paused_accounts: list of ``"<provider>:<key[:8]>"`` strings
+            currently sitting in the cooldown dict.
+        earliest_unpause_utc: UTC datetime when the FIRST account
+            comes back (the soonest moment the pool can serve again).
+        last_exc: the underlying exception from the last-attempted
+            entry (for debugging; usually an ``httpx.HTTPStatusError``
+            or a ladyol-wrapped 429).
+    """
+
+    def __init__(
+        self,
+        paused_accounts: List[str],
+        earliest_unpause_utc: Optional[datetime],
+        last_exc: Optional[BaseException] = None,
+    ) -> None:
+        self.paused_accounts = list(paused_accounts)
+        self.earliest_unpause_utc = earliest_unpause_utc
+        self.last_exc = last_exc
+        retry_after = (
+            int((earliest_unpause_utc - datetime.now(timezone.utc)).total_seconds())
+            if earliest_unpause_utc is not None
+            else None
+        )
+        detail = (
+            "all eligible accounts are rate-limited; "
+            f"paused={paused_accounts}; "
+            f"earliest_unpause_utc="
+            f"{earliest_unpause_utc.isoformat() if earliest_unpause_utc else 'unknown'}"
+            + (f"; retry_after_seconds={retry_after}" if retry_after is not None else "")
+        )
+        super().__init__(detail)
+
 
 def _account_of(entry) -> str:
     """Stable identity for the ACCOUNT (API key allotment) behind an entry.
@@ -115,6 +200,164 @@ def _account_of(entry) -> str:
     name = getattr(prov, "name", "?") or "?"
     key = getattr(prov, "api_key", "") or ""
     return f"{name}:{key[:8]}"
+
+
+def _entry_context_window(entry) -> Optional[int]:
+    """Return the input-cap for an entry, falling back across the
+    knobs that the operator can set per model:
+
+      * ``entry.model.context_window`` — declared in ``agent.yaml``
+        (always present, e.g. 200000 for minimax).
+      * ``entry.model.model_overrides['max_input_tokens']`` — explicit
+        per-model override for cases where the upstream has a stricter
+        limit than the advertised context window (e.g. minimax-m3's
+        ~935-byte response cap makes the *effective* input window
+        much smaller than the declared 200k).
+
+    Returns ``None`` when no cap is declared (treated as unbounded —
+    the entry will accept any input size).
+    """
+    try:
+        ctx = getattr(entry.model, "context_window", None)
+        if ctx:
+            return int(ctx)
+        # Fall back to the per-model override if the bundle didn't
+        # surface context_window (some ladyol versions may not).
+        overrides = getattr(entry.model, "model_overrides", None) or {}
+        cap = overrides.get("max_input_tokens")
+        if cap is not None:
+            return int(cap)
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _entry_max_input_tokens(entry) -> Optional[int]:
+    """Strict per-model input cap (operator override).
+
+    This is the knob the operator sets when they know an upstream has
+    a hidden cap below its declared ``context_window`` (e.g.
+    ``max_input_tokens: 80000`` to keep requests well clear of a
+    model's actual safe limit). Returns ``None`` when unset — in which
+    case ``_entry_context_window`` is the operative cap.
+    """
+    try:
+        overrides = getattr(entry.model, "model_overrides", None) or {}
+        cap = overrides.get("max_input_tokens")
+        if cap is not None:
+            return int(cap)
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _estimate_input_tokens(messages: List[Dict[str, Any]]) -> int:
+    """Rough token estimate for an OpenAI-shaped messages list.
+
+    Heuristic: sum character lengths across ``content`` + ``tool_calls``
+    deltas, divide by 4 (the standard chars-per-token approximation
+    for English text; conservative for code/JSON which runs denser).
+    Tools add an estimated overhead proportional to the schema size.
+
+    The estimate is intentionally conservative — the point is to
+    refuse *obvious* oversize requests at the gateway, not to predict
+    the upstream's tokenizer exactly. The upstream still gets to
+    reject with its own 400 if the estimate was wrong.
+    """
+    if not messages:
+        return 0
+    total_chars = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        # content: string OR list of content-part dicts (vision / multi-part)
+        c = msg.get("content")
+        if isinstance(c, str):
+            total_chars += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    total_chars += len(str(part.get("text", "")))
+        # tool_calls: count the JSON of each call (function name + args)
+        for tc in (msg.get("tool_calls") or []):
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                total_chars += len(str(fn.get("name", "")))
+                total_chars += len(str(fn.get("arguments", "")))
+        # tool_call_id (for tool-role replies)
+        total_chars += len(str(msg.get("tool_call_id", "")))
+        # role overhead
+        total_chars += 8
+    # chars/4 is the standard estimate; round up so we err on the
+    # side of slightly overestimating (better to 413 a borderline
+    # request than to send it upstream and watch it 400).
+    return (total_chars + 3) // 4
+
+
+def _entry_fits(entry, estimated_tokens: int) -> bool:
+    """T-NEW-121: True when the entry's input cap fits the request.
+
+    Mirrors the threshold logic in ``_filtered_entries``: unbounded
+    entries (no declared cap) always fit; bounded entries fit only
+    when ``cap >= estimated_tokens``. Used at the ladyol
+    ``_select_entry`` acceptance sites so the initial pick ALSO
+    honors the size narrowing (not just the filtered list).
+    """
+    if estimated_tokens <= 0:
+        return True
+    cap = _entry_max_input_tokens(entry)
+    if cap is None:
+        cap = _entry_context_window(entry)
+    return cap is None or cap >= estimated_tokens
+
+
+class RequestTooLarge(Exception):
+    """Raised when the estimated input size exceeds the largest input
+    cap available in the allowlist.
+
+    Distinct from ``PoolQuotaExhausted`` so the HTTP layer can map it
+    to a **413 Payload Too Large** (not a 429). Carries structured
+    detail so the harness can decide whether to compress the
+    conversation (the typical fix) or split the request.
+
+    Attributes:
+        estimated_tokens: token estimate from ``_estimate_input_tokens``
+        smallest_fittable_window: smallest ``context_window`` (or
+            ``max_input_tokens`` override) across the allowlist; the
+            request fits if ``estimated_tokens <= this``.
+        largest_fittable_window: largest input cap across the
+            allowlist; if ``estimated_tokens > largest_fittable_window``
+            the request simply can't be served by any account and the
+            caller must compact before retrying.
+        eligible_count: number of allowlist entries that COULD fit the
+            request — drives ``compact_required: True/False`` in the
+            HTTP body. ``0`` means no eligible account at all.
+    """
+
+    def __init__(
+        self,
+        estimated_tokens: int,
+        smallest_fittable_window: int,
+        largest_fittable_window: int,
+        eligible_count: int,
+    ) -> None:
+        self.estimated_tokens = estimated_tokens
+        self.smallest_fittable_window = smallest_fittable_window
+        self.largest_fittable_window = largest_fittable_window
+        self.eligible_count = eligible_count
+        # When 0 accounts can fit, the caller MUST compact; when some
+        # can fit but not all, the rotation can still proceed on the
+        # subset that fits.
+        compact_required = eligible_count == 0
+        detail = (
+            "request too large for the provider pool; "
+            f"estimated_tokens={estimated_tokens}; "
+            f"smallest_fittable_window={smallest_fittable_window}; "
+            f"largest_fittable_window={largest_fittable_window}; "
+            f"eligible_count={eligible_count}; "
+            f"compact_required={compact_required}"
+        )
+        super().__init__(detail)
 
 
 class SophiaPool:
@@ -203,12 +446,41 @@ class SophiaPool:
                         agent_path=str(agent_dir),  # must be a directory
                         cfg={"providers": {}},  # override so the bundled kahndor is bypassed
                     )
+                    # T-NEW-121 (2026-08-28): ladyol's constructor runs
+                    # _initialize_pool() once against its BUNDLED
+                    # providers.yaml (registering entries with the
+                    # bundled catalog's values — e.g. minimax-m3 /
+                    # glm-5.2 with context_window=1_000_000). The
+                    # override + second _initialize_pool() below then
+                    # APPENDS the agent.yaml-configured entries instead
+                    # of replacing, leaving 17 entries: 8 phantom
+                    # bundled ones (inflated caps) + 9 real ones. The
+                    # phantom entries with huge declared caps made the
+                    # T-NEW-121 pre-flight size check meaningless (the
+                    # estimated tokens never exceeded largest_cap=1M).
+                    # Snapshot the phantom count so we can drop exactly
+                    # those after the second init registers the real
+                    # set. (Dedup-by-(account, model) with
+                    # later-registration-wins would also work, but the
+                    # slice is simpler and preserves registration
+                    # order.)
+                    pre_init_count = len(getattr(self._pool, "_entries", []) or [])
                     # Re-load with the real path via the override hook:
                     self._pool.config = self._pool.config.override(
                         {"providers": _load_providers_dict(agent_dir)}
                     )
                     self._pool.providers = self._pool.config.get("providers")
                     self._pool._initialize_pool()
+                    if pre_init_count:
+                        # Drop the phantom bundled entries (the first
+                        # ``pre_init_count`` registrations) — but only
+                        # when the second init actually appended new
+                        # ones. When nothing was appended (e.g. a
+                        # monkeypatched stub pool whose init is a
+                        # no-op), the existing entries ARE the config.
+                        entries = getattr(self._pool, "_entries", []) or []
+                        if len(entries) > pre_init_count:
+                            self._pool._entries = entries[pre_init_count:]
                     # Apply the operator's hidden_models filter at the
                     # application boundary.  ladyol's bundled
                     # `providers.yaml` registers every model with
@@ -257,12 +529,23 @@ class SophiaPool:
                     f"sophia-auto will rotate only across this set"
                 )
 
-    def _filtered_entries(self, for_auto: bool = False):
+    def _filtered_entries(
+        self,
+        for_auto: bool = False,
+        min_context_tokens: Optional[int] = None,
+    ):
         """Return ``pool._entries`` with any operator-hidden models
         removed.  If ``for_auto`` is True AND ``SOPHIA_AUTO_MODELS`` is
         set, the list is FURTHER restricted to just the configured
         auto-allowlist.  Returns an empty list if the pool hasn't been
         constructed yet.
+
+        If ``min_context_tokens`` is provided, entries whose
+        ``context_window`` (or ``max_input_tokens`` override) is
+        smaller than that value are dropped — the caller has a request
+        it knows is too big for those accounts, and there's no point
+        including them in the rotation. Entries with NO declared cap
+        are kept (treated as unbounded).
 
         Note: the cached ``@lru_cache`` on ladyol's
         ``ProviderPool.available`` still operates on the unfiltered
@@ -276,7 +559,54 @@ class SophiaPool:
         if for_auto and self._config.auto_models:
             allow = self._config.auto_models
             out = [e for e in out if e.model.name in allow]
+        if min_context_tokens is not None:
+            threshold = int(min_context_tokens)
+            filtered: list = []
+            for e in out:
+                cap = _entry_max_input_tokens(e)
+                if cap is None:
+                    cap = _entry_context_window(e)
+                # Unbounded (None) entries are kept; bounded entries
+                # only kept if their cap meets the threshold.
+                if cap is None or cap >= threshold:
+                    filtered.append(e)
+            out = filtered
         return out
+
+    def _pool_input_caps(self, for_auto: bool = False) -> List[int]:
+        """Return the sorted list of per-entry input caps for the
+        current allowlist.
+
+        Used by ``chat()`` and ``stream()`` to compute
+        ``smallest_fittable_window`` / ``largest_fittable_window``
+        for the pre-flight ``RequestTooLarge`` check. Entries with no
+        declared cap are treated as unbounded and excluded from the
+        numeric range (the caller can then decide whether to assume
+        "infinity" for those or to apply a sane operator-defined
+        ceiling — see ``_preflight_input_caps``).
+        """
+        caps: List[int] = []
+        for e in self._filtered_entries(for_auto=for_auto):
+            cap = _entry_max_input_tokens(e)
+            if cap is None:
+                cap = _entry_context_window(e)
+            if cap is not None and cap > 0:
+                caps.append(int(cap))
+        return sorted(caps)
+
+    def _preflight_input_caps(self, for_auto: bool = False) -> tuple:
+        """Compute the smallest/largest numeric input caps for the
+        allowlist.
+
+        Returns ``(smallest, largest, total_with_cap)``. When the
+        allowlist has no entries with a declared cap at all, both
+        bounds are ``None`` and the caller should treat the pre-flight
+        check as a no-op (we don't know any limit, so we don't refuse).
+        """
+        caps = self._pool_input_caps(for_auto=for_auto)
+        if not caps:
+            return (None, None, 0)
+        return (caps[0], caps[-1], len(caps))
 
     async def chat(
         self,
@@ -318,6 +648,10 @@ class SophiaPool:
         pool = await self._ensure_pool()
         excluded: set = set()
         last_exc: Optional[Exception] = None
+        # T-NEW-121: declared up here so the narrowed-rotation paths
+        # later in the function can read it without Pyright (or a
+        # human) having to prove the pre-flight branch ran.
+        estimated_tokens: int = 0
         # Resolve the effective messages list once. The default is the
         # legacy prompt/sprompt pair, but ``messages`` (when supplied)
         # is forwarded verbatim so the upstream sees the full
@@ -328,16 +662,86 @@ class SophiaPool:
         else:
             effective_messages = messages
 
-        for attempt in range(max_retries + 1):
+        # T-NEW-121 (2026-08-27): pre-flight request-size check.
+        # If the estimated token count exceeds the LARGEST input cap
+        # in the allowlist, refuse the request with ``RequestTooLarge``
+        # rather than rotating through every account and watching
+        # each one 400 / empty-stream (the 19:06 EDT arthr incident).
+        # When some accounts can fit but not all, we narrow the
+        # rotation to the fitting subset by passing the threshold
+        # into ``_filtered_entries`` — no need to even try the
+        # accounts that would fail up front.
+        for_auto = model is None
+        smallest_cap, largest_cap, total_with_cap = self._preflight_input_caps(
+            for_auto=for_auto
+        )
+        if largest_cap is not None:
+            estimated_tokens = _estimate_input_tokens(effective_messages)
+            if estimated_tokens > largest_cap:
+                # No account can serve this size — caller MUST
+                # compact before retrying.
+                eligible = 0
+                for e in self._filtered_entries(for_auto=for_auto):
+                    cap = _entry_max_input_tokens(e)
+                    if cap is None:
+                        cap = _entry_context_window(e)
+                    if cap is not None and cap >= estimated_tokens:
+                        eligible += 1
+                raise RequestTooLarge(
+                    estimated_tokens=estimated_tokens,
+                    smallest_fittable_window=int(smallest_cap or 0),
+                    largest_fittable_window=int(largest_cap),
+                    eligible_count=eligible,
+                )
+
+        # T-NEW-120 (2026-08-27): expand the rotation budget so the
+        # loop walks the FULL allowlist instead of capping at
+        # ``max_retries``. With 5 LLM accounts on the auto-allowlist,
+        # the old cap of 4 left headroom for only one full provider
+        # rotation before the 502 fired. The new cap is
+        # ``max(allowlist_size + 1, max_retries + 1)`` and the inner
+        # ``if not available: break`` is the real exit signal — if the
+        # pool is genuinely empty, we exit cleanly and raise the right
+        # error below (PoolQuotaExhausted vs generic RuntimeError).
+        # T-NEW-121: when the pre-flight check above narrowed the
+        # allowlist (e.g. because minimax-m3's 935-byte response cap
+        # makes it unfit for a 95k-token input), the rotation budget
+        # is computed against the FITTING subset, not the full list.
+        if largest_cap is not None and estimated_tokens > 0:
+            # The narrow subset excludes accounts that can't fit
+            # this request. Use the narrow size so we don't waste
+            # attempts that we know will fail.
+            narrow = self._filtered_entries(
+                for_auto=for_auto,
+                min_context_tokens=estimated_tokens,
+            )
+            allowlist_size = len(narrow) if narrow else len(
+                self._filtered_entries(for_auto=for_auto)
+            )
+        else:
+            allowlist_size = len(self._filtered_entries(for_auto=for_auto))
+        rotation_cap = max(allowlist_size + 1, max_retries + 1)
+        rate_limit_failures = 0  # T-NEW-120: track 429s for PoolQuotaExhausted
+        for attempt in range(rotation_cap):
             # When `model` is None the caller used `sophia-auto` and
             # wants auto-routing.  Apply the SOPHIA_AUTO_MODELS
             # allowlist filter in addition to the hidden filter so
             # the operator's default-route constraint takes effect.
             # When `model` is an explicit id, only the hidden filter
             # applies — the caller is pinning a specific model.
-            available = [e for e in self._filtered_entries(for_auto=(model is None))
-                         if id(e) not in excluded
-                         and not self.cooldowns.is_paused(_account_of(e))]
+            #
+            # T-NEW-121: also narrow by ``min_context_tokens`` when the
+            # pre-flight check ran — so the rotation never even picks
+            # an account that can't fit the request.
+            filter_kw: Dict[str, Any] = {"for_auto": for_auto}
+            if largest_cap is not None and estimated_tokens > 0:
+                filter_kw["min_context_tokens"] = estimated_tokens
+            available = [
+                e
+                for e in self._filtered_entries(**filter_kw)
+                if id(e) not in excluded
+                and not self.cooldowns.is_paused(_account_of(e))
+            ]
             if model:
                 available = [e for e in available if e.model.name == model]
             if not available:
@@ -362,11 +766,15 @@ class SophiaPool:
                 # filter is bypassed (verified 2026-08-24 via the
                 # auto-rotation-probe.py smoke test: 20/20 requests landed on
                 # minimax-m2.7 when only the visible-surface filter was in place).
+                # T-NEW-121: also honor the size narrowing — the selector
+                # doesn't know about min_context_tokens, so an unfit entry
+                # would otherwise sneak in on the first pick.
                 try:
                     sel = pool._select_entry(model or "", strategy=strategy)
                     if sel is not None and id(sel) not in excluded \
                             and not self.cooldowns.is_paused(_account_of(sel)) \
-                            and sel.model.name not in self._config.hidden_models:
+                            and sel.model.name not in self._config.hidden_models \
+                            and _entry_fits(sel, estimated_tokens):
                         entry = sel
                 except Exception:
                     pass  # fall back to available[0]
@@ -496,7 +904,15 @@ class SophiaPool:
                 last_exc = exc
                 acct = _account_of(entry)
                 if _is_rate_limit(exc):
+                    # T-NEW-120: pause AND count this failure. If the
+                    # loop ends with every account paused AND every
+                    # pause was a rate-limit, the trailing raise
+                    # below emits PoolQuotaExhausted (HTTP 429)
+                    # instead of a generic 502 — the harness can then
+                    # distinguish "we're quota-walled" from "the
+                    # upstream is broken".
                     self.cooldowns.pause(acct, _next_reset_utc())
+                    rate_limit_failures += 1
                 if model is None:
                     excluded.add(id(entry))
                     logma.warning(
@@ -505,7 +921,12 @@ class SophiaPool:
                     )
                     continue
                 raise
-        if last_exc is not None:
+        if last_exc is not None and rate_limit_failures == 0:
+            # Non-rate-limit failure on the last-attempted entry.
+            # Bubble the raw exception (the harness wants the original
+            # error context, not a re-shaped one). When at least one
+            # 429 happened, we fall through to the
+            # ``PoolQuotaExhausted`` check instead — see below.
             raise last_exc
         # No entries were available at all.
         # Same filter as the rotation loop: when the caller used
@@ -516,6 +937,34 @@ class SophiaPool:
         active = [e for e in self._filtered_entries(for_auto=(model is None))
                   if not self.cooldowns.is_paused(_account_of(e))]
         if not active:
+            # T-NEW-120: distinguish "every failure was a rate limit
+            # and the pool is now empty" (the harness should back off
+            # until the next reset window) from "we ran out of
+            # entries for some other reason" (probably a transient
+            # upstream fault). The cooldown dict is the source of
+            # truth for who-is-paused-when; combine it with our
+            # in-loop rate_limit_failures counter to classify.
+            paused = sorted(self.cooldowns._paused_until.keys())
+            # ``rate_limit_failures`` is only incremented on 429s;
+            # when it's > 0 AND every filtered entry is in the
+            # cooldown dict, the loop ended specifically because
+            # every pick was paused by a 429 — surface that as a
+            # structured PoolQuotaExhausted so the HTTP layer can
+            # return a real 429 + Retry-After.
+            all_paused_via_429 = (
+                rate_limit_failures > 0
+                and paused
+                and all(
+                    _account_of(e) in self.cooldowns._paused_until
+                    for e in self._filtered_entries(for_auto=(model is None))
+                )
+            )
+            if all_paused_via_429:
+                raise PoolQuotaExhausted(
+                    paused_accounts=paused,
+                    earliest_unpause_utc=self.cooldowns.earliest_unpause_utc(),
+                    last_exc=last_exc,
+                )
             raise RuntimeError(
                 "all accounts are rate-limited (paused until their next "
                 "reset window); try again after the next window"
@@ -638,15 +1087,73 @@ class SophiaPool:
         else:
             effective_messages = messages
         last_exc: Optional[Exception] = None
+        # T-NEW-121: declared up here so the narrowed-rotation paths
+        # later in the function can read it without Pyright (or a
+        # human) having to prove the pre-flight branch ran.
+        estimated_tokens: int = 0
 
-        for attempt in range(max_retries + 1):
+        # T-NEW-121 (2026-08-27): pre-flight request-size check.
+        # Mirrors chat() — see that function for the full rationale.
+        # If the request is too large for any account in the allowlist,
+        # raise ``RequestTooLarge`` immediately so the HTTP layer can
+        # return 413 instead of cycling through every account and
+        # bubbling the last raw upstream error.
+        for_auto = model is None
+        smallest_cap, largest_cap, _ = self._preflight_input_caps(for_auto=for_auto)
+        if largest_cap is not None:
+            estimated_tokens = _estimate_input_tokens(effective_messages)
+            if estimated_tokens > largest_cap:
+                eligible = 0
+                for e in self._filtered_entries(for_auto=for_auto):
+                    cap = _entry_max_input_tokens(e)
+                    if cap is None:
+                        cap = _entry_context_window(e)
+                    if cap is not None and cap >= estimated_tokens:
+                        eligible += 1
+                raise RequestTooLarge(
+                    estimated_tokens=estimated_tokens,
+                    smallest_fittable_window=int(smallest_cap or 0),
+                    largest_fittable_window=int(largest_cap),
+                    eligible_count=eligible,
+                )
+
+        # T-NEW-120 (2026-08-27): expand the rotation budget so the
+        # loop walks the FULL allowlist instead of capping at
+        # ``max_retries``. Mirrors the change in chat() — see that
+        # function for the rationale. The trailing raise below also
+        # now distinguishes PoolQuotaExhausted (HTTP 429) from the
+        # generic RuntimeError case.
+        # T-NEW-121: also narrows to the fitting subset when the
+        # pre-flight check ran.
+        if largest_cap is not None and estimated_tokens > 0:
+            narrow = self._filtered_entries(
+                for_auto=for_auto,
+                min_context_tokens=estimated_tokens,
+            )
+            allowlist_size = len(narrow) if narrow else len(
+                self._filtered_entries(for_auto=for_auto)
+            )
+        else:
+            allowlist_size = len(self._filtered_entries(for_auto=for_auto))
+        rotation_cap = max(allowlist_size + 1, max_retries + 1)
+        rate_limit_failures = 0  # T-NEW-120
+        for attempt in range(rotation_cap):
             # Candidate selection, honoring this call's exclusions.
             # See chat() for the same for_auto logic — when the caller
             # used `sophia-auto`, the SOPHIA_AUTO_MODELS allowlist
             # applies on top of the hidden filter.
-            available = [e for e in self._filtered_entries(for_auto=(model is None))
-                         if id(e) not in excluded
-                         and not self.cooldowns.is_paused(_account_of(e))]
+            #
+            # T-NEW-121: also narrow by ``min_context_tokens`` when the
+            # pre-flight check ran.
+            filter_kw: Dict[str, Any] = {"for_auto": for_auto}
+            if largest_cap is not None and estimated_tokens > 0:
+                filter_kw["min_context_tokens"] = estimated_tokens
+            available = [
+                e
+                for e in self._filtered_entries(**filter_kw)
+                if id(e) not in excluded
+                and not self.cooldowns.is_paused(_account_of(e))
+            ]
             if model:
                 available = [e for e in available if e.model.name == model]
             if not available:
@@ -667,9 +1174,11 @@ class SophiaPool:
                 # `SOPHIA_HIDDEN_MODELS=...` actually excludes the
                 # model from auto-routing. See the matching comment in
                 # chat() above for context.
+                # T-NEW-121: also honor the size narrowing.
                 try:
                     sel = pool._select_entry(model or "", strategy=strategy)
-                    if sel is not None and sel.model.name not in self._config.hidden_models:
+                    if sel is not None and sel.model.name not in self._config.hidden_models \
+                            and _entry_fits(sel, estimated_tokens):
                         entry = sel
                 except Exception as exc:
                     last_exc = exc
@@ -787,14 +1296,46 @@ class SophiaPool:
             # (1am/6am/11am/4pm/8pm EDT). Other accounts on the same
             # provider keep serving.
             if err is not None and _is_rate_limit(err):
+                # T-NEW-120: count the 429 alongside the pause so the
+                # trailing raise can classify the failure mode.
                 self.cooldowns.pause(_account_of(entry), _next_reset_utc())
+                rate_limit_failures += 1
             logma.warning(
                 f"[SophiaPool.stream] attempt {attempt + 1} failed on "
                 f"{getattr(entry.provider, 'name', '?')}/{entry.model.name}: "
                 f"{last_exc}; rotating to another provider"
             )
-        if last_exc is not None:
+        if last_exc is not None and rate_limit_failures == 0:
+            # Non-rate-limit failure on the last-attempted entry.
+            # Bubble the raw exception. When at least one 429
+            # happened, fall through to the PoolQuotaExhausted
+            # check below so the harness gets a structured quota
+            # signal instead of the raw upstream error.
             raise last_exc
+        # T-NEW-120: same distinction as chat() — if the rotation
+        # stopped because every account is now paused (i.e. every
+        # filtered entry is in the cooldown dict AND the loop ended
+        # without raising) AND we counted at least one 429 along the
+        # way, surface a structured PoolQuotaExhausted so the HTTP
+        # layer can return a real 429 with Retry-After. Otherwise the
+        # legacy "stream exhausted" RuntimeError is preserved for
+        # backwards compatibility with callers/tests that match on
+        # it.
+        paused = sorted(self.cooldowns._paused_until.keys())
+        all_paused_via_429 = (
+            rate_limit_failures > 0
+            and paused
+            and all(
+                _account_of(e) in self.cooldowns._paused_until
+                for e in self._filtered_entries(for_auto=(model is None))
+            )
+        )
+        if all_paused_via_429:
+            raise PoolQuotaExhausted(
+                paused_accounts=paused,
+                earliest_unpause_utc=self.cooldowns.earliest_unpause_utc(),
+                last_exc=last_exc,
+            )
         raise RuntimeError("stream exhausted all provider retries without content")
 
     async def list_models(self) -> list:

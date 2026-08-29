@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, Depends
@@ -22,7 +23,7 @@ from sophia.captures import CaptureStore
 from sophia.config import load_config
 from sophia.keys import KeyStore
 from sophia.leaked_tool_call_fix import extract_leaked_tool_calls
-from sophia.pool import SophiaPool, new_completion_id, now_ts
+from sophia.pool import PoolQuotaExhausted, RequestTooLarge, SophiaPool, new_completion_id, now_ts
 from sophia.schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -45,9 +46,83 @@ def _cost_for_model(provider_meta: dict, prompt_tokens: int, completion_tokens: 
     cout = float(provider_meta.get("costs_per_1k_output", 0) or 0)
     return (
         round(prompt_tokens / 1000 * cin, 6),
-        round(completion_tokens / 1000 * cout, 6),
+        round(prompt_tokens / 1000 * cout, 6),
         round(prompt_tokens / 1000 * cin + completion_tokens / 1000 * cout, 6),
     )
+
+
+def _retry_after_for(exc: PoolQuotaExhausted) -> int:
+    """Best-effort ``Retry-After`` value (seconds) for a quota wall.
+
+    Computed from ``exc.earliest_unpause_utc``; clamped to ``[1, 86400]``
+    so we never advertise 0 ("retry immediately — you'll fail again")
+    nor multi-day waits (which would imply the cooldown dict was
+    mis-seeded). Returns 60 as a safe fallback when the unpause time
+    isn't computable (e.g. timezone math blew up).
+    """
+    if exc.earliest_unpause_utc is None:
+        return 60
+    delta = (exc.earliest_unpause_utc - datetime.now(timezone.utc)).total_seconds()
+    return max(1, min(86400, int(delta)))
+
+
+def _quota_exhausted_response(exc: PoolQuotaExhausted) -> JSONResponse:
+    """Build the HTTP 429 response for ``PoolQuotaExhausted``.
+
+    T-NEW-120 (2026-08-27): the pool now raises this distinct
+    exception (instead of a generic ``RuntimeError``) when every
+    eligible account returned 429 and the rotation gave up. The
+    harness needs to know ``429`` means "wait for the quota window",
+    not "the upstream is broken" — so we emit a real 429 with a
+    ``Retry-After`` header derived from the earliest unpause time
+    in the cooldown dict.
+    """
+    retry_after = _retry_after_for(exc)
+    body = {
+        "error": {
+            "message": str(exc),
+            "type": "rate_limit_error",
+            "code": "pool_quota_exhausted",
+            "paused_accounts": exc.paused_accounts,
+            "earliest_unpause_utc": (
+                exc.earliest_unpause_utc.isoformat()
+                if exc.earliest_unpause_utc is not None
+                else None
+            ),
+            "retry_after_seconds": retry_after,
+        }
+    }
+    return JSONResponse(
+        status_code=429,
+        content=body,
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+def _request_too_large_response(exc: RequestTooLarge) -> JSONResponse:
+    """Build the HTTP 413 response for ``RequestTooLarge``.
+
+    T-NEW-121 (2026-08-27): the pool now refuses oversize requests
+    at the gateway instead of rotating through every account and
+    watching each one 400. The 413 carries ``compact_required`` so
+    the harness knows the right fix is to compress the conversation
+    (not back off and retry, which would just re-trigger the 413).
+    """
+    body = {
+        "error": {
+            "message": str(exc),
+            "type": "request_too_large",
+            "code": "request_too_large",
+            "estimated_tokens": exc.estimated_tokens,
+            "smallest_fittable_window": exc.smallest_fittable_window,
+            "largest_fittable_window": exc.largest_fittable_window,
+            "eligible_count": exc.eligible_count,
+            "compact_required": exc.eligible_count == 0,
+        }
+    }
+    # No Retry-After — retrying the same request will 413 again.
+    # The harness's fix is to compact / split, not to wait.
+    return JSONResponse(status_code=413, content=body)
 
 
 def create_app(config=None) -> FastAPI:
@@ -329,7 +404,63 @@ def create_app(config=None) -> FastAPI:
                     _record(req, requestor, completion_id, model, strategy,
                             prompt_tokens=0, completion_tokens=0, elapsed_ms=elapsed_ms,
                             status="error", error_kind=type(e).__name__)
-                    err = {"error": {"message": str(e), "type": "server_error"}}
+                    # T-NEW-120 (2026-08-27): if the pool exhausted
+                    # its quota mid-stream, end the SSE with a
+                    # structured ``error`` event whose ``code`` is
+                    # ``pool_quota_exhausted`` AND set the SSE
+                    # ``retry:`` field to the same Retry-After value
+                    # the HTTP-layer 429 would advertise — so an
+                    # EventSource client can back off the same way
+                    # it would on a non-streaming 429. The HTTP
+                    # status on the response itself stays 200 because
+                    # SSE response headers can't be re-sent once the
+                    # stream has started; the contract is that any
+                    # final SSE ``error`` event with
+                    # ``code=pool_quota_exhausted`` means "back off".
+                    if isinstance(e, PoolQuotaExhausted):
+                        retry_after = _retry_after_for(e)
+                        err = {
+                            "error": {
+                                "message": str(e),
+                                "type": "rate_limit_error",
+                                "code": "pool_quota_exhausted",
+                                "paused_accounts": e.paused_accounts,
+                                "earliest_unpause_utc": (
+                                    e.earliest_unpause_utc.isoformat()
+                                    if e.earliest_unpause_utc is not None
+                                    else None
+                                ),
+                                "retry_after_seconds": retry_after,
+                            }
+                        }
+                        # Emit the structured error frame. The SSE
+                        # ``retry:`` directive lives on its own line
+                        # so an EventSource client can auto-back-off
+                        # using the same value the HTTP-layer 429
+                        # would advertise. Status stays 200 because
+                        # SSE response headers can't be re-sent once
+                        # the stream has started.
+                        yield f"retry: {retry_after * 1000}\n".encode("utf-8")
+                    elif isinstance(e, RequestTooLarge):
+                        # T-NEW-121: streaming path for oversize
+                        # requests. No retry directive — the harness
+                        # must compact (or split) before retrying.
+                        # The body carries the same detail the
+                        # non-streaming 413 would advertise.
+                        err = {
+                            "error": {
+                                "message": str(e),
+                                "type": "request_too_large",
+                                "code": "request_too_large",
+                                "estimated_tokens": e.estimated_tokens,
+                                "smallest_fittable_window": e.smallest_fittable_window,
+                                "largest_fittable_window": e.largest_fittable_window,
+                                "eligible_count": e.eligible_count,
+                                "compact_required": e.eligible_count == 0,
+                            }
+                        }
+                    else:
+                        err = {"error": {"message": str(e), "type": "server_error"}}
                     yield f"data: {json.dumps(err)}\n\n".encode("utf-8")
             return StreamingResponse(event_source(), media_type="text/event-stream")
 
@@ -349,6 +480,16 @@ def create_app(config=None) -> FastAPI:
             _record(req, requestor, completion_id, model, strategy,
                     prompt_tokens=0, completion_tokens=0, elapsed_ms=elapsed_ms,
                     status="error", error_kind=type(e).__name__)
+            # T-NEW-120 (2026-08-27): if the pool exhausted its quota
+            # wall, surface THAT as a structured 429 + Retry-After so
+            # the harness can back off intelligently. T-NEW-121:
+            # oversize requests (every account too small to fit)
+            # surface as a structured 413 + compact_required. Other
+            # errors keep the legacy 502 mapping.
+            if isinstance(e, PoolQuotaExhausted):
+                return _quota_exhausted_response(e)
+            if isinstance(e, RequestTooLarge):
+                return _request_too_large_response(e)
             raise HTTPException(status_code=502, detail=str(e)) from e
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)

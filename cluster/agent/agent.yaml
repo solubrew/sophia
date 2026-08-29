@@ -47,6 +47,16 @@ ProviderPool:
           max_tokens: 32768
           temperature: 0.7
           context_window: 200000
+          # T-NEW-121 (2026-08-27): minimax-m3 caps response bodies
+          # at ~935 bytes on this LAN gateway — the upstream returns
+          # a tiny thinking fragment with no tool_call on any
+          # non-trivial input, which Sophia's broken-model detection
+          # then rotates around uselessly. Declare a tighter
+          # ``max_input_tokens`` so the pre-flight check at the
+          # gateway (sophia.pool._preflight_input_caps) can steer
+          # large requests to other accounts instead.
+          model_overrides:
+            max_input_tokens: 16000
           costs_per_1k_input: 0.0004
           costs_per_1k_output: 0.0012
 

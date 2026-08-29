@@ -2,6 +2,31 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-08-28 (per-account input caps + 413 pre-flight + vault warm-start fix)
+
+### Added
+
+- **Pre-flight request-size check** (T-NEW-121). `SophiaPool.chat()` and
+  `stream()` now estimate the input token count
+  (`_estimate_input_tokens`: chars/4 across content, tool_calls,
+  tool_call_id, multi-part content) and refuse the request with a
+  structured `RequestTooLarge` exception when the estimate exceeds the
+  largest input cap in the allowlist — surfaced at the HTTP layer as
+  `413 Payload Too Large` with `compact_required: true` so the harness
+  compresses the conversation instead of blindly retrying.
+- **Narrowed rotation by size** (T-NEW-121). When the estimate fits
+  some but not all allowlist entries, the rotation narrows to the
+  fitting subset at candidate-selection time (accounts with declared
+  `max_input_tokens` smaller than the estimate are skipped), so no
+  attempt is wasted on an account we know will fail.
+- **Per-model `max_input_tokens` override** (T-NEW-121).
+- **`SOPHIA_AUTO_MODELS` pinned in docker-compose** (T-NEW-121).
+
+### Fixed
+
+- **Phantom bundled entries dropped from the pool** (T-NEW-121).
+- **Vault warm-start self-refresh** (T-NEW-121, 2026-08-28 incident).
+
 ## [Unreleased] — 2026-08-28 (multi-worker mode — SOPHIA_WORKERS=N)
 
 ### Added
@@ -58,6 +83,97 @@ All notable changes to Sophia are documented here.
   that spawns uvicorn with `--workers 2` against a temp DB and
   asserts `/healthz` returns 200.
 
+## [Unreleased] — 2026-08-27 (429 rotation now exhausts the pool before bubbling)
+
+### Fixed
+
+- **Pool rotation now walks the FULL allowlist before giving up**
+  (T-NEW-120). Previously, `SophiaPool.chat()` and `SophiaPool.stream()`
+  capped each call at `max_retries=3` iterations. With 5 LLM accounts
+  on the auto-allowlist (3× minimax, 1× zai, 1× xai), a single
+  cross-provider outage meant the pool gave up after 4 attempts —
+  leaving 1+ entries un-tried and surfacing the *last* upstream's raw
+  error to the harness as a generic HTTP 502. The cap is now
+  `max(allowlist_size + 1, max_retries + 1)`, so the inner
+  ``if not available: break`` becomes the real exit signal. If the
+  pool has 5 healthy entries, the rotation will walk all 5 before
+  bubbling.
+
+- **`PoolQuotaExhausted` is now distinct from generic pool errors**
+  (T-NEW-120). When every account on the allowlist 429s (quota
+  wall), the pool pauses each via `_ProviderCooldowns` and raises a
+  structured `sophia.pool.PoolQuotaExhausted` exception carrying
+  `paused_accounts`, `earliest_unpause_utc`, and the underlying
+  `last_exc`. The HTTP layer (`sophia/server.py`) maps this to a
+  real **HTTP 429** with a `Retry-After` header (seconds until the
+  soonest account re-activates) and a structured JSON body:
+  ```json
+  {
+    "error": {
+      "message": "all eligible accounts are rate-limited; paused=[...]; earliest_unpause_utc=2026-08-28T00:00:00+00:00; retry_after_seconds=3727",
+      "type": "rate_limit_error",
+      "code": "pool_quota_exhausted",
+      "paused_accounts": ["minimax:sk-cp-I-", "..."],
+      "earliest_unpause_utc": "2026-08-28T00:00:00+00:00",
+      "retry_after_seconds": 3727
+    }
+  }
+  ```
+  The harness can now distinguish "we're quota-walled" from "the
+  upstream is broken" without parsing the message text.
+
+- **Streaming path emits a structured quota-wall signal too**
+  (T-NEW-120). When the pool exhausts mid-stream, the SSE response
+  ends with a `data:` line whose `error.code` is
+  `pool_quota_exhausted` AND a sibling `retry: <ms>` directive so an
+  `EventSource` client can auto-back-off the same way it would on a
+  non-streaming 429. The HTTP status on the response stays 200
+  (SSE response headers can't be re-sent once the stream has
+  started); the contract is "any final SSE error event with
+  `code=pool_quota_exhausted` means back off until Retry-After".
+
+### Added
+
+- **`sophia.pool.PoolQuotaExhausted`** — a structured exception
+  (with `paused_accounts`, `earliest_unpause_utc`, `last_exc`) so
+  callers and the HTTP layer can distinguish a quota wall from a
+  transient upstream fault. Carries a `__str__` that includes the
+  paused-account list AND the retry-after value so log lines are
+  self-describing.
+- **`_ProviderCooldowns.earliest_unpause_utc()`** — returns the
+  soonest UTC moment any paused account reactivates, used by
+  `server.py` to populate the `Retry-After` header on a 429.
+- **`server._quota_exhausted_response(exc)`** and
+  **`server._retry_after_for(exc)`** — the helpers that convert
+  `PoolQuotaExhausted` into a structured HTTP 429 response.
+- **`tests/test_429_rotation.py`** — 5 new tests covering: full
+  pool walk in `chat()`, full pool walk in `stream()`, the
+  `PoolQuotaExhausted` exception shape, the
+  `earliest_unpause_utc` computation, and the legacy
+  `RuntimeError` fallback when no quota wall is in play. The full
+  suite is **88 passed** as of this commit.
+
+### Verification
+
+- Live in `sophia-sophia-1` (rebuilt with the new code,
+  `--force-recreate` confirmed). `python3 -c "from sophia.pool
+  import PoolQuotaExhausted; from sophia.server import
+  _quota_exhausted_response"` succeeds; constructing a
+  representative exception yields a
+  `status_code=429, Retry-After=3726, Content-Type=application/json`
+  response — i.e. the deployed image carries the fix.
+
+### Out of scope (separate cards)
+
+- Per-provider reset windows (the 5-hourly vs. weekly mismatch
+  from the 2026-08-27 review). Tracked in `TODOs.md`.
+- Token-budget partitioning (already on the new-features list).
+
+---
+
+ ## [Unreleased] — 2026-08-27 (tool-call wire-format fix — hermes→sophia→upstream)
+ 
+ ### Fixed
 ## [Unreleased] — 2026-08-27 (tool-call wire-format fix — hermes→sophia→upstream)
 
 ### Fixed

@@ -44,6 +44,7 @@ from __future__ import annotations
 import os
 import secrets
 import sys
+import time
 from pathlib import Path
 
 # Force unbuffered stderr so the operator can see our diagnostic
@@ -59,7 +60,18 @@ except Exception:
 VAULT_DIR = Path("/var/lib/sophia/pycurity")
 VAULT_DB = VAULT_DIR / "vault.db"
 SALT_BIN = VAULT_DIR / "salt.bin"
-TEMP_KEY = VAULT_DIR / "temp.key"
+# T-NEW-121 (2026-08-28): PyKeyStore reads its cached temp key from
+# ``master.key.temp`` (pycurity/pykey.py:461, initialize_paths:
+# ``self.temp_key_path = self.db_path.parent / "master.key.temp"``)
+# with a 3-hour TTL (TEMP_KEY_MAX_AGE_HOURS = 3). The old code wrote
+# ``temp.key`` — a file PyKeyStore never reads — so a fresh process
+# (container recreate / restart) always fell through to the getpass
+# prompt and EOF'd on non-TTY. We now write BOTH names: master.key.temp
+# (the one pykey actually loads, auto-refreshed on every boot) and
+# temp.key (kept for backwards compatibility with any tooling that
+# still greps for it).
+TEMP_KEY = VAULT_DIR / "master.key.temp"
+TEMP_KEY_LEGACY = VAULT_DIR / "temp.key"
 PASSPHRASE_FILE = VAULT_DIR / ".master_passphrase"
 ACCTS_YAML = Path("/etc/sophia/agent/agent_accts.yaml")
 
@@ -100,19 +112,26 @@ def _log_diag(token: str, value: str) -> None:
 
 
 def _write_passphrase_files(passphrase: str) -> None:
-    """Persist the passphrase to .master_passphrase AND temp.key.
+    """Persist the passphrase to .master_passphrase + master.key.temp.
 
-    PyKeyStore opens temp.key on every non-first-boot constructor call
-    to skip the getpass() prompt. Persisting both files means a
-    container restart in the warm path (no env vars set) still
-    unlocks cleanly. We write the same passphrase bytes to both files
-    (mode 600) so they stay in sync.
+    PyKeyStore loads ``master.key.temp`` on every non-first-boot
+    constructor call to skip the getpass() prompt (3h TTL — see the
+    T-NEW-121 note at TEMP_KEY). We also write the legacy ``temp.key``
+    name so older tooling / the recovery-mode detection below keep
+    working. Persisting both means a container restart in the warm
+    path (no env vars set) still unlocks cleanly.
     """
     VAULT_DIR.mkdir(parents=True, exist_ok=True)
     PASSPHRASE_FILE.write_text(passphrase + "\n")
     PASSPHRASE_FILE.chmod(0o600)
     TEMP_KEY.write_text(passphrase)
     TEMP_KEY.chmod(0o600)
+    # Keep the legacy name in sync for anything still reading it.
+    try:
+        TEMP_KEY_LEGACY.write_text(passphrase)
+        TEMP_KEY_LEGACY.chmod(0o600)
+    except OSError:
+        pass  # non-fatal — master.key.temp is the one pykey reads
 
 
 def _ensure_vault() -> None:
@@ -136,7 +155,29 @@ def _ensure_vault() -> None:
     os.environ["PYCURITY_SALT_PATH"] = str(SALT_BIN)
 
     # ── Mode 2: warm start ─────────────────────────────────────────
-    if VAULT_DB.exists() and TEMP_KEY.exists():
+    # T-NEW-121: PyKeyStore silently DELETES an expired temp key
+    # (>3h old, TEMP_KEY_MAX_AGE_HOURS) at construction time and then
+    # prompts for the passphrase. So "warm" must mean BOTH "the file
+    # exists" AND "it's fresh". When it's stale we rewrite it from
+    # .master_passphrase (which never expires) BEFORE PyKeyStore ever
+    # runs — turning a would-be EOF crash into a clean warm boot.
+    if VAULT_DB.exists() and (TEMP_KEY.exists() or TEMP_KEY_LEGACY.exists()):
+        temp_key_stale = True
+        try:
+            stat = TEMP_KEY.stat()
+            age = time.time() - stat.st_mtime
+            temp_key_stale = age > 3 * 3600  # match TEMP_KEY_MAX_AGE_HOURS
+        except FileNotFoundError:
+            # master.key.temp missing but legacy temp.key exists —
+            # treat as stale (pykey won't read the legacy name).
+            pass
+        if temp_key_stale and PASSPHRASE_FILE.exists():
+            passphrase = PASSPHRASE_FILE.read_text().strip()
+            if passphrase:
+                _write_passphrase_files(passphrase)
+                sys.stderr.write(
+                    "Refreshed expired master.key.temp from .master_passphrase\n"
+                )
         sys.stderr.write("Vault ready (cached temp-key present)\n")
         _log_diag(_DIAG_VAULT_STATE, "warm")
         return
@@ -177,7 +218,25 @@ def _ensure_vault() -> None:
     #   3b. env var missing — vault is unreachable. Fail with a clear
     #       pointer at the recovery path (run cluster/seed-keys.sh or
     #       pass the env var manually).
-    if VAULT_DB.exists() and not TEMP_KEY.exists():
+    if VAULT_DB.exists() and not TEMP_KEY.exists() and not TEMP_KEY_LEGACY.exists():
+        # T-NEW-121: self-recovery — .master_passphrase never expires
+        # and is kept in sync by _write_passphrase_files on every path
+        # that learns the passphrase (cold start, recovery, merge).
+        # When both temp-key names are missing but .master_passphrase
+        # survives, rewrite the temp keys from it and continue. We do
+        # NOT attempt a PyKeyStore unlock here (a wrong passphrase
+        # would increment pycurity's lockout counter); the server's
+        # own pool construction is the real test, and a mismatch
+        # surfaces there with full context.
+        if PASSPHRASE_FILE.exists():
+            passphrase = PASSPHRASE_FILE.read_text().strip()
+            if passphrase:
+                _write_passphrase_files(passphrase)
+                sys.stderr.write(
+                    "Self-recovered: rewrote master.key.temp from .master_passphrase\n"
+                )
+                _log_diag(_DIAG_VAULT_STATE, "warm")
+                return
         recovery_pass = os.environ.get(CLUSTER_MASTER_ENV, "").strip()
         if not recovery_pass:
             sys.stderr.write(
