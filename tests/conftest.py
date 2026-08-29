@@ -31,9 +31,19 @@ class FakePoolShim:
 
 @pytest.fixture
 def fake_pool(monkeypatch):
-    """Replace sophia.server.SophiaPool with FakePoolShim."""
+    """Replace sophia.server.SophiaPool with FakePoolShim.
+
+    T-NEW-221 changed ``SophiaPool.__init__(config)`` to
+    ``SophiaPool.__init__(config, db=None)`` so the cooldown store can
+    share the live sophia.db with the rest of the app. The shim here
+    must accept both signatures; tests that pass only ``cfg`` (the
+    legacy call shape) keep working.
+    """
     shim = FakePoolShim()
-    monkeypatch.setattr("sophia.server.SophiaPool", lambda cfg: shim)
+    def _factory(cfg, db=None):
+        # The shim doesn't need db — it short-circuits the real pool.
+        return shim
+    monkeypatch.setattr("sophia.server.SophiaPool", _factory)
     return shim
 
 

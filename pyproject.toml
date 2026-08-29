@@ -52,6 +52,11 @@ packages = ["sophia"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    # Live-cluster tests that talk to the running sophia container
+    # (default-deny: require `-m live_cluster` to run).
+    "live_cluster: tests that hit the deployed sophia LAN cluster",
+]
 
 [tool.ruff]
 line-length = 120

@@ -78,7 +78,11 @@ def _isolated_db(tmp_path, monkeypatch):
 @pytest.fixture
 def fake_pool(monkeypatch):
     shim = FakePoolShim()
-    monkeypatch.setattr("sophia.server.SophiaPool", lambda cfg: shim)
+    # T-NEW-221: SophiaPool.__init__ now takes (config, db=None) — accept
+    # both shapes so the legacy test code keeps passing.
+    def _factory(cfg, db=None):
+        return shim
+    monkeypatch.setattr("sophia.server.SophiaPool", _factory)
     return shim
 
 
