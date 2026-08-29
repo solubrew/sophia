@@ -76,6 +76,12 @@ services:
       # SOPHIA_PROVIDER_POOL=/path/to/your.yaml in cluster/.env when you
       # want to switch providers.
       SOPHIA_PROVIDER_POOL: /etc/sophia/agent
+      # T-NEW-221 (2026-08-28): spawn N parallel uvicorn workers so
+      # multiple Hermes profiles (arthr + morganna + future) can hit
+      # sophia concurrently without serializing on one event loop.
+      # 429 cooldowns are backed by SQLite so all workers see the same
+      # pause-until timestamps. Default is 1 (back-compat); set 4 here.
+      SOPHIA_WORKERS: "4"
     # ladyol's _initialize_pool() does:
     #   accts = kahndor.Instruct(join(self.agent_path, f"{self.name}_accts.yaml"))
     # where self.name = Path(agent_path).name.replace('.', '')
