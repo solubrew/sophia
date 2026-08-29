@@ -65,6 +65,34 @@ class CooldownStore:
 
     # ── internals ────────────────────────────────────────────────────
 
+    @property
+    def _paused_until(self) -> dict:
+        """Legacy dict-shaped view: ``{account: paused_until_epoch}``.
+
+        T-NEW-221 followup (2026-08-29): the deployed T-NEW-120 rotation
+        code reads ``self.cooldowns._paused_until`` (it was written
+        against the old in-process dict). ``SophiaPool`` now builds a
+        raw ``CooldownStore`` (not the ``_ProviderCooldowns`` shim), so
+        without this property ANY rotation that exhausts its accounts
+        raises ``AttributeError: 'CooldownStore' object has no
+        attribute '_paused_until'`` and the request 500s instead of
+        returning a structured 429. Exposing the same view the shim
+        provides keeps both call shapes valid on the object the pool
+        actually uses. Not hot-path — only read when a rotation ends
+        with failures.
+        """
+        now = datetime.now(timezone.utc).timestamp()
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT account, paused_until FROM cooldown_state "
+                "WHERE paused_until > ?",
+                (now,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return {r[0]: float(r[1]) for r in rows}
+
     def _connect(self) -> sqlite3.Connection:
         """Open a short-lived connection for one call.
 

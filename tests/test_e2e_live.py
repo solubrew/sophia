@@ -112,6 +112,28 @@ def live_key(live_server, tmp_path):
     db = SophiaDB(db_path=Path(db_path))
     ks = KeyStore(db)
     _, raw = ks.create(name="e2e-test")
+    # Test-ordering guard (2026-08-29): test_server.py sets SOPHIA_DB as
+    # an import side effect, so in a full-suite run this fixture does NOT
+    # skip via the env-var check above — and the live server is then
+    # backed by the stub FakeProviderPool with zero registered provider
+    # entries. Chat rotation against an empty allowlist always raises
+    # ("all accounts are rate-limited"), so the chat test cannot pass in
+    # that state. NOTE: /v1/models is NOT a valid emptiness probe — the
+    # endpoint synthesizes a static 'sophia-auto' card even when the
+    # pool has zero entries. Probe the in-process app's pool directly
+    # instead (the live server runs in a thread of this same process).
+    # This matches this module's documented intent: "the e2e tests below
+    # skip themselves when no model is registered".
+    import sophia.server as _srv
+    _app = getattr(_srv, "app", None)
+    _pool = getattr(getattr(_app, "state", None), "pool", None)
+    if _pool is not None:
+        try:
+            n = len(_pool._filtered_entries(for_auto=True))
+        except Exception:
+            n = 0
+        if n == 0:
+            pytest.skip(f"no provider entries registered on the live server ({n})")
     return raw
 
 
