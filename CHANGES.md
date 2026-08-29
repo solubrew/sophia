@@ -2,6 +2,62 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-08-28 (multi-worker mode — SOPHIA_WORKERS=N)
+
+### Added
+
+- **`SOPHIA_WORKERS=N` for cluster scale-out (T-NEW-221).** Sophia now
+  honours the `SOPHIA_WORKERS` environment variable to spawn N parallel
+  uvicorn workers, each with its own `SophiaPool` + `ProviderPool`
+  instance. Set in `.env` or `docker-compose.cluster.yml`
+  (`environment: SOPHIA_WORKERS=4`). Default `1` for full back-compat;
+  range `1`–`16`; out-of-range values cause the entrypoint to refuse
+  to start with exit code `6`.
+
+- **Cluster-shared per-account 429 cooldowns (T-NEW-221).** Replaces
+  the in-process `_ProviderCooldowns` dict with a SQLite-backed
+  `sophia.cooldowns.CooldownStore` so all uvicorn workers see the
+  same pause-until timestamps and don't cascade 429s on the same
+  account. Backed by a new `cooldown_state` table added to
+  `SCHEMA_DDL` (idempotent `CREATE TABLE IF NOT EXISTS`); WAL mode
+  was already enabled so cross-worker visibility is immediate.
+  The legacy `_ProviderCooldowns` class in `sophia.pool` is retained
+  as a thin deprecation shim that delegates to `CooldownStore` so
+  direct importers from in-flight T-NEW-120 / T-NEW-121 test work
+  keep passing. New code should use `CooldownStore` directly.
+
+### Caveats
+
+- The `paused_accounts` list on `PoolQuotaExhausted` (HTTP 429) is now
+  cluster-wide, not per-worker. This is correct: the cluster really
+  IS paused on those accounts.
+- `Retry-After` is the earliest unpause across all workers.
+- `ProviderPool`'s round-robin index is per-worker — minor load
+  imbalance is expected and acceptable. For perfect round-robin,
+  run more Sophia containers behind a TCP load balancer instead of
+  more workers in one container.
+
+### Reference
+
+- `docs/DEPLOY.md` — new "Multi-worker mode (T-NEW-221)" section:
+  shared-state table, SSE stickiness notes, caveats.
+- `sophia/cooldowns.py` — new module (`CooldownStore`,
+  ~210 lines).
+- `sophia/pool.py` — `_ProviderCooldowns` rewritten as a deprecation
+  shim; `SophiaPool.__init__` now takes an optional `db=` so the
+  server can pass the shared `SophiaDB`.
+- `sophia/server.py` — `create_app()` now constructs `db = SophiaDB()`
+  first, then `SophiaPool(cfg, db=db)` so all subsystems point at
+  the same SQLite file.
+- `cluster/entrypoint.py` — reads `SOPHIA_WORKERS`, validates range,
+  appends `--workers N` to the uvicorn argv when N > 1.
+- `tests/test_pool.py` — 5 new tests covering pause+query,
+  lazy reactivation, cross-worker visibility, earliest-unpause
+  aggregation, and clear().
+- `tests/test_multi_worker_load.py` — new integration smoke test
+  that spawns uvicorn with `--workers 2` against a temp DB and
+  asserts `/healthz` returns 200.
+
 ## [Unreleased] — 2026-08-27 (tool-call wire-format fix — hermes→sophia→upstream)
 
 ### Fixed

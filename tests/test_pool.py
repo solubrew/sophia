@@ -142,3 +142,88 @@ def test_pool_is_lazy(monkeypatch):
     from sophia.config import load_config
     p = SophiaPool(load_config())
     assert p._pool is None  # never touched the underlying pool yet
+
+
+# ─────────────────────────────────────────────────────────────────
+# T-NEW-221: CooldownStore tests
+# ─────────────────────────────────────────────────────────────────
+
+def _isolated_db(tmp_path, monkeypatch):
+    """Build a SophiaDB rooted at a per-test temp file."""
+    db_path = tmp_path / "cooldown_test.db"
+    monkeypatch.setenv("SOPHIA_DB", str(db_path))
+    from sophia.sophia import SophiaDB
+    db = SophiaDB(db_path)
+    return db
+
+
+def test_cooldowns_pause_and_query(tmp_path, monkeypatch):
+    from datetime import datetime, timezone, timedelta
+    from sophia.cooldowns import CooldownStore
+    db = _isolated_db(tmp_path, monkeypatch)
+    cs = CooldownStore(db)
+    until = datetime.now(timezone.utc) + timedelta(seconds=60)
+    cs.pause("anthropic_alice", until)
+    assert cs.is_paused("anthropic_alice") is True
+    r = cs.remaining("anthropic_alice")
+    assert 55 <= r <= 61, f"remaining={r} not in [55, 61]"
+
+
+def test_cooldowns_lazy_reactivate(tmp_path, monkeypatch):
+    from datetime import datetime, timezone, timedelta
+    from sophia.cooldowns import CooldownStore
+    db = _isolated_db(tmp_path, monkeypatch)
+    cs = CooldownStore(db)
+    until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    cs.pause("minimax_alice", until)
+    assert cs.is_paused("minimax_alice") is False
+    # Row should be deleted
+    with cs._connect() as conn:
+        rows = conn.execute(
+            "SELECT account FROM cooldown_state WHERE account = ?",
+            ("minimax_alice",),
+        ).fetchall()
+    assert rows == []
+
+
+def test_cooldowns_shared_across_workers(tmp_path, monkeypatch):
+    """The critical test: pause in pool A is visible to pool B."""
+    from datetime import datetime, timezone, timedelta
+    from sophia.cooldowns import CooldownStore
+    db = _isolated_db(tmp_path, monkeypatch)
+    cs_a = CooldownStore(db)
+    cs_b = CooldownStore(db)
+    cs_a.pause("minimax-000.000.000",
+               datetime.now(timezone.utc) + timedelta(seconds=120))
+    assert cs_b.is_paused("minimax-000.000.000") is True
+
+
+def test_cooldowns_earliest_unpause_aggregates(tmp_path, monkeypatch):
+    from datetime import datetime, timezone, timedelta
+    from sophia.cooldowns import CooldownStore
+    db = _isolated_db(tmp_path, monkeypatch)
+    cs_a = CooldownStore(db)
+    cs_b = CooldownStore(db)
+    base = datetime.now(timezone.utc)
+    cs_a.pause("a1", base + timedelta(seconds=300))
+    cs_b.pause("b1", base + timedelta(seconds=60))   # the min
+    cs_a.pause("c1", base + timedelta(seconds=600))
+    earliest = cs_b.earliest_unpause_utc()
+    assert earliest is not None
+    delta = (earliest - base).total_seconds()
+    assert 55 <= delta <= 65, f"earliest_unpause delta={delta}s not in [55, 65]"
+
+
+def test_cooldowns_clear(tmp_path, monkeypatch):
+    from datetime import datetime, timezone, timedelta
+    from sophia.cooldowns import CooldownStore
+    db = _isolated_db(tmp_path, monkeypatch)
+    cs = CooldownStore(db)
+    base = datetime.now(timezone.utc)
+    cs.pause("x1", base + timedelta(seconds=60))
+    cs.pause("x2", base + timedelta(seconds=60))
+    assert cs.paused_accounts() == ["x1", "x2"]
+    cs.clear()
+    assert cs.paused_accounts() == []
+    assert cs.is_paused("x1") is False
+    assert cs.is_paused("x2") is False
