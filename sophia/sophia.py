@@ -110,6 +110,18 @@ CREATE TABLE IF NOT EXISTS sophia_usage (
 CREATE INDEX IF NOT EXISTS idx_usage_requestor_time ON sophia_usage(requestor, created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_provider_time  ON sophia_usage(provider_name, provider_account, created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_model_time     ON sophia_usage(model, created_at);
+
+-- T-NEW-221 (2026-08-28): per-account 429 cooldowns, shared across
+-- multiple uvicorn workers. Replaces the old in-process
+-- _ProviderCooldowns dict so workers don't cascade 429s on the same
+-- account. The legacy class still exists as a thin deprecation shim
+-- in sophia.pool for in-flight importers; new code should use
+-- sophia.cooldowns.CooldownStore directly.
+CREATE TABLE IF NOT EXISTS cooldown_state (
+    account      TEXT PRIMARY KEY,
+    paused_until REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cooldown_state_until ON cooldown_state(paused_until);
 """
 
 # Idempotent migrations applied AFTER SCHEMA_DDL, in order. Each

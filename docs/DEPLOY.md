@@ -358,6 +358,69 @@ docker compose --profile tls up -d caddy
      `agent_accts.yaml` each time).
   3. Restart `sophia-sophia-1` so the entrypoint re-reads the vault.
 
+## Multi-worker mode (T-NEW-221, 2026-08-28)
+
+Sophia supports running multiple parallel uvicorn workers via the
+`SOPHIA_WORKERS` environment variable. Default is `1` (single-worker
+— full back-compat). Setting `SOPHIA_WORKERS=N` spawns N parallel
+workers, each with its own `SophiaPool` + `ProviderPool` instance.
+
+### How to enable
+
+**docker-compose** (`docker-compose.cluster.yml`):
+```yaml
+environment:
+  - SOPHIA_WORKERS=4
+```
+
+**.env** file:
+```
+SOPHIA_WORKERS=4
+```
+
+**kubernetes / systemd**: set `SOPHIA_WORKERS` in the pod spec or
+unit `Environment` block.
+
+Range: `1`–`16`. Outside this range the entrypoint refuses to start
+with exit code `6` and a clear stderr message.
+
+### What gets shared across workers
+
+| State | Shared? | How |
+|---|---|---|
+| `sophia_keys`, `sophia_requestors`, `sophia_usage` | ✅ | SQLite WAL on `/var/lib/sophia/sophia.db` (named volume) |
+| `cooldown_state` | ✅ | Same SQLite file, table created at SCHEMA_DDL (T-NEW-221) |
+| `captures/*.json` | ✅ | bind-mounted `/var/lib/sophia/captures` |
+| `agent_accts.yaml` | ✅ | read-only image layer |
+| PyKeyStore vault | ✅ | bind-mounted `/var/lib/sophia/pycurity` |
+| `SophiaPool._entries` | ⚠️ duplicated | read-only after init, no cross-worker sync needed |
+| `ProviderPool._round_robin_index` | ⚠️ duplicated | each worker round-robins from 0 — slight imbalance, no correctness bug |
+| `last_stream_usage` (per-request dict) | ⚠️ per-worker | only the calling worker reads it |
+
+### SSE stickiness
+
+A single `/v1/chat/completions?stream=true` request is served
+end-to-end by one worker (FastAPI's `StreamingResponse` yields within
+a single async task; uvicorn doesn't reassign in-flight SSE streams).
+The kernel's `SO_REUSEPORT` balancer dispatches incoming connections
+round-robin across workers — no app-side affinity needed.
+
+### Caveats
+
+- The `paused_accounts` list on `PoolQuotaExhausted` (HTTP 429) is now
+  cluster-wide, not per-worker. This is correct: the cluster really
+  IS paused on those accounts.
+- `Retry-After` is the earliest unpause across all workers.
+- `ProviderPool`'s round-robin index is per-worker — minor load
+  imbalance is expected and acceptable. If you need perfect
+  round-robin, run more Sophia containers behind a TCP load balancer
+  instead of more workers in one container.
+- The legacy `_ProviderCooldowns` class in `sophia.pool` is retained
+  as a thin deprecation shim that delegates to
+  `sophia.cooldowns.CooldownStore`. Direct importers from in-flight
+  T-NEW work keep working; new code should use `CooldownStore`
+  directly. Removal is planned in a follow-up commit.
+
 ## CLI reference
 
 ```

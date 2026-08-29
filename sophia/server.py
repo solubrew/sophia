@@ -52,10 +52,13 @@ def _cost_for_model(provider_meta: dict, prompt_tokens: int, completion_tokens: 
 
 def create_app(config=None) -> FastAPI:
     cfg = config or load_config()
-    pool = SophiaPool(cfg)
-
     # Single shared DB + per-subsystem wrappers. All live in sophia.db.
     db = SophiaDB()
+    # T-NEW-221 (2026-08-28): pass the shared ``db`` to SophiaPool so
+    # the per-account 429 cooldown store (sophia.cooldowns.CooldownStore)
+    # is cluster-visible — every uvicorn worker reads/writes the same
+    # ``cooldown_state`` table on this same SQLite file.
+    pool = SophiaPool(cfg, db=db)
     keys = KeyStore(db)
     usage = UsageLog(db)
     captures = CaptureStore()

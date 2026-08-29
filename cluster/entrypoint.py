@@ -344,4 +344,28 @@ if __name__ == "__main__":
         "--port", os.environ.get("PORT", "8765"),
         "--log-level", os.environ.get("LOG_LEVEL", "info"),
     ]
+    # T-NEW-221 (2026-08-28): honour SOPHIA_WORKERS env var so the
+    # operator can spawn N parallel uvicorn workers (default 1 — single-
+    # worker is the back-compat behaviour). Refuse to start with anything
+    # outside [1, 16] to prevent accidental fork-bombs. Cooldowns are
+    # SQLite-backed (see sophia.cooldowns.CooldownStore) so all workers
+    # see the same per-account pause state.
+    workers_raw = os.environ.get("SOPHIA_WORKERS", "1").strip()
+    try:
+        workers = int(workers_raw)
+    except ValueError:
+        sys.stderr.write(
+            f"ERROR: SOPHIA_WORKERS={workers_raw!r} is not an integer; refusing to start\n"
+        )
+        sys.exit(6)
+    if workers < 1 or workers > 16:
+        sys.stderr.write(
+            f"ERROR: SOPHIA_WORKERS={workers} out of range [1, 16]; refusing to start\n"
+        )
+        sys.exit(6)
+    sys.stderr.write(
+        f"[entrypoint] starting uvicorn with {workers} worker(s)\n"
+    )
+    if workers > 1:
+        args.extend(["--workers", str(workers)])
     os.execvp(args[0], args)

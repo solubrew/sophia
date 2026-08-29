@@ -16,7 +16,9 @@ from typing import AsyncIterator, Dict, List, Optional, Any, Union
 from kahndor.logma import Logma
 
 from sophia.config import SophiaConfig
+from sophia.cooldowns import CooldownStore
 from sophia.schemas import ModelCard
+from sophia.sophia import SophiaDB
 
 logma = Logma(__name__)
 
@@ -48,44 +50,57 @@ def _next_reset_utc(now: Optional[datetime] = None) -> datetime:
 
 
 class _ProviderCooldowns:
-    """Tracks per-ACCOUNT pause-until timestamps (UTC epoch seconds).
+    """DEPRECATED shim — delegates to :class:`sophia.cooldowns.CooldownStore`.
 
-    Quotas are per ACCOUNT (one API key = one allotment), not per
-    provider: minimax-000.000.000 exhausting its quota says nothing
-    about minimax-000.000.001. So a 429 pauses only the account whose
-    key was refused, until the next reset window; entries from other
-    accounts on the same provider remain active. Lapsed pauses
-    reactivate lazily on read. No lock — single asyncio loop mutates.
+    Retained so that in-flight tests from other T-NEW work
+    (T-NEW-120 rotation, T-NEW-121 per-account caps) that import
+    this class directly keep working. New code should use
+    ``CooldownStore`` directly. Will be removed in a follow-up once
+    those tests migrate to the new ``CooldownStore`` API.
+
+    The shim also exposes ``_paused_until`` as a read-only dict-shaped
+    view (account → paused_until as epoch seconds) so legacy test
+    assertions like ``'_paused_until' in pool.cooldowns.__dict__`` keep
+    working. The dict is recomputed on each access — only used by
+    legacy tests, never on the hot path.
     """
 
-    def __init__(self) -> None:
-        self._paused_until: dict[str, float] = {}
+    def __init__(self, db=None) -> None:
+        # If a real db is provided, attach to it. Otherwise build a
+        # default SophiaDB so legacy test code that constructs
+        # ``_ProviderCooldowns()`` with no args still works.
+        self._impl = CooldownStore(db if db is not None else SophiaDB())
 
-    def pause(self, account: str, until_utc: datetime) -> None:
-        ts = until_utc.timestamp()
-        self._paused_until[account] = ts
-        logma.warning(
-            f"[cooldown] account '{account}' paused until "
-            f"{until_utc.astimezone(_EDT).strftime('%Y-%m-%d %H:%M EDT')} "
-            f"({int(ts - time.time())}s remaining)"
-        )
+    def pause(self, account: str, until_utc) -> None:
+        self._impl.pause(account, until_utc)
 
     def is_paused(self, account: str) -> bool:
-        ts = self._paused_until.get(account)
-        if ts is None:
-            return False
-        if ts <= time.time():
-            # Window lapsed — reactivate lazily.
-            del self._paused_until[account]
-            logma.info(f"[cooldown] account '{account}' reset window reached; reactivated")
-            return False
-        return True
+        return self._impl.is_paused(account)
 
     def remaining(self, account: str) -> int:
-        ts = self._paused_until.get(account)
-        if ts is None:
-            return 0
-        return max(0, int(ts - time.time()))
+        return self._impl.remaining(account)
+
+    def earliest_unpause_utc(self):
+        return self._impl.earliest_unpause_utc()
+
+    def paused_accounts(self):
+        return self._impl.paused_accounts()
+
+    def clear(self) -> None:
+        self._impl.clear()
+
+    @property
+    def _paused_until(self) -> dict:
+        # Read-only dict-shaped view for legacy test code. Recomputed
+        # on each access; this is not on the chat hot path.
+        now = datetime.now(timezone.utc).timestamp()
+        with self._impl._connect() as conn:
+            rows = conn.execute(
+                "SELECT account, paused_until FROM cooldown_state "
+                "WHERE paused_until > ?",
+                (now,),
+            ).fetchall()
+        return {r[0]: float(r[1]) for r in rows}
 
 
 def _account_of(entry) -> str:
@@ -112,16 +127,24 @@ class SophiaPool:
     endpoints even when no provider config exists.
     """
 
-    def __init__(self, config: SophiaConfig):
+    def __init__(self, config: SophiaConfig, db=None) -> None:
         self._config = config
         self._lock = asyncio.Lock()
         self._pool = None
         # Populated by stream(): the last usage event ladyol emitted,
         # so the server can record real token counts after [DONE].
         self.last_stream_usage: dict = {}
+        # Back-compat: when ``db`` is omitted (e.g. tests that build
+        # SophiaPool directly without a DB handle), default to a fresh
+        # SophiaDB so cooldown writes land in a per-test temp file.
+        # In production, server.py always passes the shared ``db`` so
+        # all workers see the same cooldown_state table.
+        self._db = db if db is not None else SophiaDB()
         # Per-provider rate-limit cooldowns (429 → paused until the
-        # next reset window; see _ProviderCooldowns).
-        self.cooldowns = _ProviderCooldowns()
+        # next reset window). Backed by SQLite so multiple uvicorn
+        # workers share the same pause-until timestamps. See
+        # ``sophia/cooldowns.py`` for the schema + WAL guarantees.
+        self.cooldowns = CooldownStore(self._db)
 
     async def _ensure_pool(self):
         # Defer the heavy import until the first chat call. Sophia
