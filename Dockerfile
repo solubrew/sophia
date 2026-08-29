@@ -68,7 +68,7 @@ RUN pip install --no-cache-dir --no-build-isolation setuptools wheel hatchling
 COPY pyproject.toml README.md ./
 # Install PyPI deps with --no-deps.
 RUN pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps \
-        fastapi 'uvicorn[standard]' 'pydantic>=2.0,<3.0' 'pyyaml>=6.0,<7.0' \
+        fastapi 'uvicorn[standard]' 'pydantic==2.13.4' 'pyyaml>=6.0,<7.0' \
         'sse-starlette>=2.0' httpx click anyio \
         rich pydantic-settings python-dateutil \
         tenacity python-multipart itsdangerous idna certifi h11 \
