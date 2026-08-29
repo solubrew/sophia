@@ -25,7 +25,11 @@ provider_accts:
     enabled: True
     provider: zai
     name: "zai-000.000.000"
+  # 2026-08-29 operator directive: grok deactivated. The xai account's
+  # grok-2 entry points at api.groq.com and 401s with every rotation
+  # pass (wasted attempt + noisy logs). Matches the host source of
+  # truth ~/.senbai/senbai_accts.yaml, which already has xai disabled.
   "xai-000.000.000":
-    enabled: True
+    enabled: False
     provider: xai
     name: "xai-000.000.000"

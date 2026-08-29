@@ -76,6 +76,13 @@ services:
       # SOPHIA_PROVIDER_POOL=/path/to/your.yaml in cluster/.env when you
       # want to switch providers.
       SOPHIA_PROVIDER_POOL: /etc/sophia/agent
+      # T-NEW-121: restrict sophia-auto rotation to the real upstream
+      # models that have declared context windows in agent.yaml.
+      # T-NEW-221 note (2026-08-29): this pin was lost from the working
+      # tree during the deploy rollback/reset dance and is restored
+      # here. grok-2 is deliberately NOT in the list — the xai account
+      # is disabled (401s against api.groq.com).
+      SOPHIA_AUTO_MODELS: "minimax-m2.7,minimax-m3,glm-4.7,glm-5.2"
       # T-NEW-221 (2026-08-28): spawn N parallel uvicorn workers so
       # multiple Hermes profiles (arthr + morganna + future) can hit
       # sophia concurrently without serializing on one event loop.
