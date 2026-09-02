@@ -202,6 +202,64 @@ def _account_of(entry) -> str:
     return f"{name}:{key[:8]}"
 
 
+def _entry_key(entry) -> str:
+    """Per-(account, model) identity for entry-level cooldowns.
+
+    Distinct from ``_account_of``: that one collapses every model on
+    one account into a single pause target, which is correct for
+    rate-limit (429) pauses — the API-key allotment is per-account, so
+    every model on that account is dead until the next reset window.
+    But for broken-model pauses (the "stuck in reasoning-only mode"
+    detector at chat()/stream()), pausing the whole account is too
+    coarse: a broken m2.7 shouldn't lock out its sibling m3 on the
+    same account. This key adds the model suffix so broken-model
+    pauses can target a single (account, model) entry.
+
+    Operators reading logs can spot the difference:
+        ``minimax:sk-cp-t-``         → rate-limit pause (account-level)
+        ``minimax:sk-cp-t-:m2.7``    → broken-model pause (entry-level)
+    """
+    return f"{_account_of(entry)}:{getattr(entry.model, 'name', '?')}"
+
+
+def _is_entry_eligible(cooldowns, entry) -> bool:
+    """True iff neither the entry's account (rate-limit) nor the entry
+    itself (broken-model) is currently paused.
+
+    The rotation's availability filter calls this instead of checking
+    ``is_paused(_account_of(entry))`` directly. The dual-key check is
+    what makes the T-NEW-FIX-1 fix complete: broken-model pauses go to
+    per-entry keys, rate-limit pauses go to per-account keys, and an
+    entry is unavailable if EITHER bucket is paused.
+    """
+    if cooldowns.is_paused(_account_of(entry)):
+        return False
+    if cooldowns.is_paused(_entry_key(entry)):
+        return False
+    return True
+
+
+# Broken-model pause window (seconds). Short on purpose:
+#
+#   - The pause exists to stop hermes' 2-4 calls/turn from re-iterating
+#     the full pool and producing 6-12 "stream exhausted" errors per
+#     turn (T-NEW-119 / T-NEW-120 history).
+#   - 60s was too long: when a provider-wide pathology (e.g. every
+#     minimax account returning tiny think-block stubs simultaneously)
+#     triggered the broken-model detector on all 3 sibling accounts in
+#     the same 4-second window, the 60s pause left the whole pool dead
+#     for a window longer than hermes' per-turn retries — so the user's
+#     turn failed end-to-end even though the provider had recovered.
+#   - 15s is short enough that the next hermes turn (or the intent-ack
+#     continuation nudge that follows within a few seconds) hits a
+#     fully-recovered pool, and long enough to absorb the burst of
+#     hermes retries inside one turn.
+#
+# Rate-limit pauses still use the much longer ``_next_reset_utc()``
+# window — those are quota resets, not model pathology.
+BROKEN_MODEL_PAUSE_SECONDS = 15
+
+
 def _entry_context_window(entry) -> Optional[int]:
     """Return the input-cap for an entry, falling back across the
     knobs that the operator can set per model:
@@ -740,7 +798,7 @@ class SophiaPool:
                 e
                 for e in self._filtered_entries(**filter_kw)
                 if id(e) not in excluded
-                and not self.cooldowns.is_paused(_account_of(e))
+                and _is_entry_eligible(self.cooldowns, e)
             ]
             if model:
                 available = [e for e in available if e.model.name == model]
@@ -772,7 +830,7 @@ class SophiaPool:
                 try:
                     sel = pool._select_entry(model or "", strategy=strategy)
                     if sel is not None and id(sel) not in excluded \
-                            and not self.cooldowns.is_paused(_account_of(sel)) \
+                            and _is_entry_eligible(self.cooldowns, sel) \
                             and sel.model.name not in self._config.hidden_models \
                             and _entry_fits(sel, estimated_tokens):
                         entry = sel
@@ -887,16 +945,29 @@ class SophiaPool:
                     and (not text or len(text.strip()) < 200)
                 ):
                     excluded.add(id(entry))
-                    acct = _account_of(entry)
-                    self.cooldowns.pause(acct, datetime.now(timezone.utc) + timedelta(seconds=60))
+                    entry_id = _entry_key(entry)
+                    # T-NEW-FIX-1 (2026-09-02): per-(account, model) pause
+                    # with a short 15s window. The previous code paused
+                    # the whole account for 60s, which dead-ended the
+                    # pool when all sibling accounts on one provider hit
+                    # the same pathology within seconds (morganna incident,
+                    # 16:43 EDT — 3 minimax accounts all paused, no zai
+                    # fallback, hermes retries failed for 60s). Per-entry
+                    # keeps sibling models on the same account available;
+                    # 15s is short enough that the next hermes turn hits a
+                    # recovered pool. See BROKEN_MODEL_PAUSE_SECONDS docstring.
+                    self.cooldowns.pause(
+                        entry_id,
+                        datetime.now(timezone.utc) + timedelta(seconds=BROKEN_MODEL_PAUSE_SECONDS),
+                    )
                     logma.warning(
                         f"[SophiaPool.chat] attempt {attempt + 1}: "
-                        f"{acct}/{entry.model.name} returned "
+                        f"{entry_id} returned "
                         f"{len(text or '')} chars with no tool_call; "
                         f"rotating to another model (the caller supplied "
                         f"{len(tools)} tool defs but this model "
                         f"appears to be stuck in reasoning-only mode); "
-                        f"pausing {acct} for 60s to avoid retry-spam"
+                        f"pausing {entry_id} for {BROKEN_MODEL_PAUSE_SECONDS}s to avoid retry-spam"
                     )
                     continue
                 return text
@@ -935,7 +1006,7 @@ class SophiaPool:
         # pool (so the operator sees the real cause of "no eligible
         # entries" without having to dig into logs).
         active = [e for e in self._filtered_entries(for_auto=(model is None))
-                  if not self.cooldowns.is_paused(_account_of(e))]
+                  if _is_entry_eligible(self.cooldowns, e)]
         if not active:
             # T-NEW-120: distinguish "every failure was a rate limit
             # and the pool is now empty" (the harness should back off
@@ -1152,7 +1223,7 @@ class SophiaPool:
                 e
                 for e in self._filtered_entries(**filter_kw)
                 if id(e) not in excluded
-                and not self.cooldowns.is_paused(_account_of(e))
+                and _is_entry_eligible(self.cooldowns, e)
             ]
             if model:
                 available = [e for e in available if e.model.name == model]
@@ -1263,21 +1334,22 @@ class SophiaPool:
                 and total_yielded < 200
             ):
                 excluded.add(id(entry))
-                acct = _account_of(entry)
-                # Persist a 60s cooldown on the broken account so
-                # the next call from hermes (e.g. an intent-ack
-                # continuation nudge) skips it too.  Without this,
-                # each hermes retry re-iterates the full pool and
-                # produces 6-12 "stream exhausted" errors per turn.
-                self.cooldowns.pause(acct, datetime.now(timezone.utc) + timedelta(seconds=60))
+                entry_id = _entry_key(entry)
+                # T-NEW-FIX-1 (2026-09-02): per-(account, model) pause
+                # with a short 15s window — see BROKEN_MODEL_PAUSE_SECONDS
+                # docstring and the matching chat() site for rationale.
+                self.cooldowns.pause(
+                    entry_id,
+                    datetime.now(timezone.utc) + timedelta(seconds=BROKEN_MODEL_PAUSE_SECONDS),
+                )
                 logma.warning(
                     f"[SophiaPool.stream] attempt {attempt + 1}: "
-                    f"{acct}/{entry.model.name} returned "
+                    f"{entry_id} returned "
                     f"{total_yielded} chars with no tool_call; "
                     f"rotating to another model (caller supplied "
                     f"{len(tools)} tool defs but this model appears "
                     f"stuck in reasoning-only mode); "
-                    f"pausing {acct} for 60s to avoid retry-spam"
+                    f"pausing {entry_id} for {BROKEN_MODEL_PAUSE_SECONDS}s to avoid retry-spam"
                 )
                 continue
 
