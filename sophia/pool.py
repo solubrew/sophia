@@ -827,13 +827,29 @@ class SophiaPool:
                 # T-NEW-121: also honor the size narrowing — the selector
                 # doesn't know about min_context_tokens, so an unfit entry
                 # would otherwise sneak in on the first pick.
+                # T-NEW-FIX-2 (2026-09-02 morganna incident): on every
+                # subsequent attempt the selector is also re-run (with the
+                # `excluded` set honored via re-rolls), so a provider-wide
+                # pathology that hits all 3 accounts on minimax-m2.7 will
+                # rotate to minimax-m3 (different model, possibly fine) and
+                # then to zai — instead of hammering 3 different accounts on
+                # the SAME broken model. Without this, the rotation walked
+                # `available[0]` every time and re-picked minimax-m2.7 on a
+                # different account each turn, exhausting the pool without
+                # ever trying the other model.
                 try:
                     sel = pool._select_entry(model or "", strategy=strategy)
-                    if sel is not None and id(sel) not in excluded \
-                            and _is_entry_eligible(self.cooldowns, sel) \
-                            and sel.model.name not in self._config.hidden_models \
-                            and _entry_fits(sel, estimated_tokens):
-                        entry = sel
+                    for _ in range(8):  # bounded re-roll against excluded/eligible
+                        if (
+                            sel is not None
+                            and id(sel) not in excluded
+                            and _is_entry_eligible(self.cooldowns, sel)
+                            and sel.model.name not in self._config.hidden_models
+                            and _entry_fits(sel, estimated_tokens)
+                        ):
+                            entry = sel
+                            break
+                        sel = pool._select_entry(model or "", strategy=strategy)
                 except Exception:
                     pass  # fall back to available[0]
             # Defensive belt-and-suspenders: even if the above lookup slipped
@@ -1238,19 +1254,34 @@ class SophiaPool:
                     )
                 break
             entry = available[0]
-            if attempt == 0:
-                # Initial pick: use ladyol's own selector for strategy
-                # fidelity (round_robin / weighted / etc.).
-                # Post-filter against hidden_models so the operator's
-                # `SOPHIA_HIDDEN_MODELS=...` actually excludes the
-                # model from auto-routing. See the matching comment in
-                # chat() above for context.
-                # T-NEW-121: also honor the size narrowing.
+            if attempt == 0 or not model:
+                # Initial auto pick (and every subsequent auto pick):
+                # use ladyol's selector for strategy fidelity, with a
+                # bounded re-roll loop that skips entries we've already
+                # tried (`excluded`) or that are paused/over-cap/hidden.
+                # T-NEW-FIX-2 (2026-09-02 morganna incident): before
+                # this change, the selector was only consulted on
+                # attempt 0. On attempts 1+ the loop fell through to
+                # `entry = available[0]` and re-picked the same model
+                # (minimax-m2.7) on a different account each time,
+                # exhausting the pool without ever trying minimax-m3
+                # or zai. Re-rolling on every attempt means a
+                # provider-wide pathology on one model rotates to
+                # the next model instead of cycling accounts on the
+                # broken one.
                 try:
                     sel = pool._select_entry(model or "", strategy=strategy)
-                    if sel is not None and sel.model.name not in self._config.hidden_models \
-                            and _entry_fits(sel, estimated_tokens):
-                        entry = sel
+                    for _ in range(8):  # bounded re-roll
+                        if (
+                            sel is not None
+                            and id(sel) not in excluded
+                            and _is_entry_eligible(self.cooldowns, sel)
+                            and sel.model.name not in self._config.hidden_models
+                            and _entry_fits(sel, estimated_tokens)
+                        ):
+                            entry = sel
+                            break
+                        sel = pool._select_entry(model or "", strategy=strategy)
                 except Exception as exc:
                     last_exc = exc
                     break
