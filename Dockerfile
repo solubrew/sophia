@@ -79,7 +79,7 @@ RUN pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps 
         pytz python-dateutil tzdata six jsonschema \
         networkx opencv-python-headless Pillow webp \
         cryptography cffi \
-        scikit-learn scipy joblib threadpoolctl \
+        scikit-learn scipy joblib threadpoolctl cloudpickle \
         narwhals black mypy_extensions pytokens packaging attrs jsonschema \
         tomli platformdirs
 
