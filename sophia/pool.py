@@ -990,6 +990,39 @@ class SophiaPool:
             except Exception as exc:  # noqa: BLE001 — rotate on ANY provider error
                 last_exc = exc
                 acct = _account_of(entry)
+                # T-NEW-FIX-3 (2026-09-03 morganna incident): when the
+                # upstream signals context-window-exceeded, rotating
+                # to another sibling account/model on the SAME
+                # provider can't help — they share the same window.
+                # Bubble this up as RequestTooLarge so the server
+                # returns a proper 413 with compact_required: True,
+                # and hermes' existing 413 → compress → retry loop
+                # takes over (see conversation_loop.py around line
+                # 3743 / 4052).
+                #
+                # Skip when ``model is not None`` (caller pinned a
+                # specific model) — in that case the operator wants
+                # the explicit error, not a compaction redirect.
+                if model is None and _is_context_window_exceeded(exc):
+                    # Estimate the actual size for the RequestTooLarge
+                    # body so hermes sees real numbers in its
+                    # compression telemetry.
+                    try:
+                        _est = _estimate_input_tokens(effective_messages)
+                    except Exception:
+                        _est = estimated_tokens or 0
+                    logma.warning(
+                        f"[SophiaPool.chat] attempt {attempt + 1}: "
+                        f"{acct}/{entry.model.name} returned context-window-exceeded "
+                        f"({type(exc).__name__}: {exc!r}); raising RequestTooLarge so "
+                        f"hermes' 413 → compress → retry path can handle it"
+                    )
+                    raise RequestTooLarge(
+                        estimated_tokens=_est,
+                        smallest_fittable_window=int(_entry_context_window(entry) or 0),
+                        largest_fittable_window=int(_entry_context_window(entry) or 0),
+                        eligible_count=0,
+                    )
                 if _is_rate_limit(exc):
                     # T-NEW-120: pause AND count this failure. If the
                     # loop ends with every account paused AND every
@@ -1338,6 +1371,34 @@ class SophiaPool:
                     # Mid-stream failure after partial output: cannot
                     # cleanly retry (client already saw partial text).
                     raise
+                # T-NEW-FIX-3 (2026-09-03 morganna incident): same as
+                # chat() — when the upstream signals
+                # context-window-exceeded, rotating to another sibling
+                # account/model on the same provider can't help.
+                # Bubble up as RequestTooLarge so the server returns
+                # a proper 413 + compact_required: True and hermes'
+                # existing 413 → compress → retry loop takes over.
+                # Skip when ``model is not None`` (caller pinned a
+                # specific model) — operator wants the explicit
+                # error in that case.
+                if model is None and _is_context_window_exceeded(exc):
+                    try:
+                        _est = _estimate_input_tokens(effective_messages)
+                    except Exception:
+                        _est = estimated_tokens or 0
+                    logma.warning(
+                        f"[SophiaPool.stream] attempt {attempt + 1}: "
+                        f"{_account_of(entry)}/{entry.model.name} returned "
+                        f"context-window-exceeded ({type(exc).__name__}: {exc!r}); "
+                        f"raising RequestTooLarge so hermes' 413 → compress → "
+                        f"retry path can handle it"
+                    )
+                    raise RequestTooLarge(
+                        estimated_tokens=_est,
+                        smallest_fittable_window=int(_entry_context_window(entry) or 0),
+                        largest_fittable_window=int(_entry_context_window(entry) or 0),
+                        eligible_count=0,
+                    )
 
             # Broken-model detection (streaming variant).  When the
             # caller supplied tool definitions but the upstream
@@ -1490,6 +1551,70 @@ def _is_rate_limit(exc: BaseException) -> bool:
     if resp is not None:
         code = getattr(resp, "status_code", None)
         if code == 429:
+            return True
+    return False
+
+
+# T-NEW-FIX-3 (2026-09-03): upstream providers signal a too-large
+# request in three different shapes. Detect any of them.
+#
+#   * ``minimax.io`` / minimax-m3 → HTTP 400 with body
+#     ``{"error":{"code":2013,"message":"invalid params, context window
+#     exceeds limit ..."}}`` (the `2013` is minimax's internal code for
+#     this error class; the HTTP status is 400 not 413).
+#
+#   * OpenAI / Azure / GitHub Models → HTTP 413 with body
+#     ``{"error":{"code":"request_too_large","message":"..."}}``.
+#
+#   * Anthropic → HTTP 400 ``{"type":"invalid_request_error","message":
+#     "prompt is too long: X tokens > Y maximum"}}``.
+#
+# All three mean the SAME thing: the request exceeds the model's
+# context window and no rotation to a sibling account/model on the
+# SAME provider will help (they share the window). The right fix is
+# for the harness to compact the conversation and retry — hermes
+# already has that loop (see ``conversation_loop.py`` 413 → compress
+# → retry). All we need to do is map the upstream error to our
+# internal ``RequestTooLarge`` so the HTTP layer returns 413 +
+# ``compact_required: True`` and the harness kicks in.
+#
+# Tactic: detect on the exception text + status code. We keep this
+# loose on purpose — providers vary in error wording, and the cost
+# of a false positive (asking hermes to compress when it didn't need
+# to) is much lower than a false negative (cycling 8 accounts for 60
+# seconds and then bubbling "stream exhausted" to the user, which is
+# the pre-fix behaviour and what the operator was complaining about).
+_CONTEXT_WINDOW_OVERFLOW_MARKERS = (
+    "context window",
+    "context length",
+    "context_length",
+    "maximum context length",
+    "prompt is too long",
+    "request_too_large",
+    "request too large",
+    "too many tokens",
+    "payload too large",
+    "tokens too large",
+)
+
+
+def _is_context_window_exceeded(exc: BaseException) -> bool:
+    """True when the exception represents a payload-too-large error
+    that compaction can fix.
+
+    Matches HTTP 400 (minimax-style) and HTTP 413 (OpenAI-style) when
+    the body mentions a context-window or token-count overflow. See
+    ``_CONTEXT_WINDOW_OVERFLOW_MARKERS`` for the matched phrases.
+    """
+    text = str(exc).lower()
+    if any(marker in text for marker in _CONTEXT_WINDOW_OVERFLOW_MARKERS):
+        return True
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        code = getattr(resp, "status_code", None)
+        if code in (400, 413) and any(
+            marker in text for marker in _CONTEXT_WINDOW_OVERFLOW_MARKERS
+        ):
             return True
     return False
 

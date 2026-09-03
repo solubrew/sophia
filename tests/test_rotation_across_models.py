@@ -51,21 +51,28 @@ class _StubEntry:
 
 
 class _StubClient:
-    """Always returns a small error response — triggers rotation."""
+    """Always returns a small error response — triggers rotation.
+
+    Uses a generic RuntimeError rather than the
+    'upstream context window exceeded (HTTP 400)' shape so this test
+    focuses on pure rotation behaviour. The
+    context-window-overflow short-circuit is covered separately in
+    ``test_context_window_overflow.py``.
+    """
 
     def __init__(self, entry: _StubEntry):
         self._entry = entry
 
     async def stream(self, model_name, messages, **kwargs):
         self._entry.sent_models.append(model_name)
-        # Simulate a model-side failure that should trigger rotation.
+        # Simulate a transient upstream failure that triggers rotation.
         # Yield one tiny chunk then raise.
         yield {"type": "token", "content": ""}
-        raise RuntimeError("upstream context window exceeded (HTTP 400)")
+        raise RuntimeError("upstream transient failure (HTTP 503)")
 
     async def chat(self, *, prompt, model, **kw):
         self._entry.sent_models.append(model)
-        raise RuntimeError("upstream context window exceeded (HTTP 400)")
+        raise RuntimeError("upstream transient failure (HTTP 503)")
 
 
 class _StubPool:
