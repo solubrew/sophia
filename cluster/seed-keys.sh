@@ -73,6 +73,17 @@
 #     lines.
 set -euo pipefail
 
+# Skip the keyring-cache probe on every Python invocation. This
+# host has keyring installed but no gnome-keyring-daemon / dbus
+# running, so keyring.get_password hangs ~8s+ every call (verified
+# 2026-09-05). The probe was added in pycurity@gamma:b22567b and
+# would normally short-circuit in ~0.5s, but exporting this env var
+# skips even the probe for the fastest possible seed. Without this
+# line, seed-keys.sh would block ~8s on every python invocation.
+# See ~/.hermes/skills/devops/pycurity-keyring-stall-bypass/ for
+# the full diagnosis + the in-library fix.
+export PYCURITY_DISABLE_KEYRING=1
+
 if [ "$#" -lt 2 ]; then
   echo "Usage: $0 <source_vault_db_path> <source_passphrase>" >&2
   echo "  source_vault_db_path: absolute path to the source secure_store.db" >&2

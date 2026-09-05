@@ -13,6 +13,24 @@
 | SSD | 10 GB | 20 GB |
 | LAN IP | static (DHCP reservation OK) | static |
 
+### Keyring daemon (host-side vault accelerator)
+
+PyKeyStore (from pycurity) caches the master passphrase in the
+OS-native keychain for 4 hours after a successful unlock. This
+makes subsequent `cluster/seed-keys.sh` / `rebuild.sh` runs
+unattended — no `getpass.getpass` prompt.
+
+| Configuration | Behaviour |
+|---|---|
+| `gnome-keyring-daemon` + `dbus-daemon` running | PyKeyStore uses the keychain as a 4h-TTL cache. Subsequent vault accesses within the window are unattended. |
+| Keyring package installed but **no daemon running** | The pycurity keyring health probe (`pycurity.pykey._probe_keyring_health`) detects the hang in 0.5s and falls back to the on-disk `.master_passphrase` / `master.key.temp` files. **No data loss, just no caching acceleration** — every host-side script will re-prompt or re-load from disk. |
+| `PYCURITY_DISABLE_KEYRING=1` env var set | Skips the probe entirely (no 0.5s wait). Used by `cluster/seed-keys.sh` and `rebuild.sh` on this host since 2026-09-05 to guarantee no stall regardless of daemon state. |
+
+In practice: if the host is a headless server without a desktop
+session, the keyring daemon is usually not running and PyKeyStore
+will silently fall back to disk. This is **the safe default** —
+the daemon is purely a UX accelerator, not a security boundary.
+
 ## Architecture
 
 Sophia follows the **per-account 429 cooldown** pattern with a
