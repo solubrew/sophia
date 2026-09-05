@@ -2,6 +2,31 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-09-05 (persistent file logging to LOGs/sophia)
+
+### Added
+
+- **Daily-rotating file logs** (2026-09-05). `sophia/log_setup.py`
+  installs a `TimedRotatingFileHandler` on the root logger (all
+  `kahndor.logma.Logma` instances propagate to it), writing
+  `sophia.log` with midnight-UTC rotation and 30-day retention.
+  Activated from `create_app()` (must be there — the container
+  entrypoint `os.execvp`s uvicorn, which would drop any handler
+  created pre-exec) and from `sophia.cli.main` for bare-metal runs.
+  Directory resolved from `SOPHIA_LOG_DIR` env var > `logging.log_dir`
+  in `sophia.yaml` > off (stdout-only). Failures degrade to
+  stdout-only, never fatal.
+- **`sophia_logs` named volume** in both compose files, mounted at
+  `/var/log/sophia`. Docker initialises the volume from the image's
+  root-owned 0777 directory, so the container's `sophia` user (uid
+  1001) can write. Chosen over a bind-mount because the target host
+  share is NFS v3 with root-squash — a bind would be unwritable by
+  uid 1001.
+- **`scripts/sync-sophia-logs.sh`** — mirrors the log volume to the
+  host's `/home/solubrew/EDN/Downloads/LOGs/sophia/` via `docker cp`
+  (works through the daemon despite NFS root-squash). Wired into a
+  15-minute Hermes cron job (`sophia-log-sync`, no_agent watchdog).
+
 ## [Unreleased] — 2026-08-28 (per-account input caps + 413 pre-flight + vault warm-start fix)
 
 ### Added
