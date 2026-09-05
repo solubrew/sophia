@@ -48,11 +48,17 @@ services:
       SOPHIA_PROVIDER_POOL: ${SOPHIA_PROVIDER_POOL:-}
       # Logging.
       SOPHIA_LOG_LEVEL: ${SOPHIA_LOG_LEVEL:-INFO}
+      # Daily-rotating file logs (sophia.log) written to this dir inside
+      # the container; bind-mount a host directory here to persist them.
+      SOPHIA_LOG_DIR: ${SOPHIA_LOG_DIR:-/var/log/sophia}
       # Secrets resolution: production = PyKeyStore-only.
       # Dev workflows can set SOPHIA_ALLOW_ENV_FALLBACK=1 in .env.
       SOPHIA_ALLOW_ENV_FALLBACK: ${SOPHIA_ALLOW_ENV_FALLBACK:-0}
     volumes:
       - sophia_pycurity:/var/lib/sophia/pycurity
+      # Named volume for rotating logs — lives on Docker's local filesystem
+      # so the container can always write (no NFS permission issues).
+      - sophia_logs:/var/log/sophia
     ports:
       - "${SOPHIA_PORT:-8765}:8765"
     # Logging: cap at 20 MB (FastAPI access logs are larger).
@@ -101,6 +107,7 @@ services:
 
 volumes:
   sophia_pycurity:
+  sophia_logs:
   caddy_data:
   caddy_config:
   caddy_tmp:

@@ -5,6 +5,11 @@ sophia:
     port: 8765
   logging:
     level: "INFO"
+    # Directory for JSON log files written by TimedRotatingFileHandler.
+    # When set, the root logger (which all kahndor.logma.Logma instances
+    # inherit from) writes a rotating sophia.log under this directory.
+    # When null, only the StreamHandler output (stdout) is produced.
+    log_dir: null
   provider_pool:
     # Default points at ladyol's YAML so Sophia stays a thin wrapper.
     # Override via SOPHIA_PROVIDER_POOL env var when needed.

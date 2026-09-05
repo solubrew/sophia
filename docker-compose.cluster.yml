@@ -89,6 +89,7 @@ services:
       # 429 cooldowns are backed by SQLite so all workers see the same
       # pause-until timestamps. Default is 1 (back-compat); set 4 here.
       SOPHIA_WORKERS: "4"
+      SOPHIA_LOG_DIR: /var/log/sophia
     # ladyol's _initialize_pool() does:
     #   accts = kahndor.Instruct(join(self.agent_path, f"{self.name}_accts.yaml"))
     # where self.name = Path(agent_path).name.replace('.', '')
@@ -139,6 +140,12 @@ services:
       # is still honoured as a literal override for non-default
       # operator layouts — set it in cluster/.env or pass via the
       # shell:  PYCURITY_HOST_DIR=/path/to/vault docker-compose up.
+      # Named volume for rotating logs — lives on the Docker local filesystem
+      # (/var/lib/docker/volumes/sophia_logs/) so the sophia user (uid 1001)
+      # can always write without NFS permission constraints. A post-deploy
+      # sync script (scripts/sync-sophia-logs.sh) mirrors files to the
+      # host NFS share at /home/solubrew/EDN/Downloads/LOGs/sophia.
+      - sophia_logs:/var/log/sophia
       - ${PYCURITY_HOST_DIR:-/home/solubrew/.local/share/pycurity}:/host-pycurity:ro
     ports:
       - "8765:8765"   # bound to 0.0.0.0 — accessible from the LAN.
@@ -215,4 +222,5 @@ networks:
 
 volumes:
   sophia_data:
+  sophia_logs:
   openwebui_data:

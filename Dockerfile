@@ -123,7 +123,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         unixodbc \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /app /var/lib/sophia/pycurity /tmp /home/sophia \
+    && mkdir -p /app /var/lib/sophia/pycurity /tmp /home/sophia /var/log/sophia \
+    # /var/log/sophia is the container mount point for the sophia_logs
+    # named volume. Create it as root with 0777 so the sophia user (uid
+    # 1001) can write to it. When Docker initialises an empty named volume
+    # it copies the image's directory contents + permissions, so the volume
+    # will also be root-owned with 0777 — sophia can still write because
+    # 'other' has rwx. This avoids NFS root-squash permission issues that
+    # block bind-mount approaches on this host's NFS-mounted EDN share.
+    && chmod 777 /var/log/sophia \
     && chown -R sophia:sophia /app /home/sophia /tmp /var/lib/sophia
 
 WORKDIR /app

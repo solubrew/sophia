@@ -870,3 +870,51 @@ ladyol's hatchling build backend needs `hatchling` AND `trove-classifiers` avail
   `cluster/agent/agent_accts.yaml`, put the key in the host vault via
   `python -m sophia.cmds.manage_secrets set <account>`, rebuild +
   re-run `seed-keys.sh`.
+
+## [Unreleased] — 2026-09-05 (rotating file logs + named-volume mount)
+
+### Added
+
+- **Rotating file logs via `sophia.log_setup.configure_file_logging`**.
+  Attaches a daily `TimedRotatingFileHandler` (UTC, 30-day retention)
+  to the root logger so every `kahndor.logma.Logma` instance in the
+  codebase writes through it. Idempotent (marker-based guard prevents
+  duplicate handlers across uvicorn reloads), failures are swallowed
+  so a broken log mount never kills the gateway — stdout logging
+  continues. Default path `/var/log/sophia`; overridable via
+  `SOPHIA_LOG_DIR` env var or `logging.log_dir` in
+  `sophia/_data_/sophia.yaml`. Called from `sophia.cli.main` (bare
+  metal) and `sophia.server.create_app` (workers inherit via fork;
+  the entrypoint's `os.execvp` would lose handlers added before it,
+  so the call sits inside the FastAPI factory).
+- **Named volume `sophia_logs` mounted at `/var/log/sophia`** in
+  both `docker-compose.yml` and `docker-compose.cluster.yml`. Lives
+  on Docker's local filesystem (no NFS root-squash trap) with
+  `chmod 777` baked into the Dockerfile so the sophia uid 1001 can
+  write through the `other` bit.
+- **`scripts/sync-sophia-logs.sh`** — mirrors the named volume's
+  rotated files to the host NFS share at
+  `/home/solubrew/EDN/Downloads/LOGs/sophia` (host uid 1000 CAN
+  write there, container uid 1001 cannot). Handles both v1 and v2
+  compose volume names. Run manually or from a 15-min cron.
+- **`rebuild.sh`** — single-command rebuild with shieldface-aware
+  vault extract (writes passphrase to `/tmp` file rather than
+  stdout so the gate doesn't suppress it), `docker-compose build
+  sophia` + `up -d`, code-presence verification
+  (`grep BROKEN_MODEL_PAUSE_SECONDS` etc. inside the container),
+  and a `/healthz` smoke test.
+
+### Changed
+
+- **`sophia/config.py`** — `SophiaConfig` gains a `log_dir:
+  Optional[str]` field; resolved as `os.environ.get("SOPHIA_LOG_DIR")
+  or logging_cfg.get("log_dir") or None`. Empty string normalises
+  to None (file logging off).
+- **`.env.docker.example`** — documents `SOPHIA_LOG_DIR=/var/log/sophia`.
+
+### Reference
+
+- `sophia/log_setup.py` — new module (~129 lines).
+- `sophia/server.py:188-194` — file-logging activation point.
+- `sophia/cli.py:25-30` — bare-metal activation point.
+- `Dockerfile:123-135` — `/var/log/sophia` mkdir + 0777.

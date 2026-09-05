@@ -7,6 +7,7 @@ import argparse
 import uvicorn
 
 from sophia.config import load_config
+from sophia.log_setup import configure_file_logging
 
 
 def main(argv=None) -> int:
@@ -21,6 +22,12 @@ def main(argv=None) -> int:
     host = args.host or cfg.host
     port = args.port or cfg.port
     log_level = args.log_level or cfg.log_level.lower()
+
+    # Activate file logging if a log directory is configured. This is a
+    # no-op when SOPHIA_LOG_DIR / logging.log_dir are unset. Called
+    # here (before uvicorn.run) so the root logger has the file handler
+    # when all the module-level Logma instances initialise.
+    configure_file_logging(cfg.log_dir, cfg.log_level)
 
     uvicorn.run(
         "sophia.server:app",

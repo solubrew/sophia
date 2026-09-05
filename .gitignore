@@ -60,3 +60,8 @@ htmlcov/
 /zz-work_/
 /.cache/sophia/_data_/sophia.db
 sophia/_data_/
+
+# Build artifacts — wheel caches etc. (sb-dist/ is intentionally
+# NOT dockerignored — see .dockerignore for the rationale — but
+# never git-tracked).
+sb-dist/

@@ -185,6 +185,16 @@ def create_app(config=None) -> FastAPI:
             return await _require_cap(authorization, cap)
         return _dep
 
+    # ─── File logging ────────────────────────────────────────────────
+    # TimedRotatingFileHandler on the root logger. Must be called here
+    # (not in entrypoint.py) because entrypoint uses os.execvp which
+    # replaces the process — handlers added before execvp are lost.
+    # Called once per uvicorn master; workers inherit it via fork.
+    # Idempotent: safe to call multiple times.
+    # Re-reads SOPHIA_LOG_DIR from os.environ (set by docker-compose).
+    from sophia.log_setup import configure_file_logging
+    configure_file_logging()
+
     @app.get("/healthz")
     async def healthz():
         """Process-alive probe. Does NOT touch ladyol or the DB —

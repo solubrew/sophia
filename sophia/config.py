@@ -50,6 +50,7 @@ class SophiaConfig:
     host: str
     port: int
     log_level: str
+    log_dir: Optional[str]
     provider_pool_path: str
     # Model ids that must NEVER appear in `/v1/models` and must NEVER
     # be picked by any routing path.  Sourced from the
@@ -96,10 +97,19 @@ def load_config(path: Optional[str] = None) -> SophiaConfig:
             )
         provider_pool_path = _LADYOL_PROVIDERS_YAML
 
+    # Log directory resolution — SOPHIA_LOG_DIR env var wins over the
+    # YAML's logging.log_dir. Empty / null → None (file logging off).
+    log_dir = (
+        os.environ.get("SOPHIA_LOG_DIR")
+        or logging_cfg.get("log_dir")
+        or None
+    )
+
     return SophiaConfig(
         host=server.get("host", "0.0.0.0"),
         port=int(server.get("port", 8765)),
         log_level=str(logging_cfg.get("level", "INFO")).upper(),
+        log_dir=log_dir,
         provider_pool_path=provider_pool_path,
         hidden_models=_parse_id_list(os.environ.get("SOPHIA_HIDDEN_MODELS")),
         auto_models=_parse_id_list(os.environ.get("SOPHIA_AUTO_MODELS")),
