@@ -46,6 +46,21 @@ curl https://openrouter.ai/api/v1/chat/completions \
 - ✅ **Audit lifted to 98.01%** — added LICENSE, CLI.md, CI_CD.md,
   mkdocs.yml, .github/workflows/tests.yml; ruff clean across all
   sources; 6 new entrypoint unit tests bring suite to 85 passing.
+- ✅ **Sophia standalone-compose DB persistence fix**
+  (`sophia@gamma:3c3606b`) — `SOPHIA_DB=/var/lib/sophia/sophia.db`
+  + `sophia_data:/var/lib/sophia` named volume; before the fix
+  every restart overwrote the in-image `sophia/_data_/sophia.db`
+  and wiped `sophia_keys` (post-restart `/v1/chat` returned 401).
+- ✅ **Keyring-stall clean fallback for vault access**
+  (`sophia@gamma:381561e`, `pycurity@gamma:b22567b + b51f7a0 +
+  19c6783`) — three-layer resolution: in-library keyring health
+  probe + `master.key.temp` file-cache layer (the file was being
+  written but never read) + `PYCURITY_DISABLE_KEYRING=1` env var
+  on host-side scripts. Sophia container no longer EOFs on
+  `getpass.getpass`; host-side vault extract no longer stalls
+  8s+ on SecretService. 8 new tests in
+  `pycurity/tests/test_pykeystore_keyring_health.py`; all 69
+  existing tests pass, 0 regressions.
 
 ## New Features (still open)
 
@@ -211,134 +226,3 @@ card protocol before committing).**
 - Per-provider reset windows (the 5-hourly vs. weekly mismatch from
   the 2026-08-27 review). Separate card.
 - Token-budget partitioning (already on the new-features list above).
-
-## Card (commit) — keyring-stall clean fallback for vault access
-
-**Status:** Partially landed. `pycurity@gamma:b22567b` adds the
-in-library fix (`_probe_keyring_health` + `PYCURITY_DISABLE_KEYRING=1`
-env var). Sophia-side work still open — see "Affected sites" below.
-
-**Symptom (2026-09-05 incident).** When the host has `keyring` Python
-package installed but no `gnome-keyring-daemon` / `dbus-daemon`
-running (verified on `192.168.1.67`: SecretService is the default
-backend, no daemon answers), every `keyring.get_password` /
-`keyring.set_password` call hangs indefinitely. PyKeyStore's
-`_load_temp_key` and `_save_temp_key` both call into keyring →
-PyKeyStore() constructor blocks forever. Any host-side script that
-touches the vault (`cluster/seed-keys.sh`, `rebuild.sh`,
-`python -c "from pycurity.pykey import PyKeyStore; ..."`) hangs on
-the first call. The only working pattern was a manual monkey-patch:
-`PyKeyStore._load_temp_key = lambda self: None; PyKeyStore._save_temp_key
-= lambda self, p: None`. Documented as the
-`pycurity-keyring-stall-bypass` skill.
-
-**What the operator wants.**
-1. Services that need vault access (sophia container's entrypoint,
-   host-side seed-keys.sh, host-side rebuild.sh) have a secure, clean
-   path to read/write the vault without hanging.
-2. No monkey-patching — the fix lives in pycurity, not in each caller.
-3. The on-disk `.master_passphrase` / `master.key.temp` files remain
-   the source of truth when keyring is unavailable; the keyring is
-   only an accelerator (4h TTL).
-
-**What's done.**
-- ✅ `pycurity/pykey.py:64-175` — `_probe_keyring_health()` runs
-  `keyring.get_password` on a worker thread with a 0.5s timeout,
-  caches the result on `_KEYRING_HEALTHY`. `_load_temp_key` /
-  `_save_temp_key` / `_delete_temp_key` now check the probe and
-  short-circuit to no-op when the backend is non-functional.
-- ✅ `pycurity/pykey.py:74` — `PYCURITY_DISABLE_KEYRING=1` env var
-  skips the probe entirely (CI + rebuild.sh fast path).
-- ✅ `pycurity/tests/test_pykeystore_keyring_health.py` — 5 tests:
-  probe detects hang, end-to-end init completes <5s with hung
-  backend, short-circuit when keyring not installed, probe result
-  cached across instances, env-var opt-out. All 66 existing tests
-  pass; 0 regressions.
-- ✅ `pycurity/CHANGES.md` — `[Unreleased]` entry under Fixed.
-
-**Affected sites (still open in sophia repo).**
-
-- `cluster/seed-keys.sh:223-243` — host-side vault seed. Currently
-  calls `python inject-merge-vars.py ...` which imports PyKeyStore.
-  With the in-library fix, the probe will run on import (0.5s) and
-  fall back to disk if no keyring daemon — no patch needed. But the
-  0.5s probe on every run is wasted; should export
-  `PYCURITY_DISABLE_KEYRING=1` at the top of seed-keys.sh to skip
-  the probe and go straight to disk. **Verification**: run
-  seed-keys.sh, time it, confirm <2s overhead (down from the
-  8s+ stall).
-- `rebuild.sh:25-39` — same pattern as seed-keys.sh. The
-  `python3 -c "from pycurity.pykey import PyKeyStore; v =
-  PyKeyStore()..."` block currently bypasses keyring via the
-  manual monkey-patch. With the in-library fix, the manual patch is
-  no longer needed — the probe will detect the hung keyring and
-  fall back automatically. Add `export PYCURITY_DISABLE_KEYRING=1`
-  at the top of the script to skip even the probe.
-- `cluster/entrypoint.py:160-175` — container-side cold-start path.
-  The entrypoint already pre-writes `.master_passphrase` and
-  `master.key.temp` before constructing PyKeyStore, so the disk
-  fallback is already there. The in-library fix is a no-op in the
-  container (keyring isn't installed → `_HAS_KEYRING = False`), but
-  rebuild.sh needs to use the new pycurity version so future
-  container builds bake in the fallback path.
-- `sophia/sophia.py:151-155` — `default_db_path()` returns
-  `/app/sophia/_data_/sophia.db` (image-baked, ephemeral). Fixed
-  in commit 3c3606b for the standalone compose, but the cluster
-  compose already had it right. No further work here.
-- `docs/DEPLOY.md` (or equivalent) — add a "Keyring daemon
-  prerequisites" subsection explaining (a) the daemon requirements
-  for normal operation, (b) the disk fallback that activates when
-  no daemon is running, (c) the `PYCURITY_DISABLE_KEYRING=1` opt-out
-  for CI / container builds where the 0.5s probe is wasted.
-
-**Migration plan.**
-
-1. **Pull the new pycurity** — `pip install --upgrade pycurity` from
-   the sb-dist wheel cache (or rebuild via
-   `~/.hermes/projects/pycurity` `python -m build`). Confirm the
-   installed version has `_probe_keyring_health` and
-   `PYCURITY_DISABLE_KEYRING`.
-2. **Bake into the sophia image** — `cd ~/.hermes/projects/sophia &&
-   docker build -f Dockerfile -t sophia-sophia:latest .` so future
-   container builds ship with the fixed pycurity.
-3. **Add `PYCURITY_DISABLE_KEYRING=1` to seed-keys.sh and
-   rebuild.sh** — small one-line export at the top of each script.
-   Verify the scripts run end-to-end in <30s (down from 8s+
-   stalls).
-4. **Remove the monkey-patch from rebuild.sh:25-39** — the bypass is
-   no longer needed once pycurity's probe is in place. Keep the
-   `PASSFILE=/tmp/sophia-pass-$$.txt` tempfile pattern (hermes
-   approval gates still swallow `python -c` stdout that prints
-   secrets).
-5. **Add docs** — one paragraph in `docs/DEPLOY.md` §Host
-   prerequisites: "If `gnome-keyring-daemon` + `dbus-daemon` are
-   running, pycurity uses them as a 4h-TTL cache. If not, the
-   probe detects the hang in 0.5s and falls back to the on-disk
-   `.master_passphrase` / `master.key.temp` files — same security
-   guarantees, just no caching acceleration."
-6. **Live verification** — rebuild sophia with the new pycurity,
-   restart container, confirm `/healthz` returns
- `{"providers":3,"models":5}` and `/v1/chat/completions` with
-   arthr's SOPHIA_REQUESTOR_KEY returns 200. Time seed-keys.sh
-   and rebuild.sh end-to-end; confirm <5s overhead each.
-
-**Out of scope.**
-- Installing gnome-keyring-daemon + dbus-daemon on this host.
-  That's the "proper" fix; the probe-and-fall-back pattern is the
-  portable fix that works whether or not the daemon is installed.
-  Separate decision.
-- Removing the monkey-patch bypass pattern from the
-  `pycurity-keyring-stall-bypass` skill. The skill documents both
-  the historical pattern (when running against an old pycurity)
-  AND the modern pattern (`PYCURITY_DISABLE_KEYRING=1`). Both are
-  useful — keep the skill, update it with a "superseded by" note
-  pointing at the new in-library fix.
-
-**Refs.**
-- `~/.hermes/skills/devops/pycurity-keyring-stall-bypass/` — the
-  skill documenting both the old monkey-patch and the new
-  env-var opt-out.
-- `pycurity@gamma:b22567b` — the commit that landed the
-  in-library fix.
-- `sophia@gamma:3c3606b` — the sister commit (sophia.db
-  persistence) that exposed the keyring stall on this host.
