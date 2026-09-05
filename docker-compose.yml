@@ -46,6 +46,13 @@ services:
       SOPHIA_MASTER_PASSPHRASE: ${SOPHIA_MASTER_PASSPHRASE:?SOPHIA_MASTER_PASSPHRASE must be set in .env (pull from main vault's sophia_cluster_master_passphrase service)}
       # Provider pool YAML — defaults to ladyol's bundled file.
       SOPHIA_PROVIDER_POOL: ${SOPHIA_PROVIDER_POOL:-}
+      # SQLite location — MUST live in the persistent named volume,
+      # not in /app/sophia/_data_ (which is part of the image layer
+      # and gets overwritten on every rebuild, wiping sophia_keys +
+      # usage history). The cluster compose pins this same path;
+      # the standalone compose previously omitted it and silently
+      # defaulted to /app/sophia/_data_/sophia.db.
+      SOPHIA_DB: /var/lib/sophia/sophia.db
       # Logging.
       SOPHIA_LOG_LEVEL: ${SOPHIA_LOG_LEVEL:-INFO}
       # Daily-rotating file logs (sophia.log) written to this dir inside
@@ -55,7 +62,10 @@ services:
       # Dev workflows can set SOPHIA_ALLOW_ENV_FALLBACK=1 in .env.
       SOPHIA_ALLOW_ENV_FALLBACK: ${SOPHIA_ALLOW_ENV_FALLBACK:-0}
     volumes:
-      - sophia_pycurity:/var/lib/sophia/pycurity
+      # Single named volume covers the whole /var/lib/sophia tree —
+      # both the encrypted pycurity vault (subdir) and sophia.db.
+      # Two separate volumes cannot share a parent mount path.
+      - sophia_data:/var/lib/sophia
       # Named volume for rotating logs — lives on Docker's local filesystem
       # so the container can always write (no NFS permission issues).
       - sophia_logs:/var/log/sophia
@@ -106,7 +116,7 @@ services:
         max-file: "3"
 
 volumes:
-  sophia_pycurity:
+  sophia_data:
   sophia_logs:
   caddy_data:
   caddy_config:

@@ -918,3 +918,34 @@ ladyol's hatchling build backend needs `hatchling` AND `trove-classifiers` avail
 - `sophia/server.py:188-194` — file-logging activation point.
 - `sophia/cli.py:25-30` — bare-metal activation point.
 - `Dockerfile:123-135` — `/var/log/sophia` mkdir + 0777.
+
+## [Unreleased] — 2026-09-05 (sophia.db persistence fix)
+
+### Fixed
+
+- **Sophia SQLite DB now persists across container restarts.**
+  `docker-compose.yml` was missing `SOPHIA_DB` and the `sophia_data`
+  named volume mount — the running container silently defaulted to
+  `/app/sophia/_data_/sophia.db`, which is part of the image layer
+  (baked at 61440 bytes Sep 2) and gets overwritten on every rebuild.
+  The `sophia_keys` + `sophia_requestors` + `sophia_usage` tables
+  lived there, so every restart effectively rebuilt the requestor
+  registry from scratch and lost usage history.
+
+  The cluster compose (`docker-compose.cluster.yml`) had it right
+  already (`SOPHIA_DB: /var/lib/sophia/sophia.db` +
+  `sophia_data:/var/lib/sophia`). This change brings the standalone
+  compose in line: pins `SOPHIA_DB`, switches from the empty
+  `sophia_pycurity` named volume (whose only contents were
+  `pycurity/` and which conflicted on `/var/lib/sophia` if added
+  alongside `sophia_data`) to a single `sophia_data:/var/lib/sophia`
+  mount covering both the encrypted vault and `sophia.db`.
+
+### Reference
+
+- `docker-compose.yml:43-66` — env + volumes updated.
+- Symptom: post-restart, every `/v1/chat/completions` returned
+  `401 missing or invalid API key` because `sophia_keys` had been
+  overwritten with the empty in-image table. With the fix, the
+  existing `openwebui` requestor key persisted across the rebuild
+  + restart cycle and arthr/morganna profiles resumed auth cleanly.
