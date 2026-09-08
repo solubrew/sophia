@@ -2,7 +2,11 @@
 
 
 # New Features:
-  - implement routing features for pay as you go apis that will not be used in the cheapest strategy 
+  - implement routing features for pay-as-you-go APIs — CONSTRAINT: PAYG
+    accounts (e.g. OpenRouter) are EXCLUDED from the cheapest strategy;
+    cost-based auto-selection must never pick a metered account. PAYG is
+    reachable only via explicit model/account routing or an
+    operator-configured fallback, never implicitly on cost grounds
   - need to expand across models available 
   - implement full admin web server
   - create an admin panel for enable/disable of account/model
