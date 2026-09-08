@@ -120,6 +120,52 @@ ProviderPool:
           temperature: 0.7
           context_window: 128000
 
+    # PAYG provider (operator constraint 2026-09-07): reachable ONLY
+    # via explicit model pinning (model="openai/gpt-4o" etc.) or the
+    # SOPHIA_PAYG_ALLOW_IN_AUTO=1 opt-in. NEVER in sophia-auto
+    # rotation — enforced by SOPHIA_PAYG_PROVIDERS=openrouter in
+    # docker-compose.cluster.yml + sophia/pool.py's filter.
+    openrouter:
+      enabled: True
+      display_name: "OpenRouter"
+      env_key: "openrouter"
+      is_gateway: True
+      is_local: False
+      supports_prompt_caching: True
+      base_url: "https://openrouter.ai/api/v1"
+      headers:
+        Content-Type: "application/json"
+        Authorization: "Bearer <[API_KEY]>"
+      roles: [user, assistant, system]
+      models:
+        "openai/gpt-4o":
+          enabled: True
+          capability_score: 11
+          capabilities: [chat, code, analysis, vision]
+          max_tokens: 16384
+          temperature: 0.7
+          context_window: 128000
+          costs_per_1k_input: 0.0025
+          costs_per_1k_output: 0.01
+        "anthropic/claude-sonnet-4.5":
+          enabled: True
+          capability_score: 12
+          capabilities: [chat, code, analysis, reasoning]
+          max_tokens: 32768
+          temperature: 0.7
+          context_window: 200000
+          costs_per_1k_input: 0.003
+          costs_per_1k_output: 0.015
+        "meta-llama/llama-3.3-70b-instruct":
+          enabled: True
+          capability_score: 8
+          capabilities: [chat, code]
+          max_tokens: 32768
+          temperature: 0.7
+          context_window: 131072
+          costs_per_1k_input: 0.0003
+          costs_per_1k_output: 0.0013
+
     ollama:
       enabled: True
       display_name: "Local Ollama"

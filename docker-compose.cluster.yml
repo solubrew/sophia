@@ -83,6 +83,11 @@ services:
       # here. grok-2 is deliberately NOT in the list — the xai account
       # is disabled (401s against api.groq.com).
       SOPHIA_AUTO_MODELS: "minimax-m2.7,minimax-m3,glm-4.7,glm-5.2"
+      # PAYG exclusion (operator constraint 2026-09-07): openrouter
+      # is metered per-token — auto-routing (incl. cheapest strategy)
+      # must never pick it. Explicit model pins still reach it.
+      # Set SOPHIA_PAYG_ALLOW_IN_AUTO=1 to opt in as fallback.
+      SOPHIA_PAYG_PROVIDERS: "openrouter"
       # T-NEW-221 (2026-08-28): spawn N parallel uvicorn workers so
       # multiple Hermes profiles (arthr + morganna + future) can hit
       # sophia concurrently without serializing on one event loop.

@@ -2,6 +2,39 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-09-07 (PAYG exclusion from auto-routing + OpenRouter provider)
+
+### Added
+
+- **`SOPHIA_PAYG_PROVIDERS` exclusion** (operator constraint
+  2026-09-07: "pay as you go should NOT be in the cheapest routing").
+  New config fields `payg_providers` + `payg_allow_in_auto`
+  (`sophia/config.py`), enforced in `SophiaPool._filtered_entries`:
+  entries whose PROVIDER name matches the set are dropped from
+  auto-routing (`sophia-auto`) regardless of strategy — `cheapest`
+  can never land on a metered account implicitly. The initial-pick
+  re-roll loops in `chat()` + `stream()` honor the same exclusion so
+  ladyol's unfiltered selector can't sneak a PAYG entry in. PAYG
+  remains reachable via explicit model pin (`model=openai/gpt-4o`)
+  and via the `SOPHIA_PAYG_ALLOW_IN_AUTO=1` operator opt-in.
+  Both compose files pin `SOPHIA_PAYG_PROVIDERS=openrouter`.
+  10 new tests in `tests/test_payg_exclusion.py`.
+- **OpenRouter provider block** (`cluster/agent/agent.yaml`) —
+  3 models enabled (`openai/gpt-4o`,
+  `anthropic/claude-sonnet-4.5`, `meta-llama/llama-3.3-70b-instruct`)
+  with real costs declared, + `openrouter-000.000.000` account in
+  `agent_accts.yaml`. Key not yet seeded —
+  `manage_secrets set openrouter-000.000.000` after rebuild.
+
+### Fixed
+
+- **`SophiaConfig.log_dir` back to optional** — the 2026-09-05
+  logging feature made it required-positional, breaking 12
+  constructions in `test_hidden_models.py` (pre-existing red;
+  surfaced by this session's baseline diff). Now defaults to
+  `None`; `provider_pool_path` defaults to `""` (load_config always
+  resolves a real path). Suite: 130 passed, 0 failed.
+
 ## [Unreleased] — 2026-09-07 (backup-watchdog + healed missed volume backup)
 
 ### Added

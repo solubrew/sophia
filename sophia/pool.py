@@ -614,6 +614,20 @@ class SophiaPool:
             return []
         hidden = self._config.hidden_models
         out = [e for e in self._pool._entries if e.model.name not in hidden]
+        # PAYG exclusion (operator constraint 2026-09-07): metered
+        # providers must never be picked by auto-routing — cost-based
+        # strategies would otherwise land on them implicitly. Explicit
+        # model pinning (for_auto=False) is the sanctioned path, plus
+        # the operator's opt-in fallback flag. (getattr: older config
+        # stubs / pickled configs may predate the fields.)
+        _payg = getattr(self._config, "payg_providers", frozenset()) or frozenset()
+        _payg_ok = bool(getattr(self._config, "payg_allow_in_auto", False))
+        if for_auto and _payg and not _payg_ok:
+            out = [
+                e
+                for e in out
+                if getattr(getattr(e, "provider", None), "name", None) not in _payg
+            ]
         if for_auto and self._config.auto_models:
             allow = self._config.auto_models
             out = [e for e in out if e.model.name in allow]
@@ -845,6 +859,13 @@ class SophiaPool:
                             and id(sel) not in excluded
                             and _is_entry_eligible(self.cooldowns, sel)
                             and sel.model.name not in self._config.hidden_models
+                            and (
+                                not for_auto
+                                or not getattr(self._config, "payg_providers", frozenset())
+                                or getattr(self._config, "payg_allow_in_auto", False)
+                                or getattr(getattr(sel, "provider", None), "name", None)
+                                not in getattr(self._config, "payg_providers", frozenset())
+                            )
                             and _entry_fits(sel, estimated_tokens)
                         ):
                             entry = sel
@@ -1310,6 +1331,13 @@ class SophiaPool:
                             and id(sel) not in excluded
                             and _is_entry_eligible(self.cooldowns, sel)
                             and sel.model.name not in self._config.hidden_models
+                            and (
+                                not for_auto
+                                or not getattr(self._config, "payg_providers", frozenset())
+                                or getattr(self._config, "payg_allow_in_auto", False)
+                                or getattr(getattr(sel, "provider", None), "name", None)
+                                not in getattr(self._config, "payg_providers", frozenset())
+                            )
                             and _entry_fits(sel, estimated_tokens)
                         ):
                             entry = sel

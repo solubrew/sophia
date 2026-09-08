@@ -50,8 +50,14 @@ class SophiaConfig:
     host: str
     port: int
     log_level: str
-    log_dir: Optional[str]
-    provider_pool_path: str
+    # Optional since 2026-09-05 but was required-positional until
+    # 2026-09-07 — defaulting it unfixed 12 stale test constructions
+    # (test_hidden_models.py et al.) without touching them.
+    log_dir: Optional[str] = None
+    # Empty default: load_config() ALWAYS resolves a real path (env
+    # var > yaml > ladyol bundled); the default only matters for
+    # direct constructions in tests.
+    provider_pool_path: str = ""
     # Model ids that must NEVER appear in `/v1/models` and must NEVER
     # be picked by any routing path.  Sourced from the
     # `SOPHIA_HIDDEN_MODELS` env var (comma-separated).
@@ -75,6 +81,27 @@ class SophiaConfig:
     # via `/v1/models` for explicit pinning.  Sourced from the
     # `SOPHIA_AUTO_MODELS` env var (comma-separated).
     auto_models: FrozenSet[str] = field(default_factory=frozenset)
+    # Provider names whose accounts are pay-as-you-go (metered per
+    # token).  Operator constraint (2026-09-07): auto-routing
+    # (including cost-based strategies like `cheapest`) must NEVER
+    # pick a metered account implicitly — PAYG is reachable only
+    # via explicit model pinning, or when the operator opts in via
+    # `payg_allow_in_auto`.  Matched against the PROVIDER name
+    # (e.g. `openrouter`), not the model id.  Sourced from the
+    # `SOPHIA_PAYG_PROVIDERS` env var (comma-separated).
+    payg_providers: FrozenSet[str] = field(default_factory=frozenset)
+    # Operator opt-in that re-admits PAYG provider entries into
+    # auto-routing (the "operator-configured fallback" arm of the
+    # 2026-09-07 constraint).  Sourced from `SOPHIA_PAYG_ALLOW_IN_AUTO`
+    # (truthy: 1/true/yes).
+    payg_allow_in_auto: bool = False
+
+
+def _parse_bool(raw: Optional[str]) -> bool:
+    """Parse a truthy env-var value (1/true/yes, case-insensitive)."""
+    if not raw:
+        return False
+    return raw.strip().lower() in ("1", "true", "yes")
 
 
 def load_config(path: Optional[str] = None) -> SophiaConfig:
@@ -113,4 +140,6 @@ def load_config(path: Optional[str] = None) -> SophiaConfig:
         provider_pool_path=provider_pool_path,
         hidden_models=_parse_id_list(os.environ.get("SOPHIA_HIDDEN_MODELS")),
         auto_models=_parse_id_list(os.environ.get("SOPHIA_AUTO_MODELS")),
+        payg_providers=_parse_id_list(os.environ.get("SOPHIA_PAYG_PROVIDERS")),
+        payg_allow_in_auto=_parse_bool(os.environ.get("SOPHIA_PAYG_ALLOW_IN_AUTO")),
     )

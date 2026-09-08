@@ -7,6 +7,10 @@
     cost-based auto-selection must never pick a metered account. PAYG is
     reachable only via explicit model/account routing or an
     operator-configured fallback, never implicitly on cost grounds
+    → LANDED 2026-09-07: SOPHIA_PAYG_PROVIDERS exclusion in
+    sophia/pool.py + both compose files; OpenRouter provider + account
+    wired. Remaining: seed the API key after image rebuild
+    (manage_secrets set openrouter-000.000.000).
   - need to expand across models available 
   - implement full admin web server
   - create an admin panel for enable/disable of account/model

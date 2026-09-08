@@ -46,6 +46,10 @@ services:
       SOPHIA_MASTER_PASSPHRASE: ${SOPHIA_MASTER_PASSPHRASE:?SOPHIA_MASTER_PASSPHRASE must be set in .env (pull from main vault's sophia_cluster_master_passphrase service)}
       # Provider pool YAML — defaults to ladyol's bundled file.
       SOPHIA_PROVIDER_POOL: ${SOPHIA_PROVIDER_POOL:-}
+      # PAYG exclusion (operator constraint 2026-09-07) — keep in
+      # sync with docker-compose.cluster.yml. Metered providers
+      # (openrouter) never enter sophia-auto rotation.
+      SOPHIA_PAYG_PROVIDERS: ${SOPHIA_PAYG_PROVIDERS:-openrouter}
       # SQLite location — MUST live in the persistent named volume,
       # not in /app/sophia/_data_ (which is part of the image layer
       # and gets overwritten on every rebuild, wiping sophia_keys +

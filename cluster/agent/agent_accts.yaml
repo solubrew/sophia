@@ -33,3 +33,11 @@ provider_accts:
     enabled: False
     provider: xai
     name: "xai-000.000.000"
+  # PAYG account (2026-09-07): reachable only via explicit model pin;
+  # excluded from sophia-auto by SOPHIA_PAYG_PROVIDERS=openrouter.
+  # Key lands in the container vault via manage_secrets set
+  # openrouter-000.000.000 (PyKeyStore lookup uses `name`).
+  "openrouter-000.000.000":
+    enabled: True
+    provider: openrouter
+    name: "openrouter-000.000.000"
