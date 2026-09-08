@@ -1,20 +1,24 @@
 # Sophia TODOs
 
-# TODOs
-- implement open router
-curl https://openrouter.ai/api/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <token>" \
-  -d '{
-  "model": "openai/gpt-4o",
-  "messages": [
-    {
-      "role": "user",
-      "content": "What is the meaning of life?"
-    }
-  ]
-}'
 
+# New Features:
+  - implement routing features for pay as you go apis that will not be used in the cheapest strategy 
+  - need to expand across models available 
+  - implement full admin web server
+  - create an admin panel for enable/disable of account/model
+  - implement open router
+  curl https://openrouter.ai/api/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer <token>" \
+    -d '{
+    "model": "openai/gpt-4o",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the meaning of life?"
+      }
+    ]
+  }'
 
 > **Session 2026-08-27 (evening):** Maintenance docs brought current.
 > Tool-call wire-format fixed (T-NEW-119), vault recovery flow is
