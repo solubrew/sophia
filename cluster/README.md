@@ -321,6 +321,15 @@ Only the running code reverts.
 
 ### Backup / restore
 
+**Automated (since 2026-08-27):** a systemd user timer
+(`backup-volumes.timer`, 03:30 daily + 5min jitter) runs
+`~/.local/bin/backup-volumes.sh`, which tarballs every stateful
+volume for BOTH clusters (sophia + nchantdoffice_com) into
+`~/docker-data/<cluster>/backups/` (= `~/EDN/Documents/docker-data/`
+via symlink + bind mount) with 7-daily + 4-weekly retention. A
+Hermes cron watchdog (`backup-watchdog`, 04:30 daily) alerts when
+backups go stale (>26h). The manual recipe below is the fallback.
+
 The named volume `sophia_sophia_data` holds:
 
 | Path | What |

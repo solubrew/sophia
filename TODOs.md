@@ -81,6 +81,12 @@
   `SOPHIA_WORKERS` so workers don't cascade 429s on the same
   account. See CHANGES.md 2026-08-27 + 2026-08-28 sections.
 
+- ✅ **Backup cron for the named volume** — already covered by the
+  cross-cluster `backup-volumes.timer` (03:30 daily, both clusters,
+  → `~/EDN/Documents/docker-data/`). This session: healed the missed
+  Sep 7 run, added `backup-watchdog` Hermes cron (04:30, alerts >26h
+  staleness) since that failure was silent, updated cluster/README.
+
 ## New Features (still open)
 
 - **Per-provider reset windows** — cooldowns currently use a single

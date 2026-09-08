@@ -2,6 +2,31 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-09-07 (backup-watchdog + healed missed volume backup)
+
+### Added
+
+- **`backup-watchdog` Hermes cron (04:30 daily)** — the 2026-09-07
+  03:30 `backup-volumes.timer` run failed silently (empty log, exit
+  1, no tarballs) and went unnoticed for a day. New watchdog script
+  (`~/.hermes/scripts/backup-watchdog.sh`, no_agent cron job) checks
+  each live cluster's newest tarball age; healthy = silent, stale
+  (>26h) or missing = Telegram alert with diagnose/heal commands.
+  Covers `sophia` + `nchantdoffice_com` cluster dirs; ignores the
+  legacy `nchantdoffice` dir.
+
+### Fixed
+
+- **Healed the missed 2026-09-07 backup** — manual +
+  `systemctl --user start backup-volumes.service` runs both
+  succeeded (9 volumes, 238MB); root cause of the one-off failure
+  not reproducible (transient). Backups land in
+  `~/docker-data/<cluster>/backups/` which resolves to
+  `~/EDN/Documents/docker-data/` via the `~/docker-data` symlink →
+  `~/Documents/docker-data` → fstab bind of `~/EDN/Documents`.
+- **cluster/README.md §Backup/restore** now documents the automated
+  timer + watchdog as primary, manual tar recipe as fallback.
+
 ## [Unreleased] — 2026-09-05 (persistent file logging to LOGs/sophia)
 
 ### Added
