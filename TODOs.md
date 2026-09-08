@@ -65,9 +65,24 @@
   8s+ on SecretService. 8 new tests in
   `pycurity/tests/test_pykeystore_keyring_health.py`; all 69
   existing tests pass, 0 regressions.
+- ✅ **429 rotation exhausts the pool before bubbling**
+  (`sophia@gamma:b9d98e0` T-NEW-120/121 + `e09ea5d`/`11c0ef2`
+  T-NEW-221 cluster-shared cooldowns) — `rotation_cap` walks every
+  non-paused allowlist entry in both `chat()` and `stream()`; when
+  all accounts are rate-limited, a structured
+  `sophia.pool.PoolQuotaExhausted` bubbles and `server.py` maps it
+  to HTTP 429 + `Retry-After` (not 502), with `paused_accounts`
+  listed so the harness can distinguish a quota wall from a server
+  fault. Cooldown timestamps are shared cluster-wide across
+  `SOPHIA_WORKERS` so workers don't cascade 429s on the same
+  account. See CHANGES.md 2026-08-27 + 2026-08-28 sections.
 
 ## New Features (still open)
 
+- **Per-provider reset windows** — cooldowns currently use a single
+  shared reset boundary; the 5-hourly vs. weekly account mismatch
+  (2026-08-27 review) needs per-provider windows. Deferred from the
+  429-rotation card (shipped as T-NEW-120/121).
 - **structured_call endpoint** — OpenAI-style structured output for
   `sophia-auto` calls that need typed JSON responses
 - **Connection naming + per-account metadata** (`name`, `email`,
@@ -167,66 +182,3 @@ container, and restarts the container with the merged keys.
 - **WEBUI_AUTH=false** on Open WebUI — flip before real users.
 - **Streaming retry caveat** — a failure AFTER partial text was
   streamed surfaces to the client (can't cleanly retry mid-stream).
-
-## Card (commit) — 429 rotation must exhaust the pool before bubbling
-
-**Status:** Open. Reproduced live 2026-08-27 22:37 EDT — see `docker logs
-sophia-sophia-1` for `[SophiaPool.stream] attempt 4 failed on
-minimax/minimax-m3` followed by an HTTP 502 to hermes.
-
-**Symptom.** When ALL non-paused accounts on the auto-allowlist 429
-(or otherwise hard-fail), Sophia returns HTTP 502 to the harness with
-the last `httpx.HTTPStatusError` text. The harness can't tell that this
-was a *quota exhaustion* event vs. a transient network blip, so the
-fallback logic in `senbot/senbai` doesn't kick in.
-
-**What the operator wants.**
-1. Sophia catches a 429 (or any `ladyol` rate-limit error).
-2. Pauses that account until the next reset window — already works
-   (`_ProviderCooldowns.pause()` at `sophia/pool.py:476, 767`).
-3. **Keeps rotating through every remaining non-paused entry** —
-   must not stop at `max_retries=3` when more accounts exist.
-4. Only bubbles a 429-shaped error to the harness when **zero**
-   unpaused entries remain AND the only failures were rate limits.
-   Then return a **distinct HTTP status** (e.g. **429** with
-   `Retry-After` header) so the gateway/harness knows it's a quota
-   wall, not a server fault.
-
-**Current behavior gap.**
-- `chat()` line 308: `for attempt in range(max_retries + 1)` — caps at
-  4 picks even when `available` still has entries. With 5 LLM accounts
-  on the allowlist, an attempt loop of 4 leaves headroom for only one
-  full provider rotation before the 502 fires.
-- `stream()` line 619: same cap.
-- Both paths raise `last_exc` (the raw upstream exception) when the
-  loop ends, then `server.py:349` turns it into HTTP 502. No
-  "all-paused" vs. "transient-error" distinction at the HTTP layer.
-
-**Fix scope (rough — see `subagent-driven-development` skill for the
-card protocol before committing).**
-- Replace `max_retries` with `max_attempts` derived from the live
-  available-entries count, OR (simpler) raise the cap to
-  `len(allowlist) + 1` and let the inner `if not available: break`
-  be the real exit.
-- In the final raise, distinguish two cases:
-  - "every failure was a 429 and no unpaused entries remain" → raise
-    a `PoolQuotaExhausted` exception with structured detail (which
-    providers paused, next reset UTC); `server.py` maps that to
-    HTTP 429 + `Retry-After`.
-  - otherwise (mixed errors) → keep current `last_exc` re-raise.
-- Apply to both `chat()` (line ~308-500) and `stream()` (line
-  ~619-775).
-- Tests: add a `tests/test_pool_429_rotation.py` case that drives
-  every entry to 429 and asserts (a) the pool walks the whole list,
-  (b) the final exception is `PoolQuotaExhausted`, (c) the cooldown
-  dict has all entries paused until the next reset boundary.
-- Add a matching `sophia/server.py` handler that maps
-  `PoolQuotaExhausted` → HTTP 429 + `Retry-After: <seconds>` header
-  (set from the earliest `cooldowns._paused_until` value).
-- Live verification: re-run the 22:37 scenario, confirm the harness
-  gets a 429 (not 502) once all 5 accounts are paused.
-
-**Out of scope.**
-- Per-provider reset windows (the 5-hourly vs. weekly mismatch from
-  the 2026-08-27 review). Separate card.
-- Token-budget partitioning (already on the new-features list above).
