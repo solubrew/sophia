@@ -78,7 +78,8 @@ docker run -d \
   -e SOPHIA_DB=/var/lib/sophia/sophia.db \
   -e SOPHIA_PROVIDER_POOL=/etc/sophia/agent \
   -e SOPHIA_WORKERS=4 \
-  -e SOPHIA_AUTO_MODELS=minimax-m2.7,minimax-m3,glm-4.7,glm-5.2 \
+  -e SOPHIA_AUTO_MODELS=minimax-m3,glm-4.7,glm-5.2 \
+  -e SOPHIA_HIDDEN_MODELS=minimax-m2.7 \
   -e SOPHIA_LOG_DIR=/var/log/sophia \
   --restart unless-stopped \
   sophia_sophia:local 2>&1

@@ -2,6 +2,41 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-09-09 (m2.7 retired from rotation + context-window truth for sophia-auto consumers)
+
+### Changed
+
+- **`minimax-m2.7` retired from all routing** (operator 2026-09-09:
+  "deactivate the use of m2.7 only allow m3" — glm models stay
+  valid). `SOPHIA_AUTO_MODELS` is now `minimax-m3,glm-4.7,glm-5.2` in
+  `rebuild.sh` (the `docker run` source of truth) and
+  `docker-compose.cluster.yml`; new `SOPHIA_HIDDEN_MODELS=minimax-m2.7`
+  belt-and-braces removes it from `/v1/models` and every routing
+  path, not just auto. Evidence: 24h logs showed m2.7 taking 1751/1926
+  stream attempts (~91%) while returning 116–173-char reasoning-only
+  stubs with no tool_call — the source of nearly every
+  `stream exhausted all provider retries` error hitting gwen.
+  Verified live post-rebuild: `/v1/models` lists exactly
+  `glm-4.7, glm-5.2, minimax-m3, sophia-auto`; two completions
+  served 200 by glm-4.7 and glm-5.2.
+
+### Fixed
+
+- **Context-window truth for `sophia-auto` consumers** — root cause
+  of "payload grows but auto-compaction never fires". Sophia's
+  `/v1/models` carries no context-window metadata, so hermes fell
+  back to `DEFAULT_FALLBACK_CONTEXT` (256k) for the unknown
+  `sophia-auto` id; hygiene fires at 85% of the believed window
+  (217.6k) while the real rotation floor is glm's 128k — a dead zone
+  where sessions overgrow past 128k with no compaction and no 413.
+  Fix: `custom_providers[].models.sophia-auto.context_length: 128000`
+  pinned in all five sophia-routed profiles (arthr, gwen, morganna,
+  orin, solubrew) via the #15779 single-source-of-truth lookup;
+  hygiene now fires at 0.85 × 128k ≈ 108.8k, before the real wall,
+  with sophia's 413 pre-flight as backstop above it. (Profile
+  gateways must be restarted to pick this up — reads at agent
+  startup.)
+
 ## [Unreleased] — 2026-09-07 (PAYG exclusion from auto-routing + OpenRouter provider)
 
 ### Added

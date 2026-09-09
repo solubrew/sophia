@@ -82,7 +82,13 @@ services:
       # tree during the deploy rollback/reset dance and is restored
       # here. grok-2 is deliberately NOT in the list — the xai account
       # is disabled (401s against api.groq.com).
-      SOPHIA_AUTO_MODELS: "minimax-m2.7,minimax-m3,glm-4.7,glm-5.2"
+      SOPHIA_AUTO_MODELS: "minimax-m3,glm-4.7,glm-5.2"
+      # m2.7 retired 2026-09-09: recurring "stuck in reasoning-only mode"
+      # failures (tiny think-block stubs, no tool_call) — 85% of stream
+      # traffic and nearly all rotation-exhaustion errors. Hidden =
+      # removed from /v1/models AND every routing path; explicit pins
+      # would 404. m3 is the only minimax model left in rotation.
+      SOPHIA_HIDDEN_MODELS: "minimax-m2.7"
       # PAYG exclusion (operator constraint 2026-09-07): openrouter
       # is metered per-token — auto-routing (incl. cheapest strategy)
       # must never pick it. Explicit model pins still reach it.
