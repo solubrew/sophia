@@ -2,6 +2,52 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-09-11 (failure-mode tightening: empty-stream pause + cooldown-fallback cap)
+
+### Changed
+
+- **Empty-stream rotation now pauses the offending account.**
+  Operator report 2026-09-11: hermes profile agents seeing
+  "model provider failed after retries" with the actual upstream
+  being `minimax-m3` returning a successfully-opened SSE stream
+  with **no content**. Root cause: the streaming path rotated
+  to the next account on each attempt but never paused the
+  empty one, so every concurrent hermes turn kept landing on
+  the same broken account until the hermes 3-retry budget ran
+  out. New behavior: when `stream()` finishes with `err is None
+  and emitted is False`, pause the (account, model) entry for
+  60s via `cooldowns.pause()` so the rotation skips it for one
+  minute. Much shorter than a quota cooldown (60s vs hours)
+  because empty-stream pathology is typically transient
+  (gateway hiccup, brief upstream rate-limit window that came
+  back as 200-but-empty). `BROKEN_MODEL_PAUSE_SECONDS` constant
+  renamed analogously to `EMPTY_STREAM_PAUSE_SECONDS`.
+
+- **Cooldown fallback capped at 30 minutes.**
+  Same report: when the 429 body didn't carry a parseable
+  timestamp (the `_reset_from_error()` path), the pool fell
+  back to `_next_reset_utc()` — the strict EDT table — which
+  can be up to 5 hours away. A parse failure usually means
+  the body was a transient format we didn't recognise, NOT
+  that the real upstream window is that long. New behavior:
+  `_FALLBACK_PAUSE_SECONDS = 30 * 60` caps the table value
+  when the parsed reset is missing. The probe mechanism makes
+  this safe: a still-429'd account just keeps re-entering the
+  pause cycle until the real reset.
+
+### Added
+
+- `tests/test_empty_stream_pause.py` — 6 tests covering
+  pause window, code-shape gate (err is None and not emitted),
+  fallback ceiling, parse-unaffected-by-cap, sibling-account
+  isolation.
+
+### Verified
+
+- Full suite: 150/150 (was 145).
+- The two failure patterns at issue (empty-stream m3 and the
+  2-hour sticky pause) both addressed at the pool layer.
+
 ## [Unreleased] — 2026-09-11 (sophia findings closed: blueprint_structure + security_headers)
 
 ### Changed

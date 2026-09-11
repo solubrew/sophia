@@ -49,6 +49,21 @@ def _next_reset_utc(now: Optional[datetime] = None) -> datetime:
             + timedelta(days=1)).astimezone(timezone.utc)
 
 
+# Fallback pause ceiling (NEW, 2026-09-11): when the pool pauses an
+# account on a 429 AND the provider-reported timestamp parse fails
+# (``_reset_from_error`` returns None), we fall back to the strict EDT
+# table. The next scheduled boundary can be up to 5 hours away
+# (e.g. 16:00 EDT → 20:00 EDT), but a parse failure usually means
+# the body was a transient format we didn't recognise — NOT that the
+# real upstream window is that long. Capping the fallback at 30 min
+# trades false-short pauses (the pool re-probes sooner, accounts come
+# back into rotation quickly once they're healthy) for
+# false-long pauses (the user waited 2 hours for a window that was
+# actually 10 minutes). The probe mechanism makes the cap safe: a
+# still-429'd account just keeps re-entering the pause cycle.
+_FALLBACK_PAUSE_SECONDS = 30 * 60
+
+
 # Z-NEW (2026-09-11): zai changed their quota-rehydration schedule and
 # added manual quota reloads. Two consequences for the pause logic:
 #
@@ -353,6 +368,26 @@ def _is_entry_eligible(cooldowns, entry) -> bool:
 # Rate-limit pauses still use the much longer ``_next_reset_utc()``
 # window — those are quota resets, not model pathology.
 BROKEN_MODEL_PAUSE_SECONDS = 15
+
+
+# Empty-stream pause (NEW, 2026-09-11): when a stream connects, opens,
+# and finishes without ever emitting a delta.content AND without an
+# upstream error (the "silently empty stream" pattern), pause the
+# account briefly so the next rotation skips it. The 60s horizon is
+# chosen to:
+#
+#   * Absorb the burst of retries from any in-flight hermes turn
+#     (3 retries × ~5s backoff = ~15s window).
+#   * Stay short enough that a healthy recovery auto-resumes
+#     traffic within ~1 minute — much better than the multi-hour
+#     429 cooldown window, which would be wildly wrong for a
+#     pathology that's typically transient (gateway hiccup,
+#     short upstream rate-limit window that came back as 200 OK
+#     but empty, etc.).
+#
+# Rate-limit pauses still use the much longer ``_next_reset_utc()``
+# window — those are quota resets, not model pathology.
+EMPTY_STREAM_PAUSE_SECONDS = 60
 
 
 def _entry_context_window(entry) -> Optional[int]:
@@ -1228,11 +1263,17 @@ class SophiaPool:
                     # instead of a generic 502 — the harness can then
                     # distinguish "we're quota-walled" from "the
                     # upstream is broken".
-                    # Z-NEW (2026-09-11): prefer the provider-reported
-                    # reset time (zai reports Beijing-time wall clock)
-                    # over the fixed EDT table. Table stays as fallback.
+                    # Z-NEW (2026-09-11): provider-reported reset time
+                    # (zai: Beijing wall clock) with the strict EDT table
+                    # as fallback when the body carries no timestamp. The
+                    # table value is also clamped to a 30 min ceiling so
+                    # a parse failure doesn't stick the pool for the full
+                    # gap to the next scheduled boundary (up to 5 hours).
+                    parsed = _reset_from_error(exc)
+                    if parsed is None:
+                        parsed = min(_next_reset_utc(), datetime.now(timezone.utc) + timedelta(seconds=_FALLBACK_PAUSE_SECONDS))
                     self.cooldowns.pause(
-                        acct, _reset_from_error(exc) or _next_reset_utc()
+                        acct, parsed
                     )
                     rate_limit_failures += 1
                 if model is None:
@@ -1672,6 +1713,31 @@ class SophiaPool:
                 f"provider {getattr(entry.provider, 'name', '?')} "
                 f"({entry.model.name}) returned an empty stream"
             )
+            # Empty-stream recovery (NEW, 2026-09-11): when the stream
+            # finished without an error AND without ever emitting
+            # content, the upstream accepted the request (so this is
+            # not a rate limit) but returned nothing usable. Pause
+            # the account briefly so the next rotation skips it —
+            # prevents the same empty-stream account from being
+            # hammered by every concurrent hermes turn. The pause
+            # is much shorter than a quota cooldown (60s vs hours)
+            # because the pathology is typically transient; if it's
+            # genuinely broken, subsequent empty-streams will keep
+            # refreshing the pause until the underlying issue clears.
+            if err is None and not emitted:
+                entry_id = _entry_key(entry)
+                self.cooldowns.pause(
+                    entry_id,
+                    datetime.now(timezone.utc) + timedelta(
+                        seconds=EMPTY_STREAM_PAUSE_SECONDS
+                    ),
+                )
+                logma.warning(
+                    f"[SophiaPool.stream] attempt {attempt + 1}: "
+                    f"{entry_id} returned an empty stream (no content, no "
+                    f"error); pausing for {EMPTY_STREAM_PAUSE_SECONDS}s and "
+                    f"rotating to another account"
+                )
             # Auto mode only: exclude and rotate. Explicit model: stop.
             if model:
                 raise last_exc
@@ -1685,9 +1751,15 @@ class SophiaPool:
                 # trailing raise can classify the failure mode.
                 # Z-NEW (2026-09-11): provider-reported reset time
                 # (zai: Beijing wall clock) with the strict EDT table
-                # as fallback when the body carries no timestamp.
+                # as fallback when the body carries no timestamp. The
+                # table value is also clamped to a 30 min ceiling so
+                # a parse failure doesn't stick the pool for the full
+                # gap to the next scheduled boundary (up to 5 hours).
+                parsed = _reset_from_error(err)
+                if parsed is None:
+                    parsed = min(_next_reset_utc(), datetime.now(timezone.utc) + timedelta(seconds=_FALLBACK_PAUSE_SECONDS))
                 self.cooldowns.pause(
-                    _account_of(entry), _reset_from_error(err) or _next_reset_utc()
+                    _account_of(entry), parsed
                 )
                 rate_limit_failures += 1
             logma.warning(
