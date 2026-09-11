@@ -63,12 +63,16 @@ echo "[$(date +%H:%M:%S)] passphrase loaded (length: ${#SOPHIA_MASTER_PASSPHRASE
 
 # Step 1b: extract the Postgres credentials from the vault entry
 # 'pgs-4964wkcr.210' (username + private_key fields — operator
-# 2026-09-11: "it is held under private key"). Written to a 0600
-# env-file consumed via docker --env-file (NOT -e, so the password
-# never appears in `docker inspect` output).
+# 2026-09-11: "it is held under private key"). Written to the sophia
+# data volume as a root-owned 0600 file (/var/lib/sophia/pg.env) and
+# read by cluster/entrypoint.py right before exec'ing uvicorn.
+#
+# NOT --env-file: `docker run --env-file` still puts every var into
+# .Config.Env (docker inspect) — verified 2026-09-11. A mounted file
+# keeps the password out of the container spec entirely; only the
+# running uvicorn process env holds it.
 echo "[$(date +%H:%M:%S)] step 1b: extracting postgres credentials from vault"
-PGENV=/tmp/sophia-pgenv-$$.txt
-trap 'rm -f "$PASSFILE" "$PGENV"' EXIT
+PGSECRETVOL=sophia_sophia_data
 timeout 30 /home/solubrew/.hermes/hermes-agent/venv/bin/python3 -c "
 import sys
 try:
@@ -76,24 +80,46 @@ try:
     v = PyKeyStore(passphrase='brewerkey')
     r = v.get('pgs-4964wkcr.210')
     if r and r.get('username') and r.get('private_key'):
-        with open('$PGENV', 'w') as f:
-            f.write('SOPHIA_PG_HOST=192.168.1.210\n')
-            f.write('SOPHIA_PG_PORT=5432\n')
-            f.write('SOPHIA_PG_DB=sophia\n')
-            f.write('SOPHIA_PG_USER=%s\n' % r['username'])
-            f.write('SOPHIA_PG_PASSWORD=%s\n' % r['private_key'])
+        import os
+        # Write into the named volume via a one-shot helper container
+        # (the volume is owned by the in-container user; host can't
+        # write it directly).
+        content = (
+            'SOPHIA_PG_HOST=192.168.1.210\n'
+            'SOPHIA_PG_PORT=5432\n'
+            'SOPHIA_PG_DB=sophia\n'
+            'SOPHIA_PG_USER=%s\n'
+            'SOPHIA_PG_PASSWORD=%s\n'
+        ) % (r['username'], r['private_key'])
+        import subprocess, tempfile, os
+        fd, tmp = tempfile.mkstemp()
+        os.write(fd, content.encode())
+        os.close(fd)
+        os.chmod(tmp, 0o600)
+        rv = subprocess.run([
+            'docker', 'run', '--rm',
+            '-v', '$PGSECRETVOL:/var/lib/sophia',
+            '-v', tmp + ':/secret:ro',
+            'alpine:3.19',
+            # chown to 1001 = the in-container 'sophia' user (the app
+            # reads this file at boot; root-owned 0600 = EACCES).
+            'sh', '-c', 'cp /secret /var/lib/sophia/pg.env && chown 1001:1001 /var/lib/sophia/pg.env && chmod 400 /var/lib/sophia/pg.env',
+        ], capture_output=True, text=True)
+        os.unlink(tmp)
+        if rv.returncode != 0:
+            sys.stderr.write('docker secret copy failed: ' + rv.stderr[:200] + chr(10))
+            sys.exit(1)
         sys.exit(0)
 except Exception as e:
     sys.stderr.write('vault error: ' + repr(e) + chr(10))
 sys.exit(1)
 " 2>/dev/null
 
-if [ ! -f "$PGENV" ]; then
-    echo "[$(date +%H:%M:%S)] FATAL: postgres credential extract failed"
+if ! docker run --rm -v sophia_sophia_data:/var/lib/sophia alpine:3.19 test -f /var/lib/sophia/pg.env; then
+    echo "[$(date +%H:%M:%S)] FATAL: postgres secret file not staged in volume"
     exit 1
 fi
-chmod 600 "$PGENV"
-echo "[$(date +%H:%M:%S)] postgres credentials staged (env-file, 0600)"
+echo "[$(date +%H:%M:%S)] postgres credentials staged as /var/lib/sophia/pg.env (volume, 0600)"
 
 # Step 2: build the image
 echo "[$(date +%H:%M:%S)] step 2: docker build -f Dockerfile"
@@ -109,7 +135,6 @@ docker run -d \
   -v sophia_sophia_data:/var/lib/sophia \
   -v sophia_sophia_logs:/var/log/sophia \
   -v /home/solubrew/.local/share/pycurity:/host-pycurity:ro \
-  --env-file "$PGENV" \
   -e SOPHIA_DB=/var/lib/sophia/sophia.db \
   -e SOPHIA_PROVIDER_POOL=/etc/sophia/agent \
   -e SOPHIA_WORKERS=4 \

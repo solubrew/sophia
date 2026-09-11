@@ -389,6 +389,30 @@ if __name__ == "__main__":
     _ensure_vault()
     _merge_from_system_wide()
     _ensure_accts_file()
+
+    # PG credentials (2026-09-11): rebuild.sh stages them at
+    # /var/lib/sophia/pg.env (root-owned 0600, in the data volume).
+    # Read into the PROCESS env here — deliberately NOT in the
+    # container spec (docker inspect never sees it; --env-file WOULD
+    # have leaked it into .Config.Env — verified).
+    PG_ENV_FILE = Path("/var/lib/sophia/pg.env")
+    if PG_ENV_FILE.exists():
+        try:
+            for line in PG_ENV_FILE.read_text().splitlines():
+                line = line.strip()
+                if not line or "=" not in line or line.startswith("#"):
+                    continue
+                k, _, v = line.partition("=")
+                os.environ[k] = v
+            sys.stderr.write("[entrypoint] PG credentials loaded from volume secret\n")
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[entrypoint] WARN: failed to read {PG_ENV_FILE}: {exc}\n")
+    else:
+        sys.stderr.write(
+            "[entrypoint] NOTE: /var/lib/sophia/pg.env absent — "
+            "SQLite backend (set SOPHIA_PG_* or stage the file for Postgres)\n"
+        )
+
     # Re-set PYCURITY_* explicitly BEFORE we exec uvicorn — PyKeyStore's
     # constructor reads these on every chat request to decide which
     # vault to open, and the in-process env must be locked in.
