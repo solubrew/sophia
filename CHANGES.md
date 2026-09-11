@@ -2,6 +2,53 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-09-11 (Z-NEW: zai rehydration-schedule change + manual quota reloads)
+
+### Changed
+
+- **Provider-reported reset times replace the fixed EDT table for zai.**
+  zai changed their quota-rehydration schedule and now report the
+  actual window end in the 429 body:
+  `{"error":{"code":"1308","message":"Usage limit reached for 5 hour.
+  Your limit will reset at 2026-09-12 01:31:54"}}` — a wall-clock
+  timestamp in **Beijing time (UTC+8)**. The old logic paused to the
+  next fixed 01/06/11/16/20 EDT boundary; on the 2026-09-11 17:31:06
+  UTC incident that over-paused a healthy account by 2.5 hours
+  (the reported window actually ended 48 seconds later).
+  New: `_reset_from_error(exc)` parses the timestamp (zai → UTC+8,
+  others → UTC convention), sanity-clamps to 30s–12h (with a
+  dual-timezone retry interpretation), and falls back to the strict
+  EDT table when nothing parseable is present (minimax's 2056 body
+  carries no timestamp — the table still matches their behavior).
+  Wired into both 429 pause sites (`chat()` and `stream()`).
+
+- **Manual-reload probe unpauses reloaded accounts mid-window.**
+  zai now supports manual quota reloads — a paused account can
+  become servable at any moment. When a rotation finds every account
+  paused, `_probe_paused_accounts_async` fires ONE cheap 1-token
+  test request at each paused account (throttled to 1/account/60s)
+  before declaring the pool exhausted. A success calls the new
+  `CooldownStore.unpause()` and the rotation continues with real
+  traffic instead of returning 502 to hermes. Hooked into both
+  rotation loops (`chat()` and `stream()`).
+
+### Added
+
+- `CooldownStore.unpause(account)` (+ `_ProviderCooldowns` shim
+  delegation) — clears a live pause row for manual-reload recovery.
+- `_probe_paused_accounts_async` on `SophiaPool` — the throttled
+  probe described above.
+
+### Tests
+
+- `tests/test_zai_reset_parsing.py` (10 tests): Beijing-time parsing
+  (the incident shape: 48s pause, not 2.5h), mid-window parsing,
+  no-timestamp → table fallback, past/absurd timestamps → fallback,
+  strict-table regression, `unpause` round-trip + idempotence,
+  probe-recovery (traffic flows after reload), probe-still-limited
+  (stays paused), and the 60s per-account throttle.
+- Full suite 140/140 green (e2e-live excluded — needs the real vault).
+
 ## [Unreleased] — 2026-09-09 (m2.7 retired from rotation + context-window truth for sophia-auto consumers)
 
 ### Changed

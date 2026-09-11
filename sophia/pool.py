@@ -49,6 +49,95 @@ def _next_reset_utc(now: Optional[datetime] = None) -> datetime:
             + timedelta(days=1)).astimezone(timezone.utc)
 
 
+# Z-NEW (2026-09-11): zai changed their quota-rehydration schedule and
+# added manual quota reloads. Two consequences for the pause logic:
+#
+#   1. The fixed 01/06/11/16/20 EDT table is NO LONGER the truth for
+#      zai. Their 429 body now reports the actual window end:
+#      ``{"error":{"code":"1308","message":"Usage limit reached for 5
+#      hour. Your limit will reset at 2026-09-12 01:31:54"}}`` — a
+#      wall-clock timestamp in BEIJING time (UTC+8; z.ai is a CN
+#      provider). At 17:31:06 UTC on 2026-09-11 that meant the window
+#      ended 48 SECONDS later (01:31:54 CST == 17:31:54 UTC), but the
+#      table-based pause held the account for 2.5 more hours.
+#   2. Manual reloads mean an account can become SERVABLE at any
+#      moment mid-pause. The rotation now fires a cheap test request
+#      at paused accounts before declaring the pool exhausted
+#      (see ``_probe_paused_accounts``) — a success unpauses and the
+#      rotation continues instead of returning 502.
+#
+# ``_reset_from_error`` extracts the provider-reported timestamp when
+# present; the strict EDT table remains the FALLBACK when the body
+# doesn't say (minimax still reports no timestamp in its 2056 quota
+# errors — the table matches their observed reset behavior).
+import re as _re  # Z-NEW: reset-timestamp parsing
+
+# zai (z.ai) is Beijing-based: their error timestamps are UTC+8.
+_ZAI_TZ = timezone(timedelta(hours=8))
+
+# Match "will reset at 2026-09-12 01:31:54" (and close variants: extra
+# spaces, no seconds, ISO 'T' separator).
+_RESET_AT_RE = _re.compile(
+    r"reset(?:s)?(?:\s+at)?\s+(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::(\d{2}))?"
+)
+
+# Sanity clamp for a parsed pause: anything under 30s or over 12h is
+# treated as untrustworthy (mis-parsed timezone, garbage body) and we
+# fall back to the table. Real windows are 1-5h.
+_MIN_PAUSE_SECONDS = 30
+_MAX_PAUSE_SECONDS = 12 * 3600
+
+
+def _reset_from_error(exc: BaseException, now: Optional[datetime] = None) -> Optional[datetime]:
+    """Parse a provider-reported reset timestamp out of a 429 body.
+
+    Returns a UTC-aware datetime, or ``None`` when nothing parseable
+    is present (caller falls back to ``_next_reset_utc()``).
+
+    Timezone policy: zai reports Beijing time (UTC+8). Other providers
+    that adopt this error shape may report UTC or local — when the
+    provider is NOT zai we interpret the timestamp as UTC (the common
+    API convention). The 30s-12h sanity clamp catches misinterpretation
+    either way: a wrong-timezone parse produces an pause in the past
+    (<30s) or an absurd future (>12h), both of which fall back to the
+    table.
+    """
+    now = now or datetime.now(timezone.utc)
+    # Best-effort error-body extraction across exception shapes.
+    text = str(exc)
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        try:
+            body = getattr(resp, "text", "") or ""
+            text = f"{text}\n{body}"
+        except Exception:
+            pass
+    m = _RESET_AT_RE.search(text)
+    if not m:
+        return None
+    date_s, time_s, sec_s = m.group(1), m.group(2), m.group(3) or "00"
+    try:
+        naive = datetime.strptime(f"{date_s} {time_s}:{sec_s}", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    # zai → Beijing time; everyone else → UTC convention.
+    is_zai = "z.ai" in text or "zai" in text.lower()
+    aware = naive.replace(tzinfo=_ZAI_TZ if is_zai else timezone.utc)
+    pause_seconds = (aware - now).total_seconds()
+    if pause_seconds < _MIN_PAUSE_SECONDS or pause_seconds > _MAX_PAUSE_SECONDS:
+        # Untrustworthy (in the past or absurdly far). One retry
+        # interpretation: maybe the provider reports UTC but we read
+        # it as Beijing (or vice-versa) — the delta between the two is
+        # 8h, so if treating it as the OTHER interpretation lands in
+        # the sane band, use that.
+        other = naive.replace(tzinfo=timezone.utc if is_zai else _ZAI_TZ)
+        other_seconds = (other - now).total_seconds()
+        if _MIN_PAUSE_SECONDS <= other_seconds <= _MAX_PAUSE_SECONDS:
+            return other
+        return None
+    return aware
+
+
 class _ProviderCooldowns:
     """DEPRECATED shim — delegates to :class:`sophia.cooldowns.CooldownStore`.
 
@@ -103,6 +192,12 @@ class _ProviderCooldowns:
 
     def pause(self, account: str, until_utc) -> None:
         self._impl.pause(account, until_utc)
+
+    def unpause(self, account: str) -> None:
+        # Z-NEW (2026-09-11): manual-reload recovery — delegates to the
+        # real store. The probe calls this after a successful test
+        # request on a paused account.
+        self._impl.unpause(account)
 
     def is_paused(self, account: str) -> bool:
         return self._impl.is_paused(account)
@@ -680,6 +775,72 @@ class SophiaPool:
             return (None, None, 0)
         return (caps[0], caps[-1], len(caps))
 
+    # ── Z-NEW (2026-09-11): manual-reload probe ─────────────────────
+    #
+    # zai supports manual quota reloads: an account that 429'd can
+    # become servable again at ANY moment mid-pause. When a rotation
+    # finds the pool empty (every account paused), fire ONE cheap
+    # test request at each paused account before declaring defeat. A
+    # success unpauses the account and the rotation continues with
+    # real traffic instead of returning 502 to hermes.
+    #
+    # Throttled: at most one probe per account per 60s so a burst of
+    # failed requests can't hammer the upstream with test calls.
+
+    _PROBE_MIN_INTERVAL_SECONDS = 60
+    _last_probe_at: Dict[str, float] = {}
+
+    async def _probe_paused_accounts_async(
+        self, pool, excluded: set, for_auto: bool, estimated_tokens: int = 0
+    ) -> bool:
+        """Async implementation of the manual-reload probe.
+
+        See ``_probe_paused_accounts`` for the rationale. This is the
+        shape the rotation loops call (they are already async).
+        """
+        now = time.time()
+        recovered: list = []
+        for entry in self._filtered_entries(for_auto=for_auto):
+            if id(entry) in excluded:
+                continue
+            acct = _account_of(entry)
+            if not self.cooldowns.is_paused(acct):
+                continue
+            # Throttle: one probe per account per interval.
+            if now - self._last_probe_at.get(acct, 0.0) < self._PROBE_MIN_INTERVAL_SECONDS:
+                continue
+            self._last_probe_at[acct] = now
+            try:
+                client = pool._client_for(entry)
+            except Exception as exc:
+                logma.warning(f"[probe] no client for {acct}: {exc}")
+                continue
+            try:
+                # 1-token test request — cheap even on a metered plan.
+                # The message list is minimal; max_tokens floors at 1.
+                await client.chat(
+                    prompt="ping",
+                    model=entry.model.name,
+                    system="You are a health probe.",
+                    temperature=0.0,
+                    max_tokens=1,
+                )
+                # Success — the account has quota again (manual reload
+                # or early window rollover). Reactivate immediately.
+                self.cooldowns.unpause(acct)
+                recovered.append(acct)
+                logma.info(
+                    f"[probe] {acct} answered the test request — quota "
+                    f"available (manual reload?); reactivated for rotation"
+                )
+            except Exception as exc:
+                # Still exhausted (or transient network). Leave paused.
+                logma.info(
+                    f"[probe] {acct} still rate-limited on test request: "
+                    f"{type(exc).__name__}"
+                )
+        return bool(recovered)
+
     async def chat(
         self,
         prompt: Optional[str] = None,
@@ -827,6 +988,21 @@ class SophiaPool:
                         f"not served by this gateway. Remove it from the env "
                         f"var (or rebuild) to re-enable."
                     )
+                # Z-NEW (2026-09-11): every entry is paused. Before
+                # giving up, probe paused accounts once — zai supports
+                # manual quota reloads, so a paused account may already
+                # be servable again. If any probe succeeds, unpause
+                # happened inside the probe; re-run the filter (the
+                # loop's next iteration picks the recovered account).
+                try:
+                    recovered = await self._probe_paused_accounts_async(
+                        pool, excluded, for_auto, estimated_tokens
+                    )
+                except Exception as probe_exc:
+                    logma.warning(f"[probe] failed during chat rotation: {probe_exc}")
+                    recovered = False
+                if recovered:
+                    continue  # retry the availability filter
                 break
             entry = available[0]
             if attempt == 0 and not model:
@@ -1052,7 +1228,12 @@ class SophiaPool:
                     # instead of a generic 502 — the harness can then
                     # distinguish "we're quota-walled" from "the
                     # upstream is broken".
-                    self.cooldowns.pause(acct, _next_reset_utc())
+                    # Z-NEW (2026-09-11): prefer the provider-reported
+                    # reset time (zai reports Beijing-time wall clock)
+                    # over the fixed EDT table. Table stays as fallback.
+                    self.cooldowns.pause(
+                        acct, _reset_from_error(exc) or _next_reset_utc()
+                    )
                     rate_limit_failures += 1
                 if model is None:
                     excluded.add(id(entry))
@@ -1306,6 +1487,18 @@ class SophiaPool:
                         f"not served by this gateway. Remove it from the env "
                         f"var (or rebuild) to re-enable."
                     )
+                # Z-NEW (2026-09-11): same manual-reload probe as
+                # chat() — when every entry is paused, test the paused
+                # accounts once before declaring the pool exhausted.
+                try:
+                    recovered = await self._probe_paused_accounts_async(
+                        pool, excluded, for_auto, estimated_tokens
+                    )
+                except Exception as probe_exc:
+                    logma.warning(f"[probe] failed during stream rotation: {probe_exc}")
+                    recovered = False
+                if recovered:
+                    continue
                 break
             entry = available[0]
             if attempt == 0 or not model:
@@ -1490,7 +1683,12 @@ class SophiaPool:
             if err is not None and _is_rate_limit(err):
                 # T-NEW-120: count the 429 alongside the pause so the
                 # trailing raise can classify the failure mode.
-                self.cooldowns.pause(_account_of(entry), _next_reset_utc())
+                # Z-NEW (2026-09-11): provider-reported reset time
+                # (zai: Beijing wall clock) with the strict EDT table
+                # as fallback when the body carries no timestamp.
+                self.cooldowns.pause(
+                    _account_of(entry), _reset_from_error(err) or _next_reset_utc()
+                )
                 rate_limit_failures += 1
             logma.warning(
                 f"[SophiaPool.stream] attempt {attempt + 1} failed on "

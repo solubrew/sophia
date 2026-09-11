@@ -108,6 +108,31 @@ class CooldownStore:
 
     # ── writes ───────────────────────────────────────────────────────
 
+    def unpause(self, account: str) -> None:
+        """Clear any live pause row for ``account`` (manual-reload recovery).
+
+        Z-NEW (2026-09-11): zai (and possibly other providers) now
+        support MANUAL quota reloads — an operator can top up an
+        exhausted account mid-window. The pool's rotation probe uses
+        this to reactivate an account the moment a test request
+        succeeds, instead of waiting out a stale table-based pause.
+        Idempotent: deleting a row that isn't there is a no-op.
+        """
+        conn = self._connect()
+        try:
+            conn.execute(
+                "DELETE FROM cooldown_state WHERE account = ?",
+                (account,),
+            )
+            logma.info(
+                f"[cooldown] account '{account}' manually reactivated "
+                f"(probe success — quota available again)"
+            )
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
     def pause(self, account: str, until_utc: datetime) -> None:
         """Mark ``account`` as paused until ``until_utc``.
 
