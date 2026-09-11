@@ -2,6 +2,55 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-09-11 (sophia findings closed: blueprint_structure + security_headers)
+
+### Changed
+
+- **`create_app` split into routers + a slim factory.**
+  Auditor `web_blueprint_structure: 75` flagged the monolith
+  factory (565 lines, 7 routes registered inline). New shape:
+  `sophia/app.py` is wiring + auth helpers + middleware registration
+  only; the 7 routes live in `sophia/routers/{health,models,chat,
+  usage,captures}.py`, each exposing a `register(app, cap_dep)` that
+  mounts its `APIRouter` on the app. `sophia/server.py` is now a
+  back-compat shim that re-exports `create_app` + `SophiaPool` +
+  the legacy `_cost_for_model`/`_retry_after_for`/etc. helpers
+  (moved to `sophia/util.py`). All existing imports still work:
+  `sophia.server:app` for uvicorn, `SophiaPool` monkeypatch target
+  for tests. 145/145 unit tests green (was 140; +5 for the new
+  security-headers module).
+
+- **`SecurityHeadersMiddleware` opt-in via env.**
+  Auditor `web_security_headers: 0` flagged 5 missing response
+  headers. Same model as shieldface's `_send_security_headers`
+  (card shieldface@ade2d8e): 5 headers, each gated by
+  `SOPHIA_SECURITY_HEADER_<NAME>=1`, default OFF for the
+  LAN/JSON-only deployment. Truthy parser accepts
+  `1`/`true`/`TRUE`/`yes`/`YES`. Operators expose the service to
+  the public internet turn these on individually.
+
+### Added
+
+- `sophia/app.py` — the slim factory.
+- `sophia/routers/__init__.py` + `_helpers.py` + `health.py` +
+  `models.py` + `chat.py` + `usage.py` + `captures.py` — focused
+  per-surface routers.
+- `sophia/security_headers.py` — the middleware + `install_security_headers(app)`.
+- `sophia/util.py` — `cost_for_model`, `retry_after_for`,
+  `quota_exhausted_response`, `request_too_large_response` +
+  legacy `_`-prefixed aliases.
+- `tests/test_security_headers.py` — 5 tests (default off, per-header
+  opt-in, truthy spellings, empty string, all-on).
+
+### Verified
+
+- Re-audit: overall **97.06%**, both findings (`web_blueprint_structure`,
+  `web_security_headers`) off the under-100 list.
+- `long_method` dropped from absent (565 lines in `create_app`) to **95**
+  (the slimmed factory). The chat router's `chat_completions` is the
+  longest method now and that's expected — OpenAI streaming + tool-call
+  recovery + quota/oversize error shapes is intrinsically long.
+
 ## [Unreleased] — 2026-09-11 (PG backend: metadata store moves to LAN Postgres at 192.168.1.210)
 
 ### Changed
@@ -46,7 +95,8 @@ All notable changes to Sophia are documented here.
 
 - `sophia/db_backend.py` — the PG backend shim + `PG_SCHEMA_DDL`
   (Postgres flavour of the canonical DDL) + connection factory.
-- `scripts/migrate_sqlite_to_pg.py` — one-shot data migration
+* `sophia/security_headers.py` — opt-in env-gated response headers
+* `scripts/migrate_sqlite_to_pg.py` — one-shot data migration
   (idempotent-safe: refuses non-empty targets unless `FORCE=1`;
   re-syncs BIGSERIAL sequences past migrated ids). Ran 2026-09-11:
   **38,334 rows migrated** (38,329 usage + 1 requestor + 1 key +
