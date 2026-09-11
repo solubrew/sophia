@@ -61,6 +61,40 @@ fi
 export SOPHIA_MASTER_PASSPHRASE="$(cat $PASSFILE)"
 echo "[$(date +%H:%M:%S)] passphrase loaded (length: ${#SOPHIA_MASTER_PASSPHRASE})"
 
+# Step 1b: extract the Postgres credentials from the vault entry
+# 'pgs-4964wkcr.210' (username + private_key fields — operator
+# 2026-09-11: "it is held under private key"). Written to a 0600
+# env-file consumed via docker --env-file (NOT -e, so the password
+# never appears in `docker inspect` output).
+echo "[$(date +%H:%M:%S)] step 1b: extracting postgres credentials from vault"
+PGENV=/tmp/sophia-pgenv-$$.txt
+trap 'rm -f "$PASSFILE" "$PGENV"' EXIT
+timeout 30 /home/solubrew/.hermes/hermes-agent/venv/bin/python3 -c "
+import sys
+try:
+    from pycurity.pykey import PyKeyStore
+    v = PyKeyStore(passphrase='brewerkey')
+    r = v.get('pgs-4964wkcr.210')
+    if r and r.get('username') and r.get('private_key'):
+        with open('$PGENV', 'w') as f:
+            f.write('SOPHIA_PG_HOST=192.168.1.210\n')
+            f.write('SOPHIA_PG_PORT=5432\n')
+            f.write('SOPHIA_PG_DB=sophia\n')
+            f.write('SOPHIA_PG_USER=%s\n' % r['username'])
+            f.write('SOPHIA_PG_PASSWORD=%s\n' % r['private_key'])
+        sys.exit(0)
+except Exception as e:
+    sys.stderr.write('vault error: ' + repr(e) + chr(10))
+sys.exit(1)
+" 2>/dev/null
+
+if [ ! -f "$PGENV" ]; then
+    echo "[$(date +%H:%M:%S)] FATAL: postgres credential extract failed"
+    exit 1
+fi
+chmod 600 "$PGENV"
+echo "[$(date +%H:%M:%S)] postgres credentials staged (env-file, 0600)"
+
 # Step 2: build the image
 echo "[$(date +%H:%M:%S)] step 2: docker build -f Dockerfile"
 docker build -f Dockerfile -t sophia-sophia:latest -t sophia_sophia:local . 2>&1 | tail -20
@@ -75,6 +109,7 @@ docker run -d \
   -v sophia_sophia_data:/var/lib/sophia \
   -v sophia_sophia_logs:/var/log/sophia \
   -v /home/solubrew/.local/share/pycurity:/host-pycurity:ro \
+  --env-file "$PGENV" \
   -e SOPHIA_DB=/var/lib/sophia/sophia.db \
   -e SOPHIA_PROVIDER_POOL=/etc/sophia/agent \
   -e SOPHIA_WORKERS=4 \

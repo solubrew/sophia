@@ -156,10 +156,30 @@ def default_db_path() -> Path:
 
 
 class SophiaDB:
-    """One SQLite handle per process. Callers that need isolation can
-    open additional connections via ``get_conn()``."""
+    """One DB handle per process. Callers that need isolation can
+    open additional connections via ``get_conn()``.
+
+    Backend selection (2026-09-11, operator request): when
+    ``SOPHIA_PG_HOST`` / ``SOPHIA_DATABASE_URL`` is set the store
+    runs on the LAN Postgres (psycopg2 via the db_backend shim);
+    otherwise the SQLite path is byte-for-byte the previous
+    behaviour. ``self.backend`` records which one is live
+    ("postgres" | "sqlite") so health/ops endpoints can surface it.
+    """
+
+    backend: str = "sqlite"
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
+        from sophia import db_backend
+
+        if db_backend.pg_configured():
+            self.backend = "postgres"
+            self._pg_params = db_backend.pg_connect_params()
+            self.db_path = db_path or Path("<postgres>")
+            self._initialise()
+            self._conn = db_backend.open_pg_connection()
+            return
+
         self.db_path = db_path or default_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialise()
@@ -170,6 +190,27 @@ class SophiaDB:
         self._conn.execute("PRAGMA foreign_keys=ON")
 
     def _initialise(self) -> None:
+        if self.backend == "postgres":
+            from sophia import db_backend
+
+            conn = db_backend.open_pg_connection()
+            try:
+                conn.executescript(db_backend.PG_SCHEMA_DDL)
+                conn.commit()
+                cur = conn.execute(
+                    "SELECT 1 FROM schema_versions WHERE version = ?",
+                    (INITIAL_VERSION,),
+                )
+                if cur.fetchone() is None:
+                    conn.execute(
+                        "INSERT INTO schema_versions(version, name, applied_at) "
+                        "VALUES (?, ?, ?)",
+                        (INITIAL_VERSION, INITIAL_NAME, _utc_now_iso()),
+                    )
+                    conn.commit()
+            finally:
+                conn.close()
+            return
         with self._connect() as c:
             c.executescript(SCHEMA_DDL)
             _apply_migrations(c)
@@ -182,8 +223,13 @@ class SophiaDB:
                     "INSERT INTO schema_versions(version, name, applied_at) VALUES (?, ?, ?)",
                     (INITIAL_VERSION, INITIAL_NAME, _utc_now_iso()),
                 )
+            c.commit()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self):
+        if self.backend == "postgres":
+            from sophia import db_backend
+
+            return db_backend.open_pg_connection()
         c = sqlite3.connect(str(self.db_path))
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA foreign_keys=ON")
@@ -196,7 +242,24 @@ class SophiaDB:
         yield self._conn
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self):
+        """Yield the shared connection inside a transaction.
+
+        sqlite3: explicit ``BEGIN`` via cursor (deferred-immediate
+        semantics). psycopg2: the connection is not in autocommit
+        mode, so the first statement implicitly opens a transaction —
+        issuing an explicit ``BEGIN`` would raise
+        ``TransactionInProgress``. Branch accordingly; the commit /
+        rollback shape is identical.
+        """
+        if self.backend == "postgres":
+            try:
+                yield self._conn
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            return
         cur = self._conn.cursor()
         try:
             cur.execute("BEGIN")

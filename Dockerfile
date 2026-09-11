@@ -93,7 +93,7 @@ RUN pip install --prefix=/install --no-cache-dir --no-build-isolation --no-deps 
         --ignore-installed pathspec==1.1.1 tomlkit==0.15.1 packaging pytokens \
         diskcache Send2Trash ruamel.yaml pyodbc \
         referencing rpds-py jsonschema-specifications typer \
-        shellingham colorama
+        shellingham colorama psycopg2-binary
 # Install sophia itself with --no-deps.
 RUN pip install --prefix=/install --no-cache-dir --no-build-isolation \
         --no-deps .[standard]

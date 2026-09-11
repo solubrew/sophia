@@ -93,15 +93,23 @@ class CooldownStore:
             conn.close()
         return {r[0]: float(r[1]) for r in rows}
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self):
         """Open a short-lived connection for one call.
 
-        ``timeout=5`` so a transient lock from a sibling worker
-        doesn't block forever; the calling worker will retry on its
-        next request. ``isolation_level=None`` puts us in autocommit
-        mode so the caller (or our explicit ``COMMIT``) controls the
-        transaction boundary — needed for the UPSERT pattern below.
+        SQLite path: ``timeout=5`` so a transient lock from a sibling
+        worker doesn't block forever; ``isolation_level=None`` puts us
+        in autocommit mode so the caller (or our explicit ``COMMIT``)
+        controls the transaction boundary — needed for the UPSERT
+        pattern below.
+
+        Postgres path (2026-09-11): a psycopg2 connection wrapped in
+        PgConnectionShim with ``autocommit=True`` — the same
+        short-lived, caller-controls-commit semantics.
         """
+        from sophia import db_backend
+
+        if db_backend.pg_configured():
+            return db_backend.open_pg_connection(autocommit=True)
         conn = sqlite3.connect(self._path, timeout=5.0, isolation_level=None)
         conn.execute("PRAGMA foreign_keys=ON")
         return conn

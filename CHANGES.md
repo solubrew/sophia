@@ -2,6 +2,63 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-09-11 (PG backend: metadata store moves to LAN Postgres at 192.168.1.210)
+
+### Changed
+
+- **SophiaDB runs on Postgres when `SOPHIA_PG_*` env vars are set.**
+  Operator request 2026-09-11: use the PG at `192.168.1.210:5432`
+  (database `sophia`, credentials in the host pycurity vault under
+  `pgs-4964wkcr.210` — username + `private_key` fields). New module
+  `sophia/db_backend.py` is a thin DB-API shim over psycopg2 — no
+  consumer rewrite:
+
+  | sqlite3 → psycopg2 delta | Shim handling |
+  |---|---|
+  | `?` placeholders → `%s` | `pg_dialect()` rewrites on execute |
+  | `sqlite3.Row` → dict rows | `SmartRow` (dict + positional access, Decimal→float) |
+  | `cur.lastrowid` | `SELECT lastval()` after INSERT (same session) |
+  | `executescript` DDL | single multi-statement execute (PG-native) |
+  | `BEGIN` cursor dance | implicit transaction (psycopg2 non-autocommit) |
+  | `ROUND(x,6)` on REAL | PG DDL: cost columns `NUMERIC(14,6)` (PG12 has no round(double,int)) |
+  | `INTEGER PRIMARY KEY` autoincrement | `BIGSERIAL PRIMARY KEY` |
+
+  SQLite path is byte-for-byte unchanged when the env vars are absent
+  (`backend` attribute records which one is live). Full suite 140/140
+  green on the SQLite path; PG path smoke-verified live (schema init,
+  key create/lookup, usage insert + rollup JSON, cooldown
+  pause/unpause round-trip).
+
+- **CooldownStore short-lived connections speak PG too** —
+  `CooldownStore._connect()` returns an autocommit psycopg2 shim when
+  `pg_configured()`, so the cross-worker 429-pause state (and the
+  Z-NEW probe/unpause from today) is now cluster-visible on PG
+  instead of the container-local SQLite file.
+
+- **rebuild.sh injects the PG credentials via `--env-file`** (0600
+  temp file extracted from the vault at rebuild time, never `-e`, so
+  the password never appears in `docker inspect`). Container gets
+  `SOPHIA_PG_HOST/PORT/DB/USER/PASSWORD`.
+
+- **Dockerfile**: `psycopg2-binary` added to the runtime wheel list.
+
+### Added
+
+- `sophia/db_backend.py` — the PG backend shim + `PG_SCHEMA_DDL`
+  (Postgres flavour of the canonical DDL) + connection factory.
+- `scripts/migrate_sqlite_to_pg.py` — one-shot data migration
+  (idempotent-safe: refuses non-empty targets unless `FORCE=1`;
+  re-syncs BIGSERIAL sequences past migrated ids). Ran 2026-09-11:
+  **38,334 rows migrated** (38,329 usage + 1 requestor + 1 key +
+  3 cooldown), verified by count + `last_value` + the real
+  `openwebui` key authenticating through PG.
+
+### Operator action
+
+- Run `rebuild.sh` (rebuild + restart) to switch the live gateway
+  onto PG. The `sophia` database on 192.168.1.210 is created,
+  populated, and the migrated key set is verified.
+
 ## [Unreleased] — 2026-09-11 (Z-NEW: zai rehydration-schedule change + manual quota reloads)
 
 ### Changed
