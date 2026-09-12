@@ -388,7 +388,41 @@ BROKEN_MODEL_PAUSE_SECONDS = 15
 #
 # Rate-limit pauses still use the much longer ``_next_reset_utc()``
 # window — those are quota resets, not model pathology.
+#
+# ESCALATING BACKOFF (2026-09-12, zai-at-3% incident): a flat 60s
+# pause re-arms a persistently-empty account into rotation right as
+# the caller retries, burning real quota on full-size payloads. The
+# arthr incident saw 12 zai requests in 2h against an account at 3%
+# — every one empty, every one billed. Now the pause duration
+# doubles with each consecutive empty-stream on the same account
+# (60s → 2m → 4m → 8m → 16m), capped at 30 minutes. A single
+# healthy response resets the account's streak to zero.
 EMPTY_STREAM_PAUSE_SECONDS = 60
+EMPTY_STREAM_PAUSE_MAX_SECONDS = 30 * 60
+
+
+def _empty_stream_pause_for(streak: int) -> int:
+    """Escalating pause: 60s * 2^min(streak, N), capped at 30min."""
+    if streak <= 0:
+        return EMPTY_STREAM_PAUSE_SECONDS
+    return min(
+        EMPTY_STREAM_PAUSE_SECONDS * (2 ** min(streak, 5)),
+        EMPTY_STREAM_PAUSE_MAX_SECONDS,
+    )
+
+
+def _streaks(pool) -> dict:
+    """Lazily get-or-create the empty-stream streak tracker on a
+    pool instance. Works for real pools AND test stubs constructed
+    via ``object.__new__`` (whose ``__init__`` never ran)."""
+    d = getattr(pool, "_empty_stream_streaks", None)
+    if d is None:
+        d = {}
+        try:
+            pool._empty_stream_streaks = d
+        except Exception:
+            pass
+    return d
 
 
 # Recovery budget (NEW, 2026-09-12): when the rotation cycles through
@@ -634,6 +668,14 @@ class SophiaPool:
         # workers share the same pause-until timestamps. See
         # ``sophia/cooldowns.py`` for the schema + WAL guarantees.
         self.cooldowns = CooldownStore(self._db)
+        # ESCALATING empty-stream backoff (2026-09-12): consecutive
+        # empty streams per account_key double the pause duration.
+        # Cleared on the first healthy stream from that account.
+        # ``setdefault``-style access below keeps test stubs (built via
+        # object.__new__ without __init__) from crashing on a missing
+        # attribute.
+        if not hasattr(self, "_empty_stream_streaks") or self._empty_stream_streaks is None:
+            self._empty_stream_streaks: dict = {}
 
     async def _ensure_pool(self):
         # Defer the heavy import until the first chat call. Sophia
@@ -1666,7 +1708,23 @@ class SophiaPool:
                             if text:
                                 emitted = True
                                 total_yielded += len(text)
+                                # Healthy content — reset this account's
+                                # empty-stream streak (escalating backoff
+                                # starts over on the next pathology).
+                                _streaks(self).pop(_entry_key(entry), None)
                                 yield text
+                        elif ctype == "reasoning":
+                            # Reasoning-model support (2026-09-12):
+                            # GLM/Kimi/DeepSeek-R1 thinking deltas.
+                            # NOT forwarded to the caller (hermes wants
+                            # content, not chain-of-thought) but it
+                            # DOES count as stream activity — the
+                            # stream is not "empty", the account is
+                            # healthy, and the model is mid-thought.
+                            # This prevents the false "empty stream"
+                            # classification that was pausing healthy
+                            # zai accounts on thinking-heavy turns.
+                            emitted = True
                         elif ctype == "usage":
                             self.last_stream_usage = dict(chunk.get("tokens") or {})
                         elif ctype == "tool_call":
@@ -1689,6 +1747,10 @@ class SophiaPool:
                     elif isinstance(chunk, str) and chunk:
                         emitted = True
                         total_yielded += len(chunk)
+                        # Healthy content — reset this account's
+                        # empty-stream streak (escalating backoff
+                        # starts over on the next pathology).
+                        _streaks(self).pop(_entry_key(entry), None)
                         yield chunk
             except Exception as exc:  # noqa: BLE001 — rotate on ANY provider error
                 err = exc
@@ -1789,17 +1851,26 @@ class SophiaPool:
             # refreshing the pause until the underlying issue clears.
             if err is None and not emitted:
                 entry_id = _entry_key(entry)
+                # ESCALATING (2026-09-12): consecutive empty-streams
+                # double the pause (60s → 2m → 4m → ... → 30m cap) so
+                # a persistently-empty account stops being re-picked
+                # every 60s while the caller retries. Protects
+                # low-quota accounts from burn (zai-at-3% incident).
+                streaks = _streaks(self)
+                streak = streaks.get(entry_id, 0)
+                pause_secs = _empty_stream_pause_for(streak)
+                streaks[entry_id] = streak + 1
                 self.cooldowns.pause(
                     entry_id,
                     datetime.now(timezone.utc) + timedelta(
-                        seconds=EMPTY_STREAM_PAUSE_SECONDS
+                        seconds=pause_secs
                     ),
                 )
                 logma.warning(
                     f"[SophiaPool.stream] attempt {attempt + 1}: "
                     f"{entry_id} returned an empty stream (no content, no "
-                    f"error); pausing for {EMPTY_STREAM_PAUSE_SECONDS}s and "
-                    f"rotating to another account"
+                    f"error); pausing for {pause_secs}s "
+                    f"(streak={streak + 1}) and rotating to another account"
                 )
             # Auto mode only: exclude and rotate. Explicit model: stop.
             if model:
