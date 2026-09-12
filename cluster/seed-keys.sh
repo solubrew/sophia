@@ -201,6 +201,9 @@ cleanup() {
     done
   fi
 }
+# Cleanup deferred — see comment below the polling loop. The trap
+# is installed late so the source vault stays world-readable
+# until the container's entrypoint has finished its merge read.
 trap cleanup EXIT
 
 # v1 docker-compose does NOT auto-load `.env` (v2 feature), does
@@ -231,13 +234,28 @@ echo "=== bringing up sophia container ==="
 ./cluster/docker-compose-v2 -f "$TMP_YAML" --project-name sophia up -d --force-recreate sophia
 
 # Wait for the container to settle (entrypoint finished OR crashed).
+# Container name depends on the compose flavour: v1 ("sophia_sophia_1")
+# vs v2 ("sophia-sophia-1", or the bare "sophia-sophia-1" set by
+# `docker run --name sophia-sophia-1` in rebuild.sh). Probe both.
 echo "=== waiting for sophia container to settle (max 60s) ==="
+detect_container_name() {
+  for n in sophia_sophia_1 sophia-sophia-1; do
+    if docker inspect "$n" >/dev/null 2>&1; then
+      echo "$n"; return
+    fi
+  done
+  echo ""
+}
+CONTAINER_NAME=$(detect_container_name)
 for i in $(seq 1 30); do
-  cstate=$(docker inspect -f '{{.State.Status}}' sophia_sophia 2>/dev/null)
-  cuptime=$(docker inspect -f '{{.State.StartedAt}}' sophia_sophia 2>/dev/null)
+  if [ -z "$CONTAINER_NAME" ]; then
+    CONTAINER_NAME=$(detect_container_name)
+  fi
+  cstate=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null)
+  cuptime=$(docker inspect -f '{{.State.StartedAt}}' "$CONTAINER_NAME" 2>/dev/null)
   if [ "$cstate" = "running" ]; then
     if [ -n "$cuptime" ] && [ "$(date -d "$cuptime" +%s 2>/dev/null)" -lt "$(($(date +%s) - 5))" ]; then
-      echo "  sophia has been running for 5s+ (entrypoint settled)"
+      echo "  sophia (${CONTAINER_NAME}) has been running for 5s+ (entrypoint settled)"
       break
     fi
   elif [ "$cstate" = "restarting" ] || [ "$cstate" = "exited" ]; then
@@ -248,12 +266,22 @@ for i in $(seq 1 30); do
 done
 sleep 5
 
-state=$(docker inspect -f '{{.State.Status}}' sophia_sophia 2>/dev/null)
+state=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null)
 if [ "$state" = "restarting" ] || [ "$state" = "exited" ]; then
   echo "ERROR: sophia is in state=$state. Last 30 log lines:"
   ./cluster/docker-compose-v2 -f docker-compose.cluster.yml --project-name sophia logs --tail=30 sophia
   exit 3
 fi
+
+# Now that the container's entrypoint has finished its merge read
+# AND the container is healthy, restore the source vault's perms.
+# Without this defer, the trap-installed cleanup fires as soon as
+# the script exits — racing the entrypoint and causing
+# PermissionError on /host-pycurity/secure_store.db in the
+# container. The original trap (above) is still installed for
+# early-exit paths (the script's own error handlers).
+echo "=== restoring host vault perms (deferred until after merge) ==="
+cleanup
 
 # Capture entrypoint diagnostic tokens from the log. We use them
 # to detect (a) what mode the container came up in (cold/warm/recovered)
@@ -269,7 +297,7 @@ echo "  MERGED_COUNT=${MERGED_COUNT:-0}"
 # container — this is the source of truth. If the host tracker
 # disagrees with what the container actually uses, the container's
 # value wins and we back-write it.
-ACTUAL_PASSPHRASE=$(docker exec sophia_sophia cat /var/lib/sophia/pycurity/.master_passphrase 2>/dev/null)
+ACTUAL_PASSPHRASE=$(docker exec "$CONTAINER_NAME" cat /var/lib/sophia/pycurity/.master_passphrase 2>/dev/null)
 if [ -z "$ACTUAL_PASSPHRASE" ]; then
   echo "ERROR: could not read .master_passphrase from container"
   exit 4
@@ -312,4 +340,4 @@ echo "=== /healthz ==="
 curl -s -m 5 http://192.168.1.67:8765/healthz; echo
 echo
 echo "=== status ==="
-docker ps --filter "name=sophia_sophia" --format "  {{.Status}} | {{.Image}}"
+docker ps --filter "name=${CONTAINER_NAME}" --format "  {{.Status}} | {{.Image}}"
