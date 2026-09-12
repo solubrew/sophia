@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from sophia.pool import (
+    AllProvidersUnreachable,
     PoolQuotaExhausted,
     SophiaPool,
     _account_of,
@@ -281,7 +282,7 @@ def test_chat_probe_still_limited_stays_paused():
         # exhausted. chat() raises (PoolQuotaExhausted when the loop
         # saw 429s, legacy RuntimeError when entries were pre-paused
         # before the loop — both are acceptable exhausted signals).
-        with pytest.raises((PoolQuotaExhausted, RuntimeError)):
+        with pytest.raises((PoolQuotaExhausted, AllProvidersUnreachable, RuntimeError)):
             await pool.chat(prompt="hi", sprompt="sys", model=None)
         return pool
 
@@ -302,11 +303,11 @@ def test_probe_throttled_per_account():
         pool = _StubSophiaPool([entry])
         pool.cooldowns.pause(acct, datetime.now(timezone.utc) + timedelta(hours=2))
         SophiaPool._last_probe_at.clear()
-        with pytest.raises((PoolQuotaExhausted, RuntimeError)):
+        with pytest.raises((PoolQuotaExhausted, AllProvidersUnreachable, RuntimeError)):
             await pool.chat(prompt="hi", sprompt="sys", model=None)
         first_calls = client.calls
         # Second rotation immediately after — throttle must suppress.
-        with pytest.raises((PoolQuotaExhausted, RuntimeError)):
+        with pytest.raises((PoolQuotaExhausted, AllProvidersUnreachable, RuntimeError)):
             await pool.chat(prompt="hi", sprompt="sys", model=None)
         return first_calls
 

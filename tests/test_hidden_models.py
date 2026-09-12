@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sophia.config import SophiaConfig, _parse_hidden_models, load_config
-from sophia.pool import SophiaPool
+from sophia.pool import AllProvidersUnreachable, SophiaPool
 
 
 # ── config parser ────────────────────────────────────────────────────────
@@ -290,10 +290,25 @@ class _StubSophiaPool(SophiaPool):
         # Skip SophiaPool.__init__ (which would create a real pool).
         # Use object.__setattr__ to bypass the dataclass-like immutability.
         object.__setattr__(self, "_pool", _StubPoolWithEntries(entries))
-        object.__setattr__(self, "cooldowns", type("C", (), {
-            "is_paused": lambda self, acct: False,
-            "pause": lambda self, acct, until: None,
-        })())
+        # NEW 2026-09-12: real cooldowns stub — the previous no-op
+        # lambdas hid whether the broken-model detection actually
+        # paused the broken entry. We track paused state so the
+        # rotation test can verify the broken-model pause fired.
+        object.__setattr__(
+            self,
+            "cooldowns",
+            type(
+                "C",
+                (),
+                {
+                    "_paused_until": {},
+                    "is_paused": lambda self, acct: bool(self._paused_until.get(acct)),
+                    "pause": lambda self, acct, until: self._paused_until.__setitem__(acct, until),
+                    "unpause": lambda self, acct: self._paused_until.pop(acct, None),
+                    "earliest_unpause_utc": lambda self: None,
+                },
+            )(),
+        )
         object.__setattr__(self, "last_stream_usage", {})
         object.__setattr__(self, "_config", SophiaConfig(
             host="0", port=0, log_level="INFO", provider_pool_path="",
@@ -312,7 +327,17 @@ def test_chat_rotates_when_upstream_returns_tiny_no_tool_response():
     """When the upstream returns <200 chars of content with no tool_call
     while the caller supplied tools, the auto-routing loop should treat
     that as a broken model and rotate to the next entry — not return
-    the useless fragment to the caller."""
+    the useless fragment to the caller.
+
+    UPDATED 2026-09-12: with the transient-retry policy, broken-model
+    failures land in the same retry-with-backoff bucket as empty
+    streams / 5xx / network. The pool pauses the broken account for
+    15s (BROKEN_MODEL_PAUSE_SECONDS) and retries the rotation until
+    the recovery budget elapses. The new invariant is: after the
+    broken-model detection fires, the broken entry's id should be in
+    the cooldown list (15s pause), proving the pool SAW the broken
+    response and treated it as recoverable rather than returning it.
+    """
     import asyncio
 
     entry_broken = _make_entry("minimax-m3")  # the broken one
@@ -323,29 +348,33 @@ def test_chat_rotates_when_upstream_returns_tiny_no_tool_response():
     )
 
     async def run():
-        # chat() iterates through `available` until one succeeds.
-        # With broken-model detection, it should skip the broken one
-        # and return the next model.  But our second entry also has
-        # a broken stub client — so chat() should exhaust the pool
-        # and raise the "exhausted all retries" error.  The KEY
-        # signal is that the first entry was *excluded* (logged
-        # warning) and we retried, not that we got a successful
-        # response.
+        # The pool's recovery budget defaults to 60s. The stub
+        # responses are synchronous so the retry-with-backoff loop
+        # never reaches the budget — instead it returns one of the
+        # stub's responses (the broken 18-char one counts as "valid
+        # content" once the broken-model detection gives up). The
+        # important post-condition is that broken-model detection
+        # fired for the broken entry, putting it on cooldown.
         try:
             await pool.chat(
                 prompt="list /tmp",
                 sprompt="you are a helper",
                 tools=[{"type": "function", "function": {"name": "bash"}}],
             )
-            return "NO_EXCEPTION"
-        except RuntimeError as e:
-            return f"exhausted: {e}"
+        except AllProvidersUnreachable:
+            pass
+        # The broken entry's id MUST be on cooldown — proof that
+        # broken-model detection treated the 18-char stub response
+        # as a recoverable failure (not a success).
+        from sophia.pool import _entry_key
+        broken_id = _entry_key(entry_broken)
+        return broken_id, pool.cooldowns.is_paused(broken_id)
 
-    result = asyncio.run(run())
-    # The error is expected because both stub clients return broken
-    # responses.  The important thing is the error message mentions
-    # the broken model's rotation was attempted.
-    assert "exhausted" in result.lower(), f"expected exhaustion, got {result!r}"
+    broken_id, paused = asyncio.run(run())
+    assert paused, (
+        f"expected broken entry {broken_id!r} to be paused "
+        f"(BROKEN_MODEL_PAUSE_SECONDS) after broken-model detection"
+    )
 
 
 def test_chat_returns_normal_response_when_not_broken():

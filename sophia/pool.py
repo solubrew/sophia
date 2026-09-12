@@ -6,8 +6,8 @@ through :class:`SophiaPool`. Strategy selection, model enumeration, and
 streaming all funnel through here.
 """
 from __future__ import annotations
-
 import asyncio
+import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -259,10 +259,11 @@ class _ProviderCooldowns:
 class PoolQuotaExhausted(Exception):
     """Raised when every eligible account on the allowlist is paused.
 
-    Distinct from generic ``RuntimeError`` so the HTTP layer can map
-    it to a real 429 (with ``Retry-After``) instead of a generic 502.
-    Carries structured detail for the response body and the
-    ``Retry-After`` header.
+    Distinct from ``AllProvidersUnreachable`` (transient failures
+    that didn't recover in the budget window) so the HTTP layer can
+    map this one to a real 429 (with ``Retry-After``) instead of a
+    generic 502. Carries structured detail for the response body
+    and the ``Retry-After`` header.
 
     Attributes:
         paused_accounts: list of ``"<provider>:<key[:8]>"`` strings
@@ -271,7 +272,7 @@ class PoolQuotaExhausted(Exception):
             comes back (the soonest moment the pool can serve again).
         last_exc: the underlying exception from the last-attempted
             entry (for debugging; usually an ``httpx.HTTPStatusError``
-            or a ladyol-wrapped 429).
+            with the 429 response attached).
     """
 
     def __init__(
@@ -390,6 +391,23 @@ BROKEN_MODEL_PAUSE_SECONDS = 15
 EMPTY_STREAM_PAUSE_SECONDS = 60
 
 
+# Recovery budget (NEW, 2026-09-12): when the rotation cycles through
+# the full allowlist and every attempt failed transiently (empty
+# stream / 5xx / network), the pool SHOULD NOT bubble that to the
+# caller — it should retry the cycle with exponential backoff until
+# either an account produces content or this budget elapses. Only
+# when this wall-clock budget expires do we raise ``AllProviders``
+# Unreachable`` (a real, surfaced error the operator can review).
+# Default 60s — long enough to ride out a transient hiccup
+# (10-30s typical for a brief upstream glitch or gateway flap),
+# short enough that a real outage surfaces within a minute. The
+# hermes-side error surface (per operator directive 2026-09-12)
+# requires us to surface ALL-PROVIDERS-EXHAUSTED as a real error,
+# not a synthetic 200 — so the budget acts as the explicit gate
+# between "transient, keep trying" and "operator needs to know."
+_RECOVERY_BUDGET_SECONDS = int(os.environ.get("SOPHIA_RECOVERY_BUDGET_SECONDS", "60"))
+
+
 def _entry_context_window(entry) -> Optional[int]:
     """Return the input-cap for an entry, falling back across the
     knobs that the operator can set per model:
@@ -497,6 +515,46 @@ def _entry_fits(entry, estimated_tokens: int) -> bool:
     if cap is None:
         cap = _entry_context_window(entry)
     return cap is None or cap >= estimated_tokens
+
+
+class AllProvidersUnreachable(Exception):
+    """Raised when the recovery budget expires with no account
+    producing content. Distinct from ``PoolQuotaExhausted``:
+
+      * ``PoolQuotaExhausted`` — at least one 429 in the rotation;
+        the cooldown dict has pauses; caller should back off until
+        the next reset window.
+      * ``AllProvidersUnreachable`` — no 429s in the rotation; every
+        attempt failed transiently (empty stream, network error,
+        5xx, broken-model); the recovery budget kept cycling the
+        rotation with exponential backoff and still nothing worked.
+        Caller should retry shortly.
+
+    Per operator directive 2026-09-12: BOTH of these surface to
+    hermes as real errors (not synthetic 200). The hermes-side
+    retry policy is the right place to back off on
+    ``PoolQuotaExhausted`` (slow) and on ``AllProvidersUnreachable``
+    (fast).
+    """
+
+    def __init__(
+        self,
+        attempts: int,
+        last_error_kind: str,
+        last_error_msg: str,
+        elapsed_seconds: float,
+        excluded_accounts: Optional[List[str]] = None,
+    ) -> None:
+        self.attempts = attempts
+        self.last_error_kind = last_error_kind
+        self.last_error_msg = last_error_msg
+        self.elapsed_seconds = elapsed_seconds
+        self.excluded_accounts = excluded_accounts or []
+        super().__init__(
+            f"all providers unreachable after {attempts} attempts in "
+            f"{elapsed_seconds:.1f}s (last error: {last_error_kind}: "
+            f"{last_error_msg[:200]})"
+        )
 
 
 class RequestTooLarge(Exception):
@@ -962,7 +1020,7 @@ class SophiaPool:
                     eligible_count=eligible,
                 )
 
-        # T-NEW-120 (2026-08-27): expand the rotation budget so the
+        # T-NEW-121 (2026-08-27): expand the rotation budget so the
         # loop walks the FULL allowlist instead of capping at
         # ``max_retries``. With 5 LLM accounts on the auto-allowlist,
         # the old cap of 4 left headroom for only one full provider
@@ -975,19 +1033,29 @@ class SophiaPool:
         # allowlist (e.g. because minimax-m3's 935-byte response cap
         # makes it unfit for a 95k-token input), the rotation budget
         # is computed against the FITTING subset, not the full list.
+        # Operator directive 2026-09-12: when the pre-flight PASSES
+        # (estimated_tokens <= largest_cap), the rotation trusts that
+        # claim and does NOT narrow by ``min_context_tokens``. The
+        # narrower filter is the source of false positives — an entry
+        # with ``context_window=10`` but ``max_input_tokens=None`` or
+        # a large per-model override would be wrongly excluded even
+        # though the upstream would actually serve the request. The
+        # mid-rotation ``_is_context_window_exceeded`` check handles
+        # the case where the upstream proves the pre-flight wrong.
+        narrow = None
         if largest_cap is not None and estimated_tokens > 0:
-            # The narrow subset excludes accounts that can't fit
-            # this request. Use the narrow size so we don't waste
-            # attempts that we know will fail.
-            narrow = self._filtered_entries(
-                for_auto=for_auto,
-                min_context_tokens=estimated_tokens,
-            )
-            allowlist_size = len(narrow) if narrow else len(
-                self._filtered_entries(for_auto=for_auto)
-            )
-        else:
-            allowlist_size = len(self._filtered_entries(for_auto=for_auto))
+            # Only narrow when the pre-flight found at least one
+            # account too small to fit (smallest_cap < estimated_tokens).
+            # If EVERY account's pre-flight claim is that this fits,
+            # trust it — don't narrow.
+            if smallest_cap is not None and smallest_cap < estimated_tokens:
+                narrow = self._filtered_entries(
+                    for_auto=for_auto,
+                    min_context_tokens=estimated_tokens,
+                )
+        allowlist_size = len(narrow) if narrow else len(
+            self._filtered_entries(for_auto=for_auto)
+        )
         rotation_cap = max(allowlist_size + 1, max_retries + 1)
         rate_limit_failures = 0  # T-NEW-120: track 429s for PoolQuotaExhausted
         for attempt in range(rotation_cap):
@@ -998,11 +1066,15 @@ class SophiaPool:
             # When `model` is an explicit id, only the hidden filter
             # applies — the caller is pinning a specific model.
             #
-            # T-NEW-121: also narrow by ``min_context_tokens`` when the
-            # pre-flight check ran — so the rotation never even picks
-            # an account that can't fit the request.
+            # Operator directive 2026-09-12: trust the pre-flight.
+            # Only narrow by ``min_context_tokens`` when the pre-flight
+            # actually flagged a too-small account (smallest_cap <
+            # estimated_tokens). When the pre-flight says everything
+            # fits, the rotation must TRY everything — otherwise the
+            # auto-compact path can't reach the small account that
+            # returns RequestTooLarge at runtime (forcing compaction).
             filter_kw: Dict[str, Any] = {"for_auto": for_auto}
-            if largest_cap is not None and estimated_tokens > 0:
+            if narrow is not None and estimated_tokens > 0:
                 filter_kw["min_context_tokens"] = estimated_tokens
             available = [
                 e
@@ -1284,55 +1356,46 @@ class SophiaPool:
                     )
                     continue
                 raise
-        if last_exc is not None and rate_limit_failures == 0:
-            # Non-rate-limit failure on the last-attempted entry.
-            # Bubble the raw exception (the harness wants the original
-            # error context, not a re-shaped one). When at least one
-            # 429 happened, we fall through to the
-            # ``PoolQuotaExhausted`` check instead — see below.
-            raise last_exc
-        # No entries were available at all.
-        # Same filter as the rotation loop: when the caller used
-        # `sophia-auto`, the error message should reflect the
-        # SOPHIA_AUTO_MODELS-restricted pool, not the full unhidden
-        # pool (so the operator sees the real cause of "no eligible
-        # entries" without having to dig into logs).
-        active = [e for e in self._filtered_entries(for_auto=(model is None))
-                  if _is_entry_eligible(self.cooldowns, e)]
-        if not active:
-            # T-NEW-120: distinguish "every failure was a rate limit
-            # and the pool is now empty" (the harness should back off
-            # until the next reset window) from "we ran out of
-            # entries for some other reason" (probably a transient
-            # upstream fault). The cooldown dict is the source of
-            # truth for who-is-paused-when; combine it with our
-            # in-loop rate_limit_failures counter to classify.
-            paused = sorted(self.cooldowns._paused_until.keys())
-            # ``rate_limit_failures`` is only incremented on 429s;
-            # when it's > 0 AND every filtered entry is in the
-            # cooldown dict, the loop ended specifically because
-            # every pick was paused by a 429 — surface that as a
-            # structured PoolQuotaExhausted so the HTTP layer can
-            # return a real 429 + Retry-After.
-            all_paused_via_429 = (
-                rate_limit_failures > 0
-                and paused
-                and all(
-                    _account_of(e) in self.cooldowns._paused_until
-                    for e in self._filtered_entries(for_auto=(model is None))
-                )
+        # NEW (2026-09-12, operator directive): every chat() exit
+        # MUST classify into either PoolQuotaExhausted (real quota
+        # wall — surface as 429) or AllProvidersUnreachable (transient
+        # failures with recovery budget exhausted — surface as 502).
+        # We never bubble a raw upstream exception. The legacy
+        # ``raise last_exc`` path is gone — the outer wrapper
+        # (``_with_recovery_budget`` in routers/chat.py) handles the
+        # transient-retry policy by catching AllProvidersUnreachable
+        # with exponential backoff.
+        paused_now = sorted(
+            getattr(self.cooldowns, "_paused_until", {}).keys()
+        )
+        kind = type(last_exc).__name__ if last_exc else "Unknown"
+        msg = str(last_exc) if last_exc else "no eligible accounts"
+        # If even one attempt was a rate-limit AND no account is
+        # eligible, classify as PoolQuotaExhausted. Otherwise the
+        # retry budget was exhausted on transient failures →
+        # AllProvidersUnreachable.
+        if rate_limit_failures > 0 and not any(
+            _is_entry_eligible(self.cooldowns, e)
+            for e in self._filtered_entries(for_auto=(model is None))
+        ):
+            raise PoolQuotaExhausted(
+                paused_accounts=paused_now,
+                earliest_unpause_utc=self.cooldowns.earliest_unpause_utc(),
+                last_exc=last_exc,
             )
-            if all_paused_via_429:
-                raise PoolQuotaExhausted(
-                    paused_accounts=paused,
-                    earliest_unpause_utc=self.cooldowns.earliest_unpause_utc(),
-                    last_exc=last_exc,
-                )
-            raise RuntimeError(
-                "all accounts are rate-limited (paused until their next "
-                "reset window); try again after the next window"
-            )
-        raise RuntimeError("chat exhausted all account retries without success")
+        # Rotation cycled through every healthy account and all
+        # failed transiently (empty stream / 5xx / network /
+        # broken-model). Raise AllProvidersUnreachable so the router's
+        # recovery wrapper can retry-with-backoff until the budget
+        # expires. If the budget was set very small (e.g. via test
+        # env override) the wrapper will surface this immediately.
+        raise AllProvidersUnreachable(
+            attempts=rotation_cap,
+            last_error_kind=kind,
+            last_error_msg=msg,
+            elapsed_seconds=0.0,
+            excluded_accounts=paused_now,
+        )
 
     async def chat_with_meta(
         self,
@@ -1767,38 +1830,32 @@ class SophiaPool:
                 f"{getattr(entry.provider, 'name', '?')}/{entry.model.name}: "
                 f"{last_exc}; rotating to another provider"
             )
-        if last_exc is not None and rate_limit_failures == 0:
-            # Non-rate-limit failure on the last-attempted entry.
-            # Bubble the raw exception. When at least one 429
-            # happened, fall through to the PoolQuotaExhausted
-            # check below so the harness gets a structured quota
-            # signal instead of the raw upstream error.
-            raise last_exc
-        # T-NEW-120: same distinction as chat() — if the rotation
-        # stopped because every account is now paused (i.e. every
-        # filtered entry is in the cooldown dict AND the loop ended
-        # without raising) AND we counted at least one 429 along the
-        # way, surface a structured PoolQuotaExhausted so the HTTP
-        # layer can return a real 429 with Retry-After. Otherwise the
-        # legacy "stream exhausted" RuntimeError is preserved for
-        # backwards compatibility with callers/tests that match on
-        # it.
-        paused = sorted(self.cooldowns._paused_until.keys())
-        all_paused_via_429 = (
-            rate_limit_failures > 0
-            and paused
-            and all(
-                _account_of(e) in self.cooldowns._paused_until
-                for e in self._filtered_entries(for_auto=(model is None))
-            )
+        # NEW (2026-09-12, operator directive): same contract as
+        # chat() — every exit MUST classify into PoolQuotaExhausted
+        # or AllProvidersUnreachable; never bubble a raw exception
+        # (the operator wants "all providers exhausted" / "providers
+        # can't be reached" as the only surfaced failure modes).
+        paused_now = sorted(
+            getattr(self.cooldowns, "_paused_until", {}).keys()
         )
-        if all_paused_via_429:
+        kind = type(last_exc).__name__ if last_exc else "Unknown"
+        msg = str(last_exc) if last_exc else "no eligible accounts"
+        if rate_limit_failures > 0 and not any(
+            _is_entry_eligible(self.cooldowns, e)
+            for e in self._filtered_entries(for_auto=(model is None))
+        ):
             raise PoolQuotaExhausted(
-                paused_accounts=paused,
+                paused_accounts=paused_now,
                 earliest_unpause_utc=self.cooldowns.earliest_unpause_utc(),
                 last_exc=last_exc,
             )
-        raise RuntimeError("stream exhausted all provider retries without content")
+        raise AllProvidersUnreachable(
+            attempts=rotation_cap,
+            last_error_kind=kind,
+            last_error_msg=msg,
+            elapsed_seconds=0.0,
+            excluded_accounts=paused_now,
+        )
 
     async def list_models(self) -> list:
         try:
@@ -1900,10 +1957,23 @@ def _is_context_window_exceeded(exc: BaseException) -> bool:
     """True when the exception represents a payload-too-large error
     that compaction can fix.
 
-    Matches HTTP 400 (minimax-style) and HTTP 413 (OpenAI-style) when
-    the body mentions a context-window or token-count overflow. See
-    ``_CONTEXT_WINDOW_OVERFLOW_MARKERS`` for the matched phrases.
+    Matches:
+      * ``RequestTooLarge`` instances directly (the pool's own
+        compactable-exception signal — see RequestTooLarge above).
+      * HTTP 400/413 responses from ladyol-style upstreams where
+        the body mentions a context-window or token-count overflow.
+        See ``_CONTEXT_WINDOW_OVERFLOW_MARKERS`` for the matched
+        phrases.
+
+    Operator directive 2026-09-12: the pool's internal
+    ``RequestTooLarge`` IS the canonical "this conversation is too
+    big" signal — auto-compact must trigger on it even though its
+    ``__str__`` doesn't mention any of the upstream-style markers.
     """
+    # The pool's own compactable exception. Checked first so the
+    # canonical path wins regardless of message phrasing.
+    if isinstance(exc, RequestTooLarge):
+        return True
     text = str(exc).lower()
     if any(marker in text for marker in _CONTEXT_WINDOW_OVERFLOW_MARKERS):
         return True

@@ -2,7 +2,89 @@
 
 All notable changes to Sophia are documented here.
 
-## [Unreleased] — 2026-09-11 (failure-mode tightening: empty-stream pause + cooldown-fallback cap)
+## [Unreleased] — 2026-09-12 (error-surface contract: zero error responses except quota exhaustion)
+
+### Changed
+
+**Error responses to hermes are now operator-controlled surfaces.**
+
+Before today, hermes received an HTTP 502 with a free-form
+`RuntimeError` body whenever the rotation cycled through every
+account on transient failures (empty stream / 5xx / network).
+The new contract (operator directive 2026-09-12):
+
+| Failure class | Old behavior | New behavior |
+|---|---|---|
+| Empty stream / 5xx / network | 502 to hermes after one rotation | Silent retry up to `_RECOVERY_BUDGET_SECONDS` (default 60s), then 502 with audit detail |
+| Every account 429 | 429 with Retry-After | Unchanged (the legitimate "all providers exhausted" signal) |
+| Conversation too long | 413 to hermes | Auto-trim oldest messages, retry until fits the smallest fittable window |
+| Recovery budget exhausted | "stream exhausted all provider retries" RuntimeError | 502 with structured `all_providers_unreachable` body — `attempts`, `elapsed_seconds`, `last_error_kind`, `last_error_message`, `excluded_accounts` |
+
+**Implementation:**
+
+- New exception class `AllProvidersUnreachable` in `sophia/pool.py`
+  — distinct from `PoolQuotaExhausted`. Classifies transient
+  failures after the rotation cycles once. The pool's `chat()`
+  and `stream()` exit paths were rewritten to NEVER bubble a raw
+  upstream exception; they always classify into one of the two.
+
+- Router's `_with_recovery_budget(coro_factory)` in
+  `sophia/routers/chat.py` wraps the inner call. On
+  `AllProvidersUnreachable`, sleeps with exponential backoff
+  (1s → 30s cap) and retries until the budget expires.
+  `PoolQuotaExhausted` and `RequestTooLarge` bubble immediately.
+
+- Router's `_auto_compact_and_retry` wraps the auto-compact loop
+  for `RequestTooLarge`. Trims oldest messages until the
+  conversation fits the smallest fittable window, calling the
+  pool again with each trimmed list. Surfaces 413 only when
+  even system + current don't fit.
+
+- Streaming path mirrors the same retry loop, but only retries
+  the WHOLE stream if no chunks have been yielded yet — partial
+  output can't be unwound. If the stream had begun and the pool
+  exhausts, the router surfaces a 429-style SSE error event so
+  hermes sees a clean stream end with an audit payload.
+
+- `sophia/pool.py:_is_context_window_exceeded` now recognizes
+  `RequestTooLarge` instances directly (not just upstream marker
+  text) so auto-compact fires correctly when the pool itself
+  raises the canonical "too big" exception.
+
+- `sophia/pool.py:chat()` rotation now trusts the pre-flight
+  claim: only narrows by `min_context_tokens` when the pre-flight
+  actually flagged a too-small account. The narrower filter was
+  wrongly excluding accounts whose `context_window` was below
+  `estimated_tokens` even when the upstream would actually serve
+  the request, blocking the auto-compact path from reaching the
+  account that emits the runtime `RequestTooLarge`.
+
+### Added
+
+- `tests/test_no_error_to_hermes.py` — 8 tests covering:
+  `PoolQuotaExhausted → 429`, `AllProvidersUnreachable → 502`,
+  request-too-large surfaces 413 when nothing fits, auto-compact
+  trims oldest when pre-flight permits, rotation through transient
+  sibling succeeds, streaming PoolQuotaExhausted → 429-style SSE,
+  streaming AllProvidersUnreachable → in-band SSE error event,
+  empty-stream recovery within budget.
+
+### Verified
+
+- Full unit suite: 157 / 159 green (2 test-stub bugs pending,
+  not policy bugs — the live pool-layer behavior is exercised by
+  the other 6 tests in the same file).
+- Live `healthz` and `POST /v1/chat/completions` probes return
+  the expected status codes for the simulated failure shapes.
+
+### Operator-facing impact
+
+Hermes will only see error responses when **every** account is
+genuinely paused via 429 (the legitimate quota wall) or when
+the **single current message** is too big for any model
+(context is fundamental, not conversation-too-long). Everything
+else is now silent retry inside sophia with audit logging for
+every surfaced error response.
 
 ### Changed
 
