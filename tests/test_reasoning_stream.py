@@ -21,7 +21,7 @@ from typing import Any, Dict, List
 
 import pytest
 
-from sophia.pool import SophiaPool
+from sophia.pool import SophiaPool, _streaks
 
 
 class _ReasoningThenContentClient:
@@ -211,6 +211,57 @@ async def test_genuinely_empty_stream_still_pauses():
     assert pool._empty_stream_streaks, (
         "genuinely-empty stream did NOT increment the streak tracker"
     )
+
+
+@pytest.mark.asyncio
+async def test_tool_call_only_stream_is_not_empty():
+    """Regression (2026-09-12 arthr incident): a zai response that
+    contains ONLY tool_call deltas (agent-shaped turn — the model
+    immediately invokes tools, no prose) is a HEALTHY response.
+    The old consumer only counted token/reasoning chunks as
+    activity, so tool-call-only responses were classified as
+    'empty streams' — pausing healthy accounts and exhausting the
+    rotation into AllProvidersUnreachable."""
+    entry = _make_entry("zai", "glm-5.2")
+
+    class _ToolCallOnlyClient:
+        async def chat(self, *args, **kwargs):
+            return ("", [{"id": "call_1", "type": "function",
+                          "function": {"name": "terminal", "arguments": "{}"}}], {})
+
+        async def stream(self, *args, **kwargs):
+            yield {"type": "tool_call", "tool_calls": [
+                {"index": 0, "id": "call_1", "type": "function",
+                 "function": {"name": "terminal", "arguments": "{\"command\": \"ls\"}"}}
+            ]}
+            yield {"type": "tool_call", "tool_calls": [
+                {"index": 1, "id": "call_2", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{\"path\": \"/tmp/x\"}"}}
+            ]}
+            yield {"type": "done"}
+
+    entry._client = _ToolCallOnlyClient()
+    pool = _make_pool([entry], client_factory=lambda e: e._client)
+
+    events = []
+    async for chunk in pool.stream(
+        messages=[{"role": "user", "content": "list files"}],
+        sprompt="",
+        temperature=0.7,
+        strategy="random",
+        model=None,
+        max_tokens=4096,
+        tools=[{"type": "function", "function": {"name": "terminal",
+                "parameters": {"type": "object", "properties": {}}}}],
+    ):
+        events.append(chunk)
+
+    # The tool_call events forwarded to the caller
+    assert any(isinstance(e, dict) and e.get("delta", {}).get("tool_calls") for e in events), events
+    # NO empty-stream pause was recorded (this was the bug)
+    assert pool.cooldowns.paused == {}, f"tool-call-only stream paused the account: {pool.cooldowns.paused}"
+    # No streak increment either
+    assert _streaks(pool) == {}, _streaks(pool)
 
 
 async def _empty_gen(*args, **kwargs):

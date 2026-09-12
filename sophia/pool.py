@@ -1728,6 +1728,16 @@ class SophiaPool:
                         elif ctype == "usage":
                             self.last_stream_usage = dict(chunk.get("tokens") or {})
                         elif ctype == "tool_call":
+                            # A tool-call delta is stream ACTIVITY —
+                            # a response consisting solely of tool_calls
+                            # (agent-shaped turns: model immediately
+                            # invokes tools, no prose) is a HEALTHY
+                            # response, not an empty stream. Without
+                            # this flag the 2026-09-12 arthr incident
+                            # classified every tool-call-only zai
+                            # response as "empty", paused healthy
+                            # accounts, and exhausted the rotation.
+                            emitted = True
                             # T-NEW-119 (2026-08-27): forward the upstream's
                             # structured tool_call deltas as a dict event
                             # shaped like an OpenAI Chat Completions SSE
