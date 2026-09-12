@@ -214,6 +214,40 @@ The `modon_dttm` should be within the last 24h. If it's older, the
 host tracker is stale and you need to either (a) re-run the seed on
 the host vault, or (b) do a destructive `down -v` + cold restart.
 
+#### Cold restart — empty-vault after `rebuild.sh` (2026-09-12 incident)
+
+If `rebuild.sh` was used to recreate the container WITHOUT running
+`seed-keys.sh`, the container boots with `MERGED_COUNT=0` and an
+empty vault. Symptoms: every upstream call returns 401 / 200-with-no-SSE,
+sophia logs `returned an empty stream` for every account, all
+hermes profiles fail in the same instant.
+
+The fix is a true cold start — wipe the stale vault artifacts from
+the named volume and run `seed-keys.sh`:
+
+```bash
+docker stop sophia-sophia-1 && docker rm sophia-sophia-1
+
+# Wipe the stale vault + key files from the data volume. The
+# entrypoint detects the missing vault.db, generates a fresh
+# cluster master passphrase, and the merge step repopulates.
+docker run --rm -v sophia_sophia_data:/var/lib/sophia alpine:3.19 sh -c \
+    'rm -f /var/lib/sophia/pycurity/{vault.db,vault.db-shm,vault.db-wal,lockout.json,master.key.temp,temp.key}'
+
+cd /home/solubrew/.hermes/projects/sophia
+./cluster/seed-keys.sh /home/solubrew/.local/share/pycurity/secure_store.db '<host-vault-passphrase>'
+
+# Verify
+docker logs sophia-sophia-1 2>&1 | grep -E "VAULT_STATE|MERGED_COUNT"
+# → VAULT_STATE=cold  MERGED_COUNT=4
+```
+
+The `seed-keys.sh` script (2026-09-12, `860b29a`) is now safe to
+run on every restart: its cleanup trap waits for the container to
+settle before restoring host-vault perms, and its settle-check
+detects both `sophia_sophia` (compose v1) and `sophia-sophia-1`
+(docker-run v2) naming.
+
 #### Restart open-webui
 
 ```bash

@@ -28,6 +28,46 @@
     ]
   }'
 
+> **Session 2026-09-12 (arthr empty-stream incidents, three rounds):**
+> Root cause was the stream consumer only counting `token` chunks
+> as activity. Two response shapes were misclassified as
+> "empty streams":
+> 1. **Reasoning-only** responses (GLM-4.7/5.2 spend output budget
+>    on `delta.reasoning_content`). Fix: `ladyol@67fcb53` yields
+>    reasoning events; `sophia@d7079bf` consumes them as activity
+>    but doesn't forward them to hermes.
+> 2. **Tool-call-only** responses (agent-shaped turns where the
+>    model immediately invokes tools, zero prose). Fix:
+>    `sophia@77ba322` — `tool_call` deltas now set `emitted=True`.
+>    THIS was the real root cause: arthr's tool-heavy profile hit
+>    it on every turn.
+>
+> Same deploy added escalating empty-stream backoff (60s → 30m,
+> consecutive-empty-driven) so any future genuine pathology
+> can't burn quota by being retried every 60s.
+>
+> Three other fixes landed alongside:
+> * `sophia@c17c88b` — error-surface contract: `AllProvidersUnreachable`
+>   exception + `_with_recovery_budget` wrapper. Hermes now sees
+>   only two surfaced error shapes: 429 (quota wall) and 413
+>   (context too big for ALL accounts). Everything else retries
+>   internally with backoff for up to 60s.
+> * `sophia@860b29a` — `seed-keys.sh` cleanup race + v2
+>   container-name detection. `rebuild.sh` was creating
+>   containers with empty vaults (the "every request 401s /
+>   200-no-SSE" failure mode); fixed by running `seed-keys.sh`
+>   cold-start after a volume wipe.
+>
+> Diagnosis workflow that finally cracked the tool-call case:
+> replay `~/.hermes/profiles/<name>/sessions/request_dump_*.json`
+> directly against the upstream — a healthy 200 with
+> `finish_reason: "tool_calls"` proved the gateway was
+> misclassifying, not the upstream.
+>
+> `cluster/seed-keys.sh` is now the canonical operator workflow
+> after any volume-preserving rebuild. Audit-stable; live state:
+> sophia-sophia-1 healthy on `gamma@77ba322`.
+
 > **Session 2026-08-27 (evening):** Maintenance docs brought current.
 > Tool-call wire-format fixed (T-NEW-119), vault recovery flow is
 > idempotent (cluster/seed-keys.sh runs on every restart), Docker

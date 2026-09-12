@@ -2,6 +2,98 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-09-12 (empty-stream root cause: tool-call-only responses were misclassified)
+
+### Changed
+
+**Tool-call-only streams are healthy responses, not empty streams.**
+Operator report 2026-09-12 (second round, arthr profile): errors
+continued immediately after the reasoning-content fix deployed.
+Replaying arthr's EXACT captured payload
+(`~/.hermes/profiles/arthr/sessions/request_dump_*.json` — 19
+tools / 55KB of schemas, 23 messages, 15 tool-result turns)
+directly against zai showed the upstream returning HTTP 200 with
+a perfectly healthy agent-shaped response: two `tool_calls`
+deltas, `finish_reason: "tool_calls"`, zero prose, zero
+reasoning. The model immediately invokes tools — standard agent
+behavior.
+
+But the stream consumer only set `emitted=True` on `token` (and,
+earlier today, `reasoning`) chunks. A tool-call-only response
+therefore counted as "no content, no error" → classified as an
+EMPTY STREAM → healthy zai account paused → rotation exhausted →
+`AllProvidersUnreachable` surfaced to hermes. Ladyol's own stream
+docstring warns exactly this: *"an upstream that emits ONLY
+tool_calls (no prose) will produce zero token events. Consumers
+MUST inspect both."*
+
+This explains the ENTIRE day's incident series: the zai/minimax
+"empty streams" were never quota exhaustion, never thinking
+budget — they were every agent-shaped turn where the model led
+with tool calls. arthr (tool-heavy profile) was hit hardest;
+direct probes without tools always worked, which is why the
+misdiagnosis survived three rounds.
+
+- `sophia/pool.py` stream consumer: `tool_call` deltas now set
+  `emitted=True`. Only a stream with literally nothing (no
+  tokens, no reasoning, no tool_calls) is "empty".
+- `chat()` path already handled this correctly (its
+  broken-model check is guarded by `not tool_calls`) — only
+  `stream()` had the blindspot.
+
+### Added
+
+- `test_tool_call_only_stream_is_not_empty` in
+  `tests/test_reasoning_stream.py` — pins: forwarded tool_call
+  events, no pause recorded, no streak increment.
+
+### Verified
+
+- 161/163 unit suite green (2 pre-existing stub bugs in
+  `test_no_error_to_hermes.py` unchanged).
+- End-to-end: the exact payload that failed at 15:59 EDT replayed
+  through sophia post-deploy → `200`, 3 tool calls returned
+  (`terminal` + 2).
+
+#### Card (77ba322)
+
+## [Unreleased] — 2026-09-12 (reasoning-stream support + escalating empty-stream backoff)
+
+### Changed
+
+**Reasoning-model streams no longer classify as empty.** First
+round of the 2026-09-12 incident: GLM-4.7/5.2 (and Kimi,
+DeepSeek-R1) emit chain-of-thought in
+`delta.reasoning_content` before (sometimes instead of, when the
+output budget is spent thinking) `delta.content`. ladyol's SSE
+parser dropped reasoning deltas entirely, so thinking-heavy turns
+yielded zero token events.
+
+- `ladyol@67fcb53`: SSE parser yields
+  `{"type": "reasoning", "content": ...}` events.
+- `sophia/pool.py` stream consumer: `reasoning` chunks count as
+  stream activity (`emitted=True`) but are NOT forwarded to the
+  caller (hermes wants content, not chain-of-thought).
+- Escalating empty-stream backoff: consecutive empty streams on
+  the same account double the pause (60s → 2m → 4m → 8m → 16m,
+  30m cap). A single healthy token resets the streak. Protects
+  low-quota accounts from burn when a persistent pathology does
+  occur (defense-in-depth after the zai-at-3% scare).
+- Streak tracker lazily created (`_streaks()` helper) so test
+  stubs built via `object.__new__` don't crash.
+
+### Added
+
+- `tests/test_reasoning_stream.py` — reasoning+content healthy,
+  reasoning-only NOT empty, genuinely-empty still pauses,
+  tool-call-only not empty (added with 77ba322).
+
+### Verified
+
+- 160/162 at land time; deployed and probe-verified (`200 pong`).
+
+#### Card (d7079bf)
+
 ## [Unreleased] — 2026-09-12 (error-surface contract: zero error responses except quota exhaustion)
 
 ### Changed
@@ -86,6 +178,8 @@ the **single current message** is too big for any model
 else is now silent retry inside sophia with audit logging for
 every surfaced error response.
 
+#### Card (c17c88b)
+
 ### Changed
 
 - **Empty-stream rotation now pauses the offending account.**
@@ -129,6 +223,38 @@ every surfaced error response.
 - Full suite: 150/150 (was 145).
 - The two failure patterns at issue (empty-stream m3 and the
   2-hour sticky pause) both addressed at the pool layer.
+
+#### Card (7aa4567)
+
+#### Card (860b29a) — fix(seed-keys): defer vault-perm cleanup until after container merge + v2 container-name detection
+
+The 2026-09-12 empty-vault incident: `rebuild.sh` recreates the
+container WITHOUT the merge env vars, so after any
+volume-preserving rebuild the container booted with
+`MERGED_COUNT=0` and an empty vault — every upstream call went
+out unauthenticated (401/200-empty), surfacing as the same
+"empty stream" signature as the tool-call bug.
+
+Two defects fixed in `cluster/seed-keys.sh`:
+
+1. **Cleanup race**: the script's EXIT trap restored host-vault
+   perms (700/600) before the container's entrypoint finished
+   reading the bind-mounted source vault — the merge failed with
+   `PermissionError` and the container restart-looped. Cleanup
+   now waits for the container to settle (healthy or crashed)
+   before restoring perms.
+2. **Container-name detection**: the settle-check polled
+   `sophia_sophia` (compose v1 naming) while `rebuild.sh`/v2
+   names it `sophia-sophia-1` — the poll never matched, so the
+   race went undetected. Detection now tries both names.
+
+Cold-start path (used when the container vault passphrase drifts
+from the host tracker): remove `vault.db`, `vault.db-shm`,
+`vault.db-wal`, `lockout.json`, `master.key.temp`, `temp.key`
+from the named volume, then run `seed-keys.sh` — entrypoint
+regenerates a fresh vault, merges 4 LLM keys (3× minimax +
+1× zai per the allowlist), and syncs the new cluster master
+passphrase back to the host vault.
 
 ## [Unreleased] — 2026-09-11 (sophia findings closed: blueprint_structure + security_headers)
 
