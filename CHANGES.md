@@ -55,7 +55,32 @@ misdiagnosis survived three rounds.
   through sophia post-deploy → `200`, 3 tool calls returned
   (`terminal` + 2).
 
-#### Card (77ba322)
+### Fixed
+
+**Two contract regressions re-opened by the post-empty-stream work
+(`sophia@0c0dbf7`):**
+
+- `sophia/routers/chat.py::_auto_compact_and_retry` was a plain
+  `def` that did `return pool.chat_with_meta(...)` without `await`.
+  The coroutine object was created but never executed inside the
+  `try/except RequestTooLarge`, so the trim-from-the-oldest loop
+  was dead code — every RTL bubbled straight to the router's 413
+  even when compaction would have served. Now `async def` +
+  `await`. Pinned by
+  `tests/test_no_error_to_hermes.py::test_request_too_large_trims_oldest_when_pre_flight_permits`
+  (was failing 6→5→4→3→2 messages; the stub's `chat_with_meta`
+  succeeds at len=2 and returns `"ok (2 msgs)"`).
+- `sophia/pool.py::SophiaPool.chat()`'s messages-driven path
+  returned `text` even when it was `""` and there were no
+  `tool_calls`. The operator's no-error contract forbids
+  200-with-garbage — only real recovery or a real 502. Mirrors the
+  empty-stream handling in `stream()` (pause + rotate via
+  `EMPTY_STREAM_PAUSE_SECONDS` escalating backoff). Pinned by
+  `tests/test_no_error_to_hermes.py::test_empty_stream_recovers_silently_within_budget`.
+
+**Suite: 168 passed, 2 skipped, 0 failed** (was 166/170).
+
+#### Card (0c0dbf7)
 
 ## [Unreleased] — 2026-09-12 (reasoning-stream support + escalating empty-stream backoff)
 
