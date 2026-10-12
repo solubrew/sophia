@@ -98,7 +98,7 @@ def register(app, cap_dep, router=None) -> None:
             return list(messages)
         return list(messages[:1]) + list(messages[2:])
 
-    def _auto_compact_and_retry(
+    async def _auto_compact_and_retry(
         pool: SophiaPool,
         messages: List[Dict[str, Any]],
         sprompt: str,
@@ -117,6 +117,14 @@ def register(app, cap_dep, router=None) -> None:
         ``RequestTooLarge`` when nothing fits. We never synthesize a
         200 — the operator wants real compaction to succeed OR a
         real error.
+
+        BUGFIX (2026-10-11): this was a plain ``def`` that did
+        ``return pool.chat_with_meta(...)`` without ``await`` — the
+        coroutine object was created but never executed inside the
+        try/except, so the trim loop was dead code and every
+        RequestTooLarge bubbled straight out as a 413 even when
+        compaction could have served the request. Now ``async def``
+        + ``await`` so the trim loop actually runs.
         """
         attempt_messages = list(messages)
         # Bound the compaction loop: don't trim below 2 messages
@@ -127,7 +135,7 @@ def register(app, cap_dep, router=None) -> None:
         # try/except in the chat router surfaces the 413.
         while True:
             try:
-                return pool.chat_with_meta(
+                return await pool.chat_with_meta(
                     messages=attempt_messages,
                     sprompt=sprompt,
                     temperature=temperature,

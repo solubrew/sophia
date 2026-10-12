@@ -1332,6 +1332,21 @@ class SophiaPool:
                         f"pausing {entry_id} for {BROKEN_MODEL_PAUSE_SECONDS}s to avoid retry-spam"
                     )
                     continue
+                # Empty-content guard (BUGFIX 2026-10-11): when the
+                # messages path collected ZERO text and no tool_calls,
+                # the upstream gave us a synthetic-200-with-garbage —
+                # the exact shape the operator's no-error contract
+                # forbids (mirrors the empty-stream handling in
+                # stream()). Raise a RuntimeError so the rotation
+                # loop's except-path pauses + rotates (and the pool
+                # eventually surfaces AllProvidersUnreachable instead
+                # of returning empty content to hermes).
+                if not (text or "").strip() and not tool_calls:
+                    raise RuntimeError(
+                        f"provider {getattr(entry.provider, 'name', '?')} "
+                        f"({entry.model.name}) returned empty content "
+                        f"(no text, no tool_calls)"
+                    )
                 return text
             except Exception as exc:  # noqa: BLE001 — rotate on ANY provider error
                 last_exc = exc
