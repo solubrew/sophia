@@ -122,6 +122,35 @@ False positive — kept, fixed upstream in the auditor instead:
 
 #### Card (27531d3)
 
+## [Unreleased] — 2026-10-12 (module_cli_coverage: launcher-only CLI is vacuous coverage)
+
+**Was:** `module_cli_coverage: 10%`. The dim flagged 6 top-level
+sophia modules (security_headers, util, db_backend, log_setup,
+cooldowns, app) as "no corresponding CLI command" because
+`sophia/cli.py` is a 42-line argparse script that just calls
+`uvicorn.run("sophia.server:app", ...)` — a launcher, not a
+command surface. The dim's underlying question ("does each module
+expose a CLI command?") presupposes a command surface that this
+API-server project shape does not have.
+
+**Fix:** in sasquatch `62f47c33` (T-NEW-121): `StructureAuditor
+._check_module_cli_coverage` now counts STRONG command signals
+(`@\w+\.command` decorators, `add_parser` calls) separately from
+the weak catch-all string scan. When `strong_command_signals == 0`,
+the dim returns 100 (vacuously satisfied). The regression test
+`test_subcommand_cli_still_penalises_missing_modules` pins that
+a Typer-style subcommand CLI still gets full coverage checking.
+
+### Verified
+
+- Re-audit: `module_cli_coverage` **10% → 100%** [pass],
+  overall **97.73% → 98.87%**.
+- 8 partial dims remain (file_sizes 80, logging 80, lambda_antipattern 82,
+  feature_envy 90, readme_quality 90, testing 90, logging_coverage 95,
+  long_method 95). 77/85 dims at 100%.
+
+#### Card (T-NEW-122)
+
 ## [Unreleased] — 2026-09-12 (reasoning-stream support + escalating empty-stream backoff)
 
 ### Changed
