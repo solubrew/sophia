@@ -24,9 +24,7 @@ dependencies = [
     "uvicorn[standard]>=0.27",
     "pydantic>=2.0,<3.0",
     "pyyaml>=6.0,<7.0",
-    "sse-starlette>=2.0",
     "kahndor>=0.0.1,<1.0.0",
-    "subtrix>=0.0.1,<1.0.0",
     "pycurity>=0.0.1,<1.0.0",
     # Provider pool lives in ladyol — pinned to a known-good range.
     "ladyol>=0.2.0,<1.0.0",
