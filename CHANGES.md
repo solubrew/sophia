@@ -82,6 +82,46 @@ misdiagnosis survived three rounds.
 
 #### Card (0c0dbf7)
 
+## [Unreleased] — 2026-10-12 (dep hygiene: drop subtrix + sse-starlette, auditor FP fixed upstream)
+
+### Changed
+
+**Commit B of the 2026-10-12 audit lift (`sophia@27531d3`).**
+`dependency_usage` scored 70% with 3 `unused_direct` findings:
+`subtrix`, `sse-starlette`, `uvicorn[standard]`.
+
+True positives — dropped here:
+
+- `subtrix`: never imported anywhere. Its import name is `logma`,
+  which lives inside the **kahndor** distribution (`kahndor/logma.py`)
+  — a different dist entirely. The pin was dead weight installing a
+  package nothing imports.
+- `sse-starlette`: never imported. Sophia's streaming endpoint uses
+  starlette-core `StreamingResponse` via `fastapi.responses`, not
+  sse-starlette's `EventSourceResponse`. Repo-wide grep: 0 hits for
+  `EventSourceResponse|sse_starlette`.
+
+False positive — kept, fixed upstream in the auditor instead:
+
+- `uvicorn[standard]`: genuinely used (`sophia/cli.py:7`,
+  `tests/test_e2e_live.py:10`, `tests/test_multi_worker_load.py:29`,
+  `cluster/entrypoint.py`). The auditor's `dependency_usage` scan had
+  two name-normalization bugs — PEP 508 extras suffix not stripped
+  (regex searched source for the literal `uvicorn[standard]`) and
+  hyphen/underscore not swapped (`sse-starlette` vs
+  `from sse_starlette import ...`). Fixed in sasquatch `3a66a4fd`
+  with 4 regression tests (`TestPipNameNormalization`).
+
+### Verified
+
+- Imports clean: `sophia.app`, `sophia.cli`, `sophia.server`,
+  `sophia.pool` all import post-drop.
+- Full suite: 164 passed + 2 skipped + 4 `live_cluster` deselected.
+- Re-audit: `dependency_usage` **70% → 100%** [pass],
+  `unused_direct: []`, overall **97.69% → 97.73%**.
+
+#### Card (27531d3)
+
 ## [Unreleased] — 2026-09-12 (reasoning-stream support + escalating empty-stream backoff)
 
 ### Changed
