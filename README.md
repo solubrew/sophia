@@ -11,7 +11,7 @@ accounting.
 Runs LAN-side today (the cluster is on `192.168.1.67`); no external
 exposure yet.
 
-## Quickstart
+## Installation & Quickstart
 
 ```bash
 cd /home/solubrew/.hermes/projects/sophia
