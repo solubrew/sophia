@@ -2,6 +2,46 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-10-12 (file_sizes: pool.py 105 KB → 4 modules, largest 74 KB)
+
+### Changed
+
+**`sophia/pool.py` split from a 2136-line / 105 KB monolith into 4
+modules.** `file_sizes` dim flagged it at 102.7 KB (cap 100 KB).
+The split is structural — every name importable from
+`sophia.pool` still resolves via a re-export block, and the
+public API is unchanged.
+
+New layout:
+
+- `pool_exceptions.py` — `PoolQuotaExhausted` (429),
+  `AllProvidersUnreachable` (502), `RequestTooLarge` (413).
+  One exception trio, three HTTP statuses, one file.
+- `pool_cooldowns.py` — the DEPRECATED `_ProviderCooldowns`
+  shim (delegates to `CooldownStore`). Also removed a duplicate
+  `earliest_unpause_utc()` shadow pyright flagged (dead code).
+- `pool_helpers.py` — module-level helpers + pause-policy
+  constants (`_next_reset_utc`, `_reset_from_error`,
+  `_account_of`, `_entry_key`, `_is_entry_eligible`,
+  `_empty_stream_pause_for`, `_streaks`, `_entry_fits`,
+  `_estimate_input_tokens`, `_is_rate_limit`,
+  `_is_context_window_exceeded`, ...).
+- `pool.py` — imports, `logma`, `SophiaPool`, and the re-export
+  block. 1416 lines / 74.2 KB.
+
+### Verified
+
+- All 31 names tests import from `sophia.pool` resolve
+  (AST scan of every `from sophia.pool import ...` in the repo).
+- Full suite: 168 passed, 2 skipped, 0 failed — identical to the
+  pre-split baseline. (One intermediate breakage during the
+  split — an over-trimmed `datetime` import — was caught by
+  `test_429_rotation` and fixed before commit.)
+- Re-audit: `file_sizes` **80% → 100%** [pass],
+  overall **99.37% → 99.62%**.
+
+#### Card (ca01f51)
+
 ## [Unreleased] — 2026-10-12 (lambda_antipattern: 9 dispatch lambdas → functools.partial)
 
 ### Changed
