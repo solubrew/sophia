@@ -2,6 +2,40 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-10-12 (PII sweep: hardcoded paths and LAN IPs redacted)
+
+### Changed
+
+**Operator-specific infrastructure identifiers removed from shipped
+artifacts.** Sweep covered pre-existing leaks in shipped source +
+test fixtures + the historical CHANGELOG:
+
+- `sophia/leaked_tool_call_fix.py` docstring example:
+  `cwd="/home/solubrew"` → `cwd="/home/user"` (fixture string,
+  round-trip parser test still green).
+- `sophia/config.py` comment: removed the literal `/home/solubrew/...`
+  reference, kept the design rationale.
+- `tests/test_leaked_tool_call_fix.py`: 20 fixture strings
+  (`/home/solubrew/...` → `/home/user/projects/demo` and similar).
+  Round-trip assertions (input == extracted) preserved.
+- `tests/test_manage_secrets.py`: 3 `subprocess.run(cwd=...)` calls
+  swapped to a module-level `_REPO_ROOT = Path(__file__).resolve()
+  .parent.parent` so the test follows the repo wherever it lives.
+- `CHANGES.md` historical cards: 13 references to operator LAN IPs
+  and home-dir paths replaced with bracketed placeholders:
+  `192.168.1.210` → `[LAN-PG-HOST]`, `192.168.1.67` →
+  `[LAN-DEPLOY-HOST]`, `/home/solubrew` → `[HOME]`. The deployment
+  narrative is preserved; only the identifiers are redacted.
+
+### Verified
+
+- Zero `solubrew` or `192.168.*` remaining in shipped source,
+  tests, or CHANGES.md.
+- Affected test modules (`test_leaked_tool_call_fix.py`,
+  `test_manage_secrets.py`, `test_config.py`): 24/24 green.
+
+#### Card (3e75836)
+
 ## [Unreleased] — 2026-10-12 (file_sizes: pool.py 105 KB → 4 modules, largest 74 KB)
 
 ### Changed
@@ -510,12 +544,12 @@ passphrase back to the host vault.
   longest method now and that's expected — OpenAI streaming + tool-call
   recovery + quota/oversize error shapes is intrinsically long.
 
-## [Unreleased] — 2026-09-11 (PG backend: metadata store moves to LAN Postgres at 192.168.1.210)
+## [Unreleased] — 2026-09-11 (PG backend: metadata store moves to LAN Postgres at [LAN-PG-HOST])
 
 ### Changed
 
 - **SophiaDB runs on Postgres when `SOPHIA_PG_*` env vars are set.**
-  Operator request 2026-09-11: use the PG at `192.168.1.210:5432`
+  Operator request 2026-09-11: use the PG at `[LAN-PG-HOST]:5432`
   (database `sophia`, credentials in the host pycurity vault under
   `pgs-4964wkcr.210` — username + `private_key` fields). New module
   `sophia/db_backend.py` is a thin DB-API shim over psycopg2 — no
@@ -565,7 +599,7 @@ passphrase back to the host vault.
 ### Operator action
 
 - Run `rebuild.sh` (rebuild + restart) to switch the live gateway
-  onto PG. The `sophia` database on 192.168.1.210 is created,
+  onto PG. The `sophia` database on [LAN-PG-HOST] is created,
   populated, and the migrated key set is verified.
 
 ## [Unreleased] — 2026-09-11 (Z-NEW: zai rehydration-schedule change + manual quota reloads)
@@ -729,7 +763,7 @@ passphrase back to the host vault.
   share is NFS v3 with root-squash — a bind would be unwritable by
   uid 1001.
 - **`scripts/sync-sophia-logs.sh`** — mirrors the log volume to the
-  host's `/home/solubrew/EDN/Downloads/LOGs/sophia/` via `docker cp`
+  host's `[HOME]/EDN/Downloads/LOGs/sophia/` via `docker cp`
   (works through the daemon despite NFS root-squash). Wired into a
   15-minute Hermes cron job (`sophia-log-sync`, no_agent watchdog).
 
@@ -1111,7 +1145,7 @@ passphrase back to the host vault.
   pool.stream(...)` loop ends, emit one final SSE chunk with
   `finish_reason: "stop"` (empty delta) before `data: [DONE]`. Indent
   is outside the inner loop so it's emitted exactly once per request.
-- **Verified end-to-end** at `192.168.1.67:8765` on 2026-08-23:
+- **Verified end-to-end** at `[LAN-DEPLOY-HOST]:8765` on 2026-08-23:
   ```
   [0] finish_reason=None content='<think>…'
   [4] finish_reason='stop' content=''     ← NEW
@@ -1147,12 +1181,12 @@ passphrase back to the host vault.
   ```yaml
   model:
     provider: custom
-    base_url: http://192.168.1.67:8765/v1
+    base_url: http://[LAN-DEPLOY-HOST]:8765/v1
     default: sophia-auto
     api_key: ${SOPHIA_REQUESTOR_KEY}
   custom_providers:
     - name: sophia
-      base_url: http://192.168.1.67:8765/v1
+      base_url: http://[LAN-DEPLOY-HOST]:8765/v1
       model: sophia-auto
       extra_body:
         strategy: best_available
@@ -1399,7 +1433,7 @@ passphrase back to the host vault.
 ## [Unreleased] — 2026-08-23 (senbai consumer + reproducible build)
 
 ### Added
-- **Senbai agent harness now consumes sophia** as its sole LLM provider. `~/.senbai/senbai_accts.yaml` carries a single enabled account (`sophia-000.000.000`); ladyol's ProviderPool exposes exactly one entry (`sophia` / `sophia-auto` → `http://192.168.1.67:8765/v1`) and rotation stays upstream inside sophia. Verified: 5/5 chat round-trips 200 OK, no internal ladyol rotation.
+- **Senbai agent harness now consumes sophia** as its sole LLM provider. `~/.senbai/senbai_accts.yaml` carries a single enabled account (`sophia-000.000.000`); ladyol's ProviderPool exposes exactly one entry (`sophia` / `sophia-auto` → `http://[LAN-DEPLOY-HOST]:8765/v1`) and rotation stays upstream inside sophia. Verified: 5/5 chat round-trips 200 OK, no internal ladyol rotation.
 - `docs/DEPLOY.md` Step 3 + troubleshooting rows: the vault-boot gotchas (`temp.key` vs `master.key.temp` filename mismatch; PyKeyStore 4-hour mtime expiry; `uuid_extensions` stub wheel).
 
 #### d2ccd8c — restore host-side wheel vendoring (the original pipeline)
@@ -1466,7 +1500,7 @@ passphrase back to the host vault.
 - `docs/DEPLOY.md` — operator-facing deployment guide documenting the single-unlock vault pattern + troubleshooting table.
 
 ### Architecture (single-unlock vault)
-Sophia's master passphrase is stored in the **main** PyKeyStore instance (`/home/solubrew/.local/share/pycurity/`) under service name `sophia_master_passphrase`. At deploy time, the operator pulls that value once and exports it as `SOPHIA_MASTER_PASSPHRASE`. Sophia's container unlocks its own internal vault with that passphrase, where the provider keys (anthropic, openai, kalshi) live. Provider rotation is `set anthropic_api_key` + `docker compose restart sophia`.
+Sophia's master passphrase is stored in the **main** PyKeyStore instance (`[HOME]/.local/share/pycurity/`) under service name `sophia_master_passphrase`. At deploy time, the operator pulls that value once and exports it as `SOPHIA_MASTER_PASSPHRASE`. Sophia's container unlocks its own internal vault with that passphrase, where the provider keys (anthropic, openai, kalshi) live. Provider rotation is `set anthropic_api_key` + `docker compose restart sophia`.
 
 ### Plan corrections applied during rollout
 - Task 4 Dockerfile fix: `COPY pyproject.toml README.md ./` (hatchling requires README.md before the first `pip install .`).
@@ -1483,7 +1517,7 @@ Sophia's master passphrase is stored in the **main** PyKeyStore instance (`/home
 - **Code-level:** Dockerfile + compose + Caddy + build script all written and syntax-valid.
 - **End-to-end Docker build:** NOT verified in this session due to a local environment quirk — Ubuntu 22.04's system setuptools 70+ removed its bundled `distutils` fallback, breaking `pip wheel`'s build isolation under `--no-build-isolation`. The fix is one of:
   - `pip install --upgrade setuptools` on the build host (the script does this in Step 1 but the host's setuptools is broken at the package level, not user-install level — needs `apt install --reinstall python3-setuptools` or a venv-based build host).
-  - Run `./scripts/build-sophia.sh` from a clean host where the SB-stack editable installs work (the standard dev host with `/home/solubrew/ENVs/shieldface/` does, since that venv's setuptools is intact).
+  - Run `./scripts/build-sophia.sh` from a clean host where the SB-stack editable installs work (the standard dev host with `[HOME]/ENVs/shieldface/` does, since that venv's setuptools is intact).
   - Pre-vendor wheels into `sb-dist/` from a working dev host and `docker build` on the deploy host.
 - **Recommended workflow for operators:** build on the standard SB-stack dev host (where the venv + setuptools + editable installs are intact), push the resulting `sophia-web:local` image to the deploy host's registry, then `docker compose up -d sophia` on the deploy host.
 
@@ -1582,7 +1616,7 @@ ladyol's hatchling build backend needs `hatchling` AND `trove-classifiers` avail
   `manage_secrets set`), troubleshooting table updated with the actual
   failure modes (PermissionError, orphan vault, 401, 429 rotation,
   wrong base_url, etc.).
-- `docs/HERMES_SETUP.md` — TL;DR now references `192.168.1.67`;
+- `docs/HERMES_SETUP.md` — TL;DR now references `[LAN-DEPLOY-HOST]`;
   rotation section now documents per-account 429 cooldowns;
   "not implemented" list shortened to the three items still open
   (structured_call endpoint, connection metadata, token-budget
@@ -1594,7 +1628,7 @@ ladyol's hatchling build backend needs `hatchling` AND `trove-classifiers` avail
 ### Operator handoff notes
 - Running image: `sophia_sophia:latest` (commit `088fcfc`)
 - Active accounts: 5 LLM keys (3× minimax, 1× zai, 1× xai)
-- Open WebUI at `http://192.168.1.67:3000` — model dropdown shows
+- Open WebUI at `http://[LAN-DEPLOY-HOST]:3000` — model dropdown shows
   `sophia-auto` first, then concrete ids (minimax-m2.7, minimax-m3,
   glm-4.7, glm-5.2, grok-2).
 - To add a new provider account: edit `cluster/agent/agent.yaml` +
@@ -1625,7 +1659,7 @@ ladyol's hatchling build backend needs `hatchling` AND `trove-classifiers` avail
   write through the `other` bit.
 - **`scripts/sync-sophia-logs.sh`** — mirrors the named volume's
   rotated files to the host NFS share at
-  `/home/solubrew/EDN/Downloads/LOGs/sophia` (host uid 1000 CAN
+  `[HOME]/EDN/Downloads/LOGs/sophia` (host uid 1000 CAN
   write there, container uid 1001 cannot). Handles both v1 and v2
   compose volume names. Run manually or from a 15-min cron.
 - **`rebuild.sh`** — single-command rebuild with shieldface-aware
