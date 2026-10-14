@@ -33,6 +33,7 @@ Exit codes: 0 success · 1 not found · 2 bad args · 3 db error.
 from __future__ import annotations
 
 import argparse
+import functools
 import sys
 
 from sophia.sophia import SophiaDB
@@ -154,14 +155,14 @@ def main(argv=None) -> int:
     keys = KeyStore(db)
     usage = UsageLog(db)
     handler = {
-        "create": lambda a: _cmd_create(a, keys),
-        "list": lambda a: _cmd_list(a, keys),
-        "disable": lambda a: _cmd_disable(a, keys),
-        "enable": lambda a: _cmd_enable(a, keys),
-        "set-role": lambda a: _cmd_set_role(a, keys),
-        "set-payload": lambda a: _cmd_set_payload(a, keys),
-        "delete": lambda a: _cmd_delete(a, keys),
-        "show": lambda a: _cmd_show(a, keys, usage),
+        "create": functools.partial(_cmd_create, keys=keys),
+        "list": functools.partial(_cmd_list, keys=keys),
+        "disable": functools.partial(_cmd_disable, keys=keys),
+        "enable": functools.partial(_cmd_enable, keys=keys),
+        "set-role": functools.partial(_cmd_set_role, keys=keys),
+        "set-payload": functools.partial(_cmd_set_payload, keys=keys),
+        "delete": functools.partial(_cmd_delete, keys=keys),
+        "show": functools.partial(_cmd_show, keys=keys, usage=usage),
     }.get(args.cmd)
     if handler is None:
         parser.error(f"unknown subcommand {args.cmd!r}")

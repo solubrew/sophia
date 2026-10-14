@@ -17,6 +17,7 @@ functions. Behaviour identical; only the call graph changed.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -668,7 +669,8 @@ async def _non_stream_chat_completions(
     # 413.
     try:
         content, provider_meta = await _with_recovery_budget(
-            lambda: _auto_compact_and_retry(
+            functools.partial(
+                _auto_compact_and_retry,
                 pool, forward_messages, sprompt, temperature,
                 strategy, model, max_tokens, req.tools,
             )
