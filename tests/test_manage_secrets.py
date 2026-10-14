@@ -5,6 +5,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Repo root (tests/ sits directly under it) — keeps the subprocess cwd
+# portable instead of hard-coding a user-specific absolute path.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+
 
 
 def _run_cli(args: list[str], env_extra: dict, vault_dir: Path) -> subprocess.CompletedProcess:
@@ -19,7 +23,7 @@ def _run_cli(args: list[str], env_extra: dict, vault_dir: Path) -> subprocess.Co
     return subprocess.run(
         [sys.executable, "-m", "sophia.cmds.manage_secrets", *args],
         env=env,
-        cwd="/home/solubrew/.hermes/projects/sophia",
+        cwd=_REPO_ROOT,
         capture_output=True,
         text=True,
         timeout=30,
@@ -46,7 +50,7 @@ def test_set_and_list_roundtrip(tmp_path: Path):
             "SOPHIA_PYCURITY_SALT_PATH": str(tmp_path / "salt.bin"),
             "SOPHIA_MASTER_PASSPHRASE": "test-passphrase-xyz",
         },
-        cwd="/home/solubrew/.hermes/projects/sophia",
+        cwd=_REPO_ROOT,
         capture_output=True, text=True, timeout=30,
     )
     assert proc.returncode == 0, proc.stderr
@@ -68,7 +72,7 @@ def test_set_refuses_empty_value(tmp_path: Path):
             "SOPHIA_PYCURITY_SALT_PATH": str(tmp_path / "salt.bin"),
             "SOPHIA_MASTER_PASSPHRASE": "test-passphrase-xyz",
         },
-        cwd="/home/solubrew/.hermes/projects/sophia",
+        cwd=_REPO_ROOT,
         capture_output=True, text=True, timeout=30,
     )
     assert proc.returncode != 0

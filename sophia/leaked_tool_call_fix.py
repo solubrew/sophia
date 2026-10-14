@@ -23,7 +23,7 @@ across runs — observed variants on the same `minimax-m2.7` endpoint
       <minimax:tool_call>
       <skill_view name="production-readiness-review">
       </skill_view>
-      <bash cmd="ls /foo" cwd="/home/solubrew" max_duration="10">
+      <bash cmd="ls /foo" cwd="/home/user" max_duration="10">
       </bash>
       </minimax:tool_call>
 

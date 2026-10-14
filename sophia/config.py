@@ -21,7 +21,7 @@ PXCFG = join(HERE, "_data_", "sophia.yaml")
 # like `ladyol.providers` is deferred and avoids pulling in optional
 # dependencies such as `xskillaber` that are not present in every venv).
 # This lets us resolve `ladyol/_data_/providers.yaml` from any environment
-# that has ladyol installed, without hard-coding `/home/solubrew/...` paths.
+# that has ladyol installed, without hard-coding user-specific absolute paths.
 try:
     import ladyol as _ladyol_pkg  # noqa: F401
     _LADYOL_PROVIDERS_YAML = join(_ladyol_pkg.__path__[0], "_data_", "providers.yaml")

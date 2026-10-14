@@ -73,8 +73,8 @@ def test_extracts_multiple_calls_in_order():
         '[/TOOL_CALL]\n'
         '[TOOL_CALL]\n'
         '{tool => "bash", args => {\n'
-        '  --cmd "ls /home/solubrew/.hermes/projects/shieldface/"\n'
-        '  --cwd "/home/solubrew"\n'
+        '  --cmd "ls /home/user/projects/demo/"\n'
+        '  --cwd "/home/user"\n'
         '  --explanation "List project contents"\n'
         '  --max_duration 10\n'
         '}}\n'
@@ -88,8 +88,8 @@ def test_extracts_multiple_calls_in_order():
         "name": "production-readiness-review"
     }
     assert json.loads(tool_calls[2]["function"]["arguments"]) == {
-        "cmd": "ls /home/solubrew/.hermes/projects/shieldface/",
-        "cwd": "/home/solubrew",
+        "cmd": "ls /home/user/projects/demo/",
+        "cwd": "/home/user",
         "explanation": "List project contents",
         "max_duration": 10,
     }
@@ -102,7 +102,7 @@ def test_extracts_read_tool_with_array_arg():
         'On it. Let me explore the project.\n'
         '[TOOL_CALL]\n'
         '{tool => "read", args => {\n'
-        '  --paths ["/home/solubrew/.hermes/projects/shieldface"]\n'
+        '  --paths ["/home/user/projects/demo"]\n'
         '  --filter "*"\n'
         '  --include_hidden false\n'
         '}}\n'
@@ -111,7 +111,7 @@ def test_extracts_read_tool_with_array_arg():
     tool_calls, cleaned = extract_leaked_tool_calls(text)
     assert len(tool_calls) == 1
     args = json.loads(tool_calls[0]["function"]["arguments"])
-    assert args["paths"] == ["/home/solubrew/.hermes/projects/shieldface"]
+    assert args["paths"] == ["/home/user/projects/demo"]
     assert args["filter"] == "*"
     assert args["include_hidden"] is False
 
@@ -270,7 +270,7 @@ def test_extracts_xml_with_multiple_attrs_per_tag():
     multiple kwargs (the real bash call from the second reproduction)."""
     text = (
         '<minimax:tool_call>\n'
-        '<shell、干 pwd="x" cmd="ls /home/solubrew/.hermes/projects/shieldface/">\n'
+        '<shell、干 pwd="x" cmd="ls /home/user/projects/demo/">\n'
         '</shell、干>\n'
         '</minimax:tool_call>'
     )
@@ -278,7 +278,7 @@ def test_extracts_xml_with_multiple_attrs_per_tag():
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["name"] == "shell、干"
     args = json.loads(tool_calls[0]["function"]["arguments"])
-    assert args["cmd"] == "ls /home/solubrew/.hermes/projects/shieldface/"
+    assert args["cmd"] == "ls /home/user/projects/demo/"
     assert args["pwd"] == "x"
 
 
@@ -301,7 +301,7 @@ def test_extracts_claude_style_invoke_with_parameter_tags():
         '<minimax:tool_call>\n'
         '<invoke name="bash">\n'
         '<parameter name="description">Explore project structure</parameter>\n'
-        '<parameter name="command">ls /home/solubrew/.hermes/projects/shieldface/</parameter>\n'
+        '<parameter name="command">ls /home/user/projects/demo/</parameter>\n'
         '</invoke>\n'
         '</minimax:tool_call>'
     )
@@ -309,7 +309,7 @@ def test_extracts_claude_style_invoke_with_parameter_tags():
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["name"] == "bash"
     args = json.loads(tool_calls[0]["function"]["arguments"])
-    assert args["command"] == "ls /home/solubrew/.hermes/projects/shieldface/"
+    assert args["command"] == "ls /home/user/projects/demo/"
     assert args["description"] == "Explore project structure"
 
 
@@ -380,5 +380,5 @@ def test_mixed_variants_in_one_response():
 # response is a real tool_calls array) is done by rebuilding the sophia
 # image and running the original failing query through the arthr
 # gateway; see scripts/build-sophia.sh and the live-state probe at
-# /home/solubrew/.hermes/profiles/arthr/state.db (turn at 23:43
+# /home/user/.hermes/profiles/agent/state.db (turn at 23:43
 # pre-fix vs the post-fix run should differ in tool_calls column).
