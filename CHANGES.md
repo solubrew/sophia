@@ -2,6 +2,32 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-10-12 (lambda_antipattern: 9 dispatch lambdas → functools.partial)
+
+### Changed
+
+**All 9 flagged lambdas replaced with `functools.partial`.**
+`lambda_antipattern` flagged 8 lambdas in `manage_keys.py::main`
+(the per-subcommand dispatch table) + 1 in `routers/chat.py`
+(the zero-arg `coro_factory` handed to `_with_recovery_budget`).
+
+- `manage_keys.py`: dispatch table now maps subcommand →
+  `functools.partial(_cmd_<name>, keys=keys, ...)` — same
+  `handler(args)` call contract, real function objects instead
+  of closures.
+- `chat.py`: `_with_recovery_budget(functools.partial(
+  _auto_compact_and_retry, pool, ...))` — partial's call
+  returns the coroutine exactly like the lambda did.
+
+### Verified
+
+- Re-audit: `lambda_antipattern` **82% → 100%** [pass],
+  overall **99.25% → 99.37%**.
+- Full suite: 168 passed, 2 skipped, 0 failed.
+- `grep lambda` over both files: zero matches.
+
+#### Card (2c0088a)
+
 ## [Unreleased] — 2026-10-12 (long_method: register() split 678 → 78 lines)
 
 ### Changed
