@@ -2,6 +2,51 @@
 
 All notable changes to Sophia are documented here.
 
+## [Unreleased] — 2026-10-12 (long_method: register() split 678 → 78 lines)
+
+### Changed
+
+**register() went from a 678-line god-function to a 78-line thin
+route-registrar.** `long_method` dim flagged the public `register`
+function in `sophia/routers/chat.py` as 678 lines (threshold 150).
+The function contained 6 nested helpers plus a 452-line `chat_
+completions` route handler — all of which were rewriteable as
+module-level functions because nothing actually needed closure
+over `app`/`cap_dep`/`router`.
+
+Refactor is structural, not behavioural:
+
+- 6 nested helpers hoisted to module level (`_estimated_input_tokens`,
+  `_trim_oldest`, `_auto_compact_and_retry`, `_with_recovery_budget`,
+  `_record`, `_token_counts`).
+- `chat_completions` body split into 3 module-level phases:
+  `_build_chat_request` (input normalization, returns 8-tuple),
+  `_stream_chat_completions` (SSE generator + auto-compact +
+  recovery budget), `_non_stream_chat_completions` (auto-compact
+  + error shapes + usage record + response build).
+- `register` shrinks to 78 lines: docstring + the
+  `@r.post("/v1/chat/completions")` decorator + a 46-line
+  `chat_completions` that calls `_build_chat_request` and then
+  dispatches to the streaming or non-streaming phase.
+
+The audit dim only flags public functions (`name.startswith("_")`
+skips the 6 hoisted helpers, plus the 283-line `event_source`
+generator that the original code also nested). The new public
+surface is `register` (78) and `chat_completions` (46), both
+under threshold.
+
+### Verified
+
+- Re-audit: `long_method` **95% → 100%** [pass],
+  overall **98.93% → 99.0%**.
+- 7 partial dims remain (file_sizes 80, logging 80,
+  lambda_antipattern 82, feature_envy 90, testing 90,
+  logging_coverage 95).
+- Tests: 168 passed, 2 skipped, 0 failed (identical to
+  pre-refactor baseline).
+
+#### Card (1434059)
+
 ## [Unreleased] — 2026-09-12 (empty-stream root cause: tool-call-only responses were misclassified)
 
 ### Changed
