@@ -43,6 +43,10 @@ test fixtures + the historical CHANGELOG:
   required environment.
 - `README.md`: dropped the `(owner: solubrew; ...)` file-owner
   detail from the vault layout note.
+- `README.md` + `docs/HERMES_SETUP.md` (fourth sweep, 15ca8cf):
+  12 remaining `192.168.1.67` deploy-host references →
+  `[LAN-DEPLOY-HOST]`. The wheel and docs/ no longer carry the
+  operator's LAN topology.
 
 ### Documentation
 
