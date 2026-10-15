@@ -1,7 +1,7 @@
 """T-NEW-221 followup: verify the LIVE sophia cluster is actually running in multi-worker mode.
 
 This is a deploy-time check, not a unit test. It talks to the production
-sophia container at ``http://192.168.1.67:8765`` (the LAN gateway) and
+sophia container at ``SOPHIA_E2E_URL`` (set at deploy time) and
 inspects:
 
   1. The uvicorn process tree inside the container has N > 1 workers.
@@ -14,7 +14,7 @@ inspects:
      parallel (p95 wall time < serial-bound baseline).
 
 Skipped automatically when:
-  - The LAN cluster at ``192.168.1.67:8765`` is unreachable
+  - The LAN cluster (``SOPHIA_E2E_URL``, no default) is unreachable
   - The docker socket isn't accessible (cannot introspect the container)
   - The required env vars (SOPHIA_REQUESTOR_KEY in
     ~/.hermes/profiles/morganna/.env) aren't present
@@ -37,15 +37,21 @@ from pathlib import Path
 
 import pytest
 
-CLUSTER_URL = os.environ.get("SOPHIA_E2E_URL", "http://192.168.1.67:8765")
+# Set at deploy time. Module-level default is empty so the test
+# is a hard no-op without explicit operator opt-in (no LAN IP
+# ever ships in source); pytest fixtures/tests further down
+# short-circuit on empty CLUSTER_URL.
+CLUSTER_URL = os.environ.get("SOPHIA_E2E_URL", "")
 CONTAINER_NAME = "sophia-sophia-1"
 KEY_FILE = Path.home() / ".hermes" / "profiles" / "morganna" / ".env"
 
 
 def _cluster_reachable(url: str, timeout: float = 2.0) -> bool:
     """TCP-level reachability check (cheap, no http deps)."""
+    if not url:
+        return False
     try:
-        # url like http://192.168.1.67:8765/healthz → (host, port)
+        # url like http://<host>:<port>/healthz → (host, port)
         from urllib.parse import urlparse
         u = urlparse(url)
         host = u.hostname or "127.0.0.1"

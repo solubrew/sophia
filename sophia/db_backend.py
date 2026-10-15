@@ -1,8 +1,8 @@
 """PostgreSQL backend for SophiaDB (2026-09-11, operator request).
 
 Sophia moves its metadata store (keys / usage / cooldowns / schema
-versions) from the in-container SQLite file to the LAN Postgres at
-``192.168.1.210:5432`` (credentials in the host pycurity vault under
+versions) from the in-container SQLite file to the LAN Postgres
+(credentials in the host pycurity vault under
 ``pgs-4964wkcr.210`` — username + private_key fields).
 
 Design: a thin DB-API shim, not a rewrite. Every consumer
@@ -324,7 +324,12 @@ def pg_connect_params() -> dict:
             "password": password,
         }
     return {
-        "host": os.environ.get("SOPHIA_PG_HOST", "192.168.1.210"),
+        # No IP default: the operator sets SOPHIA_PG_HOST at deploy
+        # time (docker-compose env / systemd unit). Shipping a
+        # hardcoded LAN IP would both leak infrastructure details and
+        # make non-LAN deployments try to phone a host that isn't
+        # theirs. An unset host fails fast with a clear error instead.
+        "host": os.environ.get("SOPHIA_PG_HOST", ""),
         "port": int(os.environ.get("SOPHIA_PG_PORT", "5432")),
         "dbname": os.environ.get("SOPHIA_PG_DB", "sophia"),
         "user": os.environ.get("SOPHIA_PG_USER", "sophia"),
