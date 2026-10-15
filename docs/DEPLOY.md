@@ -462,6 +462,90 @@ The `set` subcommand maps env-var names to PyKeyStore keys:
 `migrate-from-env` only migrates entries on this whitelist — other env
 vars stay in plain `.env` files.
 
+## Environment variable reference
+
+Every `SOPHIA_*` variable the code actually reads. Generated from a
+source scan (2026-10-12); defaults come from the code, not from memory.
+
+### Backend / database
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SOPHIA_DATABASE_URL` | *(unset)* | Full postgres URL (`postgresql://user:pass@host:port/db`). Takes precedence over the discrete vars below. |
+| `SOPHIA_PG_HOST` | *(empty — **no IP default**)* | Postgres host. Must be set for PG mode; `pg_configured()` gates on this (or `SOPHIA_DATABASE_URL`). |
+| `SOPHIA_PG_PORT` | `5432` | Postgres port. |
+| `SOPHIA_PG_DB` | `sophia` | Database name. |
+| `SOPHIA_PG_USER` | `sophia` | Database user. |
+| `SOPHIA_PG_PASSWORD` | *(empty)* | Database password. |
+| `SOPHIA_DB` | *(platform default sophia.db)* | SQLite path (used when PG env vars are unset). |
+
+**PG mode requires explicit configuration since the 2026-10-12 PII
+sweep** — the code previously defaulted `SOPHIA_PG_HOST` to a LAN IP,
+which leaked infrastructure and made non-LAN deployments dial a host
+that wasn't theirs. Deploy scripts set this at deploy time
+(`rebuild.sh` reads it from the environment and requires it).
+
+### Secrets / vault
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SOPHIA_MASTER_PASSPHRASE` | *(unset)* | Unlocks sophia's in-container PyKeyStore vault (provider keys). Set at deploy time by `cluster/seed-keys.sh`. |
+| `SOPHIA_CLUSTER_MASTER_PASSPHRASE` | *(unset)* | Recovery-mode vault unlock (mode-3 entrypoint recovery). |
+| `SOPHIA_VAULT_PASSPHRASE` | *(empty)* | Host-vault (pycurity) passphrase for `rebuild.sh` steps. Empty default lets PyKeyStore try the `master.key.temp` auto-unlock path. |
+| `SOPHIA_PYCURITY_DB_PATH` | *(unset)* | Path to the PyKeyStore DB file (per-instance override). |
+| `SOPHIA_PYCURITY_SALT_PATH` | *(unset)* | Path to the PyKeyStore salt file. |
+| `SOPHIA_ALLOW_ENV_FALLBACK` | *(unset)* | `0` in production: missing secrets become hard errors instead of falling back to env vars. |
+
+### Merging (vault → in-container vault)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SOPHIA_MERGE_FROM_PYCURITY_PATH` | *(unset)* | Host pycurity DB path to merge from (set by `seed-keys.sh`). |
+| `SOPHIA_MERGE_PASSPHRASE` | *(unset)* | Passphrase for the source vault during merge. |
+| `SOPHIA_MERGE_ALLOWLIST` | *(unset)* | Comma-separated account names allowed to migrate. |
+
+### Server / runtime
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SOPHIA_HOST` | `0.0.0.0` | Bind host (docker-compose / tests). |
+| `SOPHIA_PORT` | `8765` | Bind port. |
+| `SOPHIA_WORKERS` | `1` | Uvicorn worker count (T-NEW-221 multi-worker mode). |
+| `SOPHIA_LOG_DIR` | *(in-container default)* | Log directory for rotating file logs. |
+| `SOPHIA_LOG_LEVEL` | `INFO` | Log level. |
+| `SOPHIA_RECOVERY_BUDGET_SECONDS` | `60` | Pool rotation wall-clock budget before `AllProvidersUnreachable` surfaces. |
+| `SOPHIA_DEFAULT_MAX_TOKENS` | *(model default)* | Per-request max completion tokens when the client omits it. |
+
+### Pool / routing
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SOPHIA_PROVIDER_POOL` | *(agent.yaml path)* | ladyol ProviderPool config path. |
+| `SOPHIA_AUTO_MODELS` | *(unset)* | Override the auto-routed model list. |
+| `SOPHIA_HIDDEN_MODELS` | *(unset)* | Models hidden from the public /models listing but still servable. |
+| `SOPHIA_PAYG_PROVIDERS` | *(unset)* | Comma-separated providers excluded from auto-routing (PAYG accounts). |
+| `SOPHIA_PAYG_ALLOW_IN_AUTO` | *(unset)* | Re-allow specific PAYG providers in auto-routing. |
+| `SOPHIA_SECURITY_HEADER_<NAME>` | *(unset)* | Add/override security response headers (e.g. `SOPHIA_SECURITY_HEADER_X_FRAME_OPTIONS`). |
+
+### Captures
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SOPHIA_CAPTURES_DIR` | *(unset)* | Directory for prompt+completion captures. |
+| `SOPHIA_CAPTURE_MAX_BYTES` | *(unset)* | Per-capture byte cap. |
+
+### Requestor keys
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SOPHIA_REQUESTOR_KEY` | *(unset)* | API key consumers use to authenticate to sophia. |
+
+### Deploy-time test triggers
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SOPHIA_E2E_URL` | *(empty — **no IP default**)* | Target URL for the `live_cluster` e2e tests (`tests/test_e2e_live_multiworker.py`). Empty default = the 4 tests skip hermetically. Set explicitly to run against a live cluster. |
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
