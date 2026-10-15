@@ -33,6 +33,25 @@ test fixtures + the historical CHANGELOG:
   configured deployments), and `SOPHIA_E2E_URL` has no default —
   the 4 `live_cluster` tests skip cleanly without operator
   opt-in instead of dialing a hardcoded gateway.
+- `rebuild.sh` (third sweep, doc update): removed the hardcoded
+  LAN PG IP **and two plaintext vault passphrases** (the host
+  vault passphrase was hardcoded twice). Vault unlock now comes
+  from `SOPHIA_VAULT_PASSPHRASE` (empty default falls back to
+  PyKeyStore's `master.key.temp` auto-unlock); the PG endpoint
+  from `SOPHIA_PG_HOST` (required — script fails fast with a
+  clear message if unset). Script header now documents the
+  required environment.
+- `README.md`: dropped the `(owner: solubrew; ...)` file-owner
+  detail from the vault layout note.
+
+### Documentation
+
+- `docs/DEPLOY.md`: new **Environment variable reference** section
+  listing every `SOPHIA_*` var the code reads (source-scanned),
+  grouped backend/secrets/merge/server/pool/captures/requestor/
+  deploy-time tests, with defaults — including the two new
+  no-IP-default behaviors (`SOPHIA_PG_HOST`, `SOPHIA_E2E_URL`).
+- `README.md` Configuration section now links to it.
 
 ### Verified
 
