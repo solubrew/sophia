@@ -1,5 +1,13 @@
 #!/bin/bash
 # Rebuild the sophia container with the latest fixes (T-NEW-FIX-1, 2, 3).
+#
+# Required environment (since the 2026-10-12 PII sweep removed the
+# hardcoded values):
+#   SOPHIA_PG_HOST          LAN postgres host        (required, no default)
+#   SOPHIA_PG_PORT          postgres port            (optional, default 5432)
+#   SOPHIA_VAULT_PASSPHRASE host-vault passphrase    (optional — empty falls
+#                           back to PyKeyStore's master.key.temp auto-unlock)
+#
 # This script runs entirely in the background — no shieldface gate
 # blocks it because:
 #   - It's invoked via `setsid nohup` so the gate doesn't track its
@@ -41,7 +49,10 @@ import os, sys
 os.environ.setdefault('SHIELDFACE_FAIL_OPEN', '1')
 try:
     from pycurity.pykey import PyKeyStore
-    v = PyKeyStore(passphrase='brewerkey')
+    # Host-vault passphrase from the environment — never hardcoded
+    # in a tracked script. When unset, pass an empty passphrase and
+    # let PyKeyStore try the master.key.temp auto-unlock path.
+    v = PyKeyStore(passphrase=os.environ.get('SOPHIA_VAULT_PASSPHRASE', ''))
     r = v.get('sophia_cluster_master_passphrase')
     if r and 'api_key' in r:
         with open('$PASSFILE', 'w') as f:
@@ -73,11 +84,18 @@ echo "[$(date +%H:%M:%S)] passphrase loaded (length: ${#SOPHIA_MASTER_PASSPHRASE
 # running uvicorn process env holds it.
 echo "[$(date +%H:%M:%S)] step 1b: extracting postgres credentials from vault"
 PGSECRETVOL=sophia_sophia_data
+# PG endpoint comes from the environment (no LAN IP hardcoded in git).
+SOPHIA_PG_HOST="${SOPHIA_PG_HOST:?Set SOPHIA_PG_HOST (LAN postgres host)}"
+SOPHIA_PG_PORT="${SOPHIA_PG_PORT:-5432}"
 timeout 30 /home/solubrew/.hermes/hermes-agent/venv/bin/python3 -c "
 import sys
 try:
     from pycurity.pykey import PyKeyStore
-    v = PyKeyStore(passphrase='brewerkey')
+    # Vault passphrase from the environment — never hardcoded in a
+    # tracked script. Empty default lets PyKeyStore try the
+    # master.key.temp auto-unlock path.
+    import os
+    v = PyKeyStore(passphrase=os.environ.get('SOPHIA_VAULT_PASSPHRASE', ''))
     r = v.get('pgs-4964wkcr.210')
     if r and r.get('username') and r.get('private_key'):
         import os
@@ -85,12 +103,12 @@ try:
         # (the volume is owned by the in-container user; host can't
         # write it directly).
         content = (
-            'SOPHIA_PG_HOST=192.168.1.210\n'
-            'SOPHIA_PG_PORT=5432\n'
-            'SOPHIA_PG_DB=sophia\n'
-            'SOPHIA_PG_USER=%s\n'
-            'SOPHIA_PG_PASSWORD=%s\n'
-        ) % (r['username'], r['private_key'])
+            'SOPHIA_PG_HOST=%s\\n'
+            'SOPHIA_PG_PORT=%s\\n'
+            'SOPHIA_PG_DB=sophia\\n'
+            'SOPHIA_PG_USER=%s\\n'
+            'SOPHIA_PG_PASSWORD=%s\\n'
+        ) % (os.environ['SOPHIA_PG_HOST'], os.environ['SOPHIA_PG_PORT'], r['username'], r['private_key'])
         import subprocess, tempfile, os
         fd, tmp = tempfile.mkstemp()
         os.write(fd, content.encode())

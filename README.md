@@ -139,11 +139,16 @@ sophia:
 
 CLI flags (`--host`, `--port`, `--log-level`, `--config`) override.
 
+For the full SOPHIA_* env-var surface (vault, server, pool, captures,
+deploy-time test triggers), see the
+[**Environment variable reference**](docs/DEPLOY.md#environment-variable-reference)
+in the deploy guide.
+
 ## Vault layout
 
 - Host system-wide: `~/.local/share/pycurity/secure_store.db` — 23
   entries incl. the LLM keys and `sophia_cluster_master_passphrase`
-  (owner: solubrew; mode 600).
+  (mode 600).
 - Container local: `/var/lib/sophia/pycurity/vault.db` — only the
   keys passed by `SOPHIA_MERGE_ALLOWLIST` (set by seed-keys.sh from
   `agent_accts.yaml`).
