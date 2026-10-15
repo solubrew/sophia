@@ -26,15 +26,27 @@ test fixtures + the historical CHANGELOG:
   `192.168.1.210` → `[LAN-PG-HOST]`, `192.168.1.67` →
   `[LAN-DEPLOY-HOST]`, `/home/solubrew` → `[HOME]`. The deployment
   narrative is preserved; only the identifiers are redacted.
+- `sophia/db_backend.py` + `tests/test_e2e_live_multiworker.py`
+  (second sweep, 158c846): the last two live LAN IPs. The PG
+  host default is now empty (deployments set `SOPHIA_PG_HOST`;
+  `pg_configured()` gates on it, so nothing changes for
+  configured deployments), and `SOPHIA_E2E_URL` has no default —
+  the 4 `live_cluster` tests skip cleanly without operator
+  opt-in instead of dialing a hardcoded gateway.
 
 ### Verified
 
-- Zero `solubrew` or `192.168.*` remaining in shipped source,
-  tests, or CHANGES.md.
+- `git grep -E "solubrew|192\.168\."` over `sophia/` + `tests/`:
+  zero hits.
 - Affected test modules (`test_leaked_tool_call_fix.py`,
   `test_manage_secrets.py`, `test_config.py`): 24/24 green.
+- Full suite after the second sweep: 164 passed, 6 skipped
+  (the 4 multiworker live-cluster tests now skip hermetically —
+  correct for deploy-time checks).
+- `pg_configured()` gating verified: False with no env, True with
+  `SOPHIA_PG_HOST` set.
 
-#### Card (3e75836)
+#### Card (3e75836, 158c846)
 
 ## [Unreleased] — 2026-10-12 (file_sizes: pool.py 105 KB → 4 modules, largest 74 KB)
 
