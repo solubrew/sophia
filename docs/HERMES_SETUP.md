@@ -6,7 +6,7 @@ and avoid the mistakes the gateway is built to prevent.
 
 > **TL;DR:** issue a requestor API key with
 > `python -m sophia.cmds.manage_keys create hermes-cli`, set
-> `provider: custom` + `base_url: http://192.168.1.67:8765/v1` +
+> `provider: custom` + `base_url: http://[LAN-DEPLOY-HOST]:8765/v1` +
 > `api_key: <sk-sophia-…>` in Hermes' `config.yaml`, set
 > `model.default: sophia-auto`, and (so the gateway actually rotates
 > per turn) add a `custom_providers:` block that injects
@@ -273,7 +273,7 @@ hermes-agent's `AGENTS.md`):
 model:
   # Use Sophia as the active provider
   provider: custom
-  base_url: "http://192.168.1.67:8765/v1"
+  base_url: "http://[LAN-DEPLOY-HOST]:8765/v1"
 
   # Sophia auth: a REAL requestor key issued via `manage_keys create`.
   # For LAN-only mode (operator's current config; `SOPHIA_ALLOW_ENV_FALLBACK=0`
@@ -302,7 +302,7 @@ documented Hermes knob is `custom_providers:` (see
 # task_router. Default in sophia is `random` (not what you want).
 custom_providers:
   - name: sophia
-    base_url: http://192.168.1.67:8765/v1
+    base_url: http://[LAN-DEPLOY-HOST]:8765/v1
     model: sophia-auto
     extra_body:
       strategy: best_available
@@ -315,11 +315,11 @@ running today):**
 model:
   default: sophia-auto
   provider: custom
-  base_url: http://192.168.1.67:8765/v1
+  base_url: http://[LAN-DEPLOY-HOST]:8765/v1
   api_key: ${SOPHIA_REQUESTOR_KEY}
 custom_providers:
   - name: sophia
-    base_url: http://192.168.1.67:8765/v1
+    base_url: http://[LAN-DEPLOY-HOST]:8765/v1
     model: sophia-auto
     extra_body:
       strategy: best_available
@@ -332,7 +332,7 @@ SOPHIA_REQUESTOR_KEY=sk-sophia-...
 # optional: also export OPENAI_* env vars so the OpenAI SDK reads them
 # directly (the SDK reads OPENAI_BASE_URL/OPENAI_API_KEY first and
 # overrides config.yaml — pick one source of truth per session).
-OPENAI_BASE_URL=http://192.168.1.67:8765/v1
+OPENAI_BASE_URL=http://[LAN-DEPLOY-HOST]:8765/v1
 OPENAI_API_KEY=sk-sophia-...
 ```
 
@@ -436,12 +436,12 @@ will skip accounts that are currently paused for 429 cooldowns.
 
 ```bash
 # 1. Sophia is healthy
-curl -fsS http://192.168.1.67:8765/healthz
+curl -fsS http://[LAN-DEPLOY-HOST]:8765/healthz
 # {"status":"ok","providers":N,"models":M}
 
 # 2. Sophia exposes the model list (sophia-auto + concrete ids)
 curl -fsS -H "Authorization: Bearer <sk-sophia-...>" \
-  http://192.168.1.67:8765/v1/models | head -c 600
+  http://[LAN-DEPLOY-HOST]:8765/v1/models | head -c 600
 # {"object":"list","data":[{"id":"sophia-auto",...},
 #                         {"id":"minimax-m2.7",...},
 #                         {"id":"minimax-m3",...}, ...]}
@@ -450,7 +450,7 @@ curl -fsS -H "Authorization: Bearer <sk-sophia-...>" \
 curl -fsS -X POST -H "Authorization: Bearer <sk-sophia-...>" \
   -H "Content-Type: application/json" \
   -d '{"model":"sophia-auto","messages":[{"role":"user","content":"ping"}]}' \
-  http://192.168.1.67:8765/v1/chat/completions | head -c 400
+  http://[LAN-DEPLOY-HOST]:8765/v1/chat/completions | head -c 400
 # {"id":"...","model":"minimax-m3",...}  ← actual model picked
 
 # 4. Force a specific model to confirm rotation across accounts
@@ -458,7 +458,7 @@ for i in 1 2 3; do
   curl -fsS -X POST -H "Authorization: Bearer <sk-sophia-...>" \
     -H "Content-Type: application/json" \
     -d '{"model":"minimax-m2.7","messages":[{"role":"user","content":"ping"}]}' \
-    http://192.168.1.67:8765/v1/chat/completions | head -c 200; echo
+    http://[LAN-DEPLOY-HOST]:8765/v1/chat/completions | head -c 200; echo
 done
 # Look at Sophia's logs — the picked model stays the same (forced),
 # but the underlying ACCOUNT rotates among the 3 minimax entries.

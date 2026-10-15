@@ -8,7 +8,7 @@ streaming + non-streaming OpenAI Chat Completions, requestor API
 keys with RBAC, capture-to-disk for forensics, and per-request usage
 accounting.
 
-Runs LAN-side today (the cluster is on `192.168.1.67`); no external
+Runs LAN-side today (the cluster is on `[LAN-DEPLOY-HOST]`); no external
 exposure yet.
 
 ## Installation & Quickstart
@@ -20,7 +20,7 @@ pip install -e .[dev]
 ./cluster/seed-keys.sh /home/solubrew/.local/share/pycurity/secure_store.db '<passphrase>'
 ```
 
-Then point any OpenAI-compatible client at `http://192.168.1.67:8765/v1`
+Then point any OpenAI-compatible client at `http://[LAN-DEPLOY-HOST]:8765/v1`
 with a Sophia requestor key (`sk-sophia-...`).
 
 ## Consumers (2026-08-23)
